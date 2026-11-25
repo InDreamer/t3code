@@ -1,4 +1,10 @@
-import { ArrowLeftIcon, ArrowRightIcon, ChartNoAxesColumnIcon, SettingsIcon } from "lucide-react";
+import {
+  ArrowLeftIcon,
+  ArrowRightIcon,
+  BotIcon,
+  ChartNoAxesColumnIcon,
+  SettingsIcon,
+} from "lucide-react";
 import type { ReactNode } from "react";
 import { T, useGT } from "gt-react";
 import { memo } from "react";
@@ -263,6 +269,11 @@ const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
     void navigate({ to: "/usage" });
   };
 
+  const handleBotsClick = () => {
+    closeMobileSidebar();
+    void navigate({ to: "/bots", search: {} });
+  };
+
   const handleBackClick = () => {
     closeMobileSidebar();
     void navigateToMainApp();
@@ -300,6 +311,7 @@ const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
               onClick={handleIssuesClick}
             />
           ) : null}
+          <SidebarUtilityItem icon={<BotIcon />} label={gt("Bots")} onClick={handleBotsClick} />
           <SidebarUtilityItem
             icon={<ChartNoAxesColumnIcon />}
             label={gt("Usage")}

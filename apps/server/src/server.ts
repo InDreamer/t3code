@@ -45,6 +45,7 @@ import {
 import { resolveLauncherPath } from "./cloud/pinnedRuntime.ts";
 import { fixPath } from "./os-jank.ts";
 import * as Ws from "./ws.ts";
+import * as PaHttp from "./pa/PaHttp.ts";
 import * as AgentScopeLive from "./process/agentScope.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
 import * as ProcessLauncher from "./process/ProcessLauncher.ts";
@@ -914,6 +915,7 @@ const layerMakeRoutes = Layer.mergeAll(
     ServerBrowserStream.routeLayer,
     PreviewTunnel.routeLayer,
     ServerHttp.layerStaticAndDevRoute,
+    PaHttp.layer,
     Ws.layer,
     speechStreamRouteLayer,
   ),
