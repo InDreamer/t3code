@@ -41,6 +41,34 @@ import {
   ChatGptHandoffInput,
   ChatGptHandoffState,
 } from "./providerSetup.ts";
+import {
+  PaBotConfig,
+  PaBotInput,
+  PaBotSummary,
+  PaCreateBotInput,
+  PaCreateSessionInput,
+  PaError,
+  PaGetBotModelsInput,
+  PaGetMessagesInput,
+  PaGetMessagesResult,
+  PaListBotsResult,
+  PaListCommandsResult,
+  PaListSessionsResult,
+  PaModelCatalog,
+  PaMutateScheduleInput,
+  PaPatchBotConfigInput,
+  PaRespondRequestInput,
+  PaSchedulesResult,
+  PaSelectBotModelInput,
+  PaSelectBotModelResult,
+  PaSendMessageInput,
+  PaSendResult,
+  PaSessionInput,
+  PaSessionSummary,
+  PaStreamEvent,
+  PaSubscribeSessionInput,
+  PaUpdateBotMetaInput,
+} from "./pa.ts";
 import * as Schema from "effect/Schema";
 import * as Rpc from "effect/rpc/Rpc";
 import * as RpcGroup from "effect/rpc/RpcGroup";
@@ -594,6 +622,23 @@ export const WS_METHODS = {
   serverGetStorageCleanupReport: "server.getStorageCleanupReport",
   serverGetDatabaseStorage: "server.getDatabaseStorage",
   serverReclaimDatabaseSpace: "server.reclaimDatabaseSpace",
+  paListBots: "pa.listBots",
+  paGetBotModels: "pa.getBotModels",
+  paSelectBotModel: "pa.selectBotModel",
+  paGetBotConfig: "pa.getBotConfig",
+  paPatchBotConfig: "pa.patchBotConfig",
+  paUpdateBotMeta: "pa.updateBotMeta",
+  paListSchedules: "pa.listSchedules",
+  paMutateSchedule: "pa.mutateSchedule",
+  paCreateBot: "pa.createBot",
+  paListCommands: "pa.listCommands",
+  paListSessions: "pa.listSessions",
+  paCreateSession: "pa.createSession",
+  paGetMessages: "pa.getMessages",
+  paSendMessage: "pa.sendMessage",
+  paInterruptSession: "pa.interruptSession",
+  paRespondRequest: "pa.respondRequest",
+  paSubscribeSession: "pa.subscribeSession",
   peerLinksList: "peerLinks.list",
   peerLinksNames: "peerLinks.names",
   peerLinksLink: "peerLinks.link",
@@ -950,6 +995,110 @@ const WsServerGetDatabaseStorageRpc = Rpc.make(WS_METHODS.serverGetDatabaseStora
 const WsServerReclaimDatabaseSpaceRpc = Rpc.make(WS_METHODS.serverReclaimDatabaseSpace, {
   payload: Schema.Struct({}),
   error: Schema.Union([DatabaseReclaimError, EnvironmentAuthorizationError]),
+});
+
+const PaRpcError = Schema.Union([PaError, EnvironmentAuthorizationError]);
+
+const WsPaListBotsRpc = Rpc.make(WS_METHODS.paListBots, {
+  payload: Schema.Struct({}),
+  success: PaListBotsResult,
+  error: PaRpcError,
+});
+
+const WsPaGetBotModelsRpc = Rpc.make(WS_METHODS.paGetBotModels, {
+  payload: PaGetBotModelsInput,
+  success: PaModelCatalog,
+  error: PaRpcError,
+});
+
+const WsPaSelectBotModelRpc = Rpc.make(WS_METHODS.paSelectBotModel, {
+  payload: PaSelectBotModelInput,
+  success: PaSelectBotModelResult,
+  error: PaRpcError,
+});
+
+const WsPaGetBotConfigRpc = Rpc.make(WS_METHODS.paGetBotConfig, {
+  payload: PaBotInput,
+  success: PaBotConfig,
+  error: PaRpcError,
+});
+
+const WsPaPatchBotConfigRpc = Rpc.make(WS_METHODS.paPatchBotConfig, {
+  payload: PaPatchBotConfigInput,
+  success: PaBotConfig,
+  error: PaRpcError,
+});
+
+/** T3-local avatar, name, pin and read marker: never reaches the engine. */
+const WsPaUpdateBotMetaRpc = Rpc.make(WS_METHODS.paUpdateBotMeta, {
+  payload: PaUpdateBotMetaInput,
+  error: PaRpcError,
+});
+
+const WsPaListSchedulesRpc = Rpc.make(WS_METHODS.paListSchedules, {
+  payload: PaBotInput,
+  success: PaSchedulesResult,
+  error: PaRpcError,
+});
+
+const WsPaMutateScheduleRpc = Rpc.make(WS_METHODS.paMutateSchedule, {
+  payload: PaMutateScheduleInput,
+  success: PaSchedulesResult,
+  error: PaRpcError,
+});
+
+const WsPaCreateBotRpc = Rpc.make(WS_METHODS.paCreateBot, {
+  payload: PaCreateBotInput,
+  success: PaBotSummary,
+  error: PaRpcError,
+});
+
+const WsPaListCommandsRpc = Rpc.make(WS_METHODS.paListCommands, {
+  payload: PaBotInput,
+  success: PaListCommandsResult,
+  error: PaRpcError,
+});
+
+const WsPaListSessionsRpc = Rpc.make(WS_METHODS.paListSessions, {
+  payload: PaBotInput,
+  success: PaListSessionsResult,
+  error: PaRpcError,
+});
+
+const WsPaCreateSessionRpc = Rpc.make(WS_METHODS.paCreateSession, {
+  payload: PaCreateSessionInput,
+  success: PaSessionSummary,
+  error: PaRpcError,
+});
+
+const WsPaGetMessagesRpc = Rpc.make(WS_METHODS.paGetMessages, {
+  payload: PaGetMessagesInput,
+  success: PaGetMessagesResult,
+  error: PaRpcError,
+});
+
+const WsPaSendMessageRpc = Rpc.make(WS_METHODS.paSendMessage, {
+  payload: PaSendMessageInput,
+  success: PaSendResult,
+  error: PaRpcError,
+});
+
+const WsPaInterruptSessionRpc = Rpc.make(WS_METHODS.paInterruptSession, {
+  payload: PaSessionInput,
+  error: PaRpcError,
+});
+
+const WsPaRespondRequestRpc = Rpc.make(WS_METHODS.paRespondRequest, {
+  payload: PaRespondRequestInput,
+  error: PaRpcError,
+});
+
+/** Live session events; a slow reader is cut off and resumes from its last `resumeToken`. */
+const WsPaSubscribeSessionRpc = Rpc.make(WS_METHODS.paSubscribeSession, {
+  payload: PaSubscribeSessionInput,
+  success: PaStreamEvent,
+  error: PaRpcError,
+  stream: true,
 });
 
 const WsPeerLinksListRpc = Rpc.make(WS_METHODS.peerLinksList, {
@@ -2505,6 +2654,23 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerGetSettingsRpc,
   WsServerReclaimDatabaseSpaceRpc,
   WsServerUpdateSettingsRpc,
+  WsPaListBotsRpc,
+  WsPaGetBotModelsRpc,
+  WsPaSelectBotModelRpc,
+  WsPaGetBotConfigRpc,
+  WsPaPatchBotConfigRpc,
+  WsPaUpdateBotMetaRpc,
+  WsPaListSchedulesRpc,
+  WsPaMutateScheduleRpc,
+  WsPaCreateBotRpc,
+  WsPaListCommandsRpc,
+  WsPaListSessionsRpc,
+  WsPaCreateSessionRpc,
+  WsPaGetMessagesRpc,
+  WsPaSendMessageRpc,
+  WsPaInterruptSessionRpc,
+  WsPaRespondRequestRpc,
+  WsPaSubscribeSessionRpc,
   WsPeerLinksListRpc,
   WsPeerLinksNamesRpc,
   WsPeerLinksLinkRpc,

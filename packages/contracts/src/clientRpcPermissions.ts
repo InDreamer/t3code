@@ -101,6 +101,16 @@ export const CLIENT_GUARDED_RPC_SCOPES = {
   [WS_METHODS.peerLinksAnswerRequest]: AuthAccessWriteScope,
   [WS_METHODS.peerLinksPairClient]: AuthAccessWriteScope,
   [WS_METHODS.peerLinksPairLink]: AuthAccessWriteScope,
+  // Personal agents: provider-side profile config and credentials need providers:manage.
+  [WS_METHODS.paCreateBot]: AuthProvidersManageScope,
+  [WS_METHODS.paSelectBotModel]: AuthProvidersManageScope,
+  [WS_METHODS.paPatchBotConfig]: AuthProvidersManageScope,
+  [WS_METHODS.paMutateSchedule]: AuthProvidersManageScope,
+  [WS_METHODS.paUpdateBotMeta]: AuthOrchestrationOperateScope,
+  [WS_METHODS.paCreateSession]: AuthOrchestrationOperateScope,
+  [WS_METHODS.paSendMessage]: AuthOrchestrationOperateScope,
+  [WS_METHODS.paInterruptSession]: AuthOrchestrationOperateScope,
+  [WS_METHODS.paRespondRequest]: AuthOrchestrationOperateScope,
   // Send stores and sends a report from a thread's turn: the bar of running that thread.
   [WS_METHODS.agentFeedbackAnswerRequest]: AuthOrchestrationOperateScope,
 } as const;
@@ -131,6 +141,10 @@ export function clientRpcRequiredScopes(
   if (method === WS_METHODS.peerLinksPairLink && input !== undefined) {
     const held = mcpClientScopes(decodeLinkPairing(input).access);
     return [AuthAccessWriteScope, ...held];
+  }
+  // A schedule is both standing config and future execution.
+  if (method === WS_METHODS.paMutateSchedule) {
+    return [AuthProvidersManageScope, AuthOrchestrationOperateScope];
   }
   if (method === WS_METHODS.guestShareCreate) {
     return [AuthAccessWriteScope, AuthOrchestrationReadScope];
