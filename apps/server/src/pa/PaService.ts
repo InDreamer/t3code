@@ -47,8 +47,6 @@ function nowMs(): number {
 }
 
 const DEFAULT_MESSAGE_LIMIT = 120;
-/** Events a slow client may lag behind before its stream is cut and it resumes. */
-const SUBSCRIBER_BUFFER = 1_024;
 
 const isPaError = Schema.is(PaError);
 
@@ -119,6 +117,9 @@ export function makePaService(options: {
   const instances = new Map(options.instances.map((instance) => [instance.instanceId, instance]));
   const hubs = new Map<string, PaSessionHub>();
   const hubOptions = options.hub ?? DEFAULT_PA_HUB_OPTIONS;
+  // Events a slow client may lag behind before its stream is cut and it resumes. It must hold a
+  // whole hub replay, or a legitimate catch-up would cut the client it is catching up.
+  const subscriberBuffer = Math.max(1_024, hubOptions.capacity + 64);
 
   const resolveBot = (botId: string) =>
     Effect.suspend(() => {
@@ -430,10 +431,12 @@ export function makePaService(options: {
   const respondRequest = Effect.fn("PaService.respondRequest")(function* (
     input: PaRespondRequestInput,
   ) {
-    const { instance, agentRef } = yield* resolveBot(input.botId);
+    const { instance, agentRef, botId } = yield* resolveBot(input.botId);
     const requests = yield* facet(instance, "requests", "approvals");
     const { botId: _botId, sessionId, ...answer } = input;
     yield* fromPromise(() => requests.respond(agentRef, sessionId, answer));
+    // The engine's own settle event may come late or never: the answered card leaves every viewer now.
+    hubs.get(hubKey(botId, sessionId))?.resolveRequest(input.requestId);
   });
 
   const hubFor = (
@@ -492,7 +495,7 @@ export function makePaService(options: {
                 ),
                 (detach) => Effect.sync(detach),
               ),
-            { bufferSize: SUBSCRIBER_BUFFER, strategy: "dropping" },
+            { bufferSize: subscriberBuffer, strategy: "dropping" },
           ),
         ),
       ),

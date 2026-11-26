@@ -270,6 +270,18 @@ export function mergePaMessagesByTime(
 }
 
 /**
+ * A timestamp for a message created on this device that sorts after everything already shown,
+ * even when this clock runs behind the engine's or several rows land in the same millisecond.
+ */
+export function nextPaLocalTimestamp(shown: ReadonlyArray<PaMessage>, nowMs: number): number {
+  let latest = Number.NEGATIVE_INFINITY;
+  for (const message of shown) {
+    if (message.timestamp !== null && message.timestamp > latest) latest = message.timestamp;
+  }
+  return Math.max(nowMs, latest + 1);
+}
+
+/**
  * Projects stored messages into timeline items: consecutive tool rows and reasoning traces
  * coalesce into one collapsible work-group right above the reply they produced.
  */
@@ -449,7 +461,11 @@ function applyTextDelta(
           (block) => block.kind === "text" && block.segmentId === event.segmentId,
         );
   const segment = segmentIndex >= 0 ? blocks[segmentIndex] : undefined;
-  if (segment?.kind === "text" && (commentary || segmentIndex === lastIndex)) {
+  // Answer text never extends a commentary block, even one that is still the last block.
+  if (
+    segment?.kind === "text" &&
+    (commentary || (segmentIndex === lastIndex && !segment.commentary))
+  ) {
     // A commentary delta may reclassify a segment that is no longer the last block.
     blocks[segmentIndex] = {
       ...segment,
@@ -519,6 +535,7 @@ export function reducePaStreamEvent(
         startedAt: nowMs,
         statusText: null,
         blocks: [],
+        openRequests: state.openRequests.filter((request) => request.scope === "session"),
         error: null,
       };
 
@@ -610,6 +627,7 @@ export function reducePaStreamEvent(
         statusText: null,
         blocks,
         nextBlockSeq,
+        openRequests: state.openRequests.filter((request) => request.scope === "session"),
         error: event.status === "error" && event.error ? event.error : state.error,
       };
     }
@@ -633,8 +651,10 @@ export function reducePaStreamEvent(
       return {
         ...state,
         phase: state.blocks.length > 0 ? "settling" : "idle",
+        settleToken: state.settleToken + 1,
         statusText: null,
         blocks: finalizeLiveBlocks(state.blocks),
+        openRequests: state.openRequests.filter((request) => request.scope === "session"),
         error: event.message,
       };
 

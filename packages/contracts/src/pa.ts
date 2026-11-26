@@ -439,6 +439,8 @@ export const PaSendResult = Schema.Struct({
   kind: Schema.Literals(["turn", "output"]),
   sessionId: Schema.String,
   submissionId: Schema.optionalKey(Schema.String),
+  /** A retried `inputId` whose turn already ended: nothing streams, reload the transcript. */
+  settled: Schema.optionalKey(Schema.Boolean),
   output: Schema.optionalKey(Schema.String),
   notice: Schema.optionalKey(Schema.String),
 });
@@ -449,6 +451,8 @@ export type PaSendResult = typeof PaSendResult.Type;
 export const PaPendingRequest = Schema.Struct({
   requestId: Schema.String,
   kind: Schema.Literals(["approval", "clarify"]),
+  /** Defaults to turn lifetime. Session requests stay open until explicitly resolved. */
+  scope: Schema.optionalKey(Schema.Literals(["turn", "session"])),
   title: Schema.String,
   detail: Schema.String,
   command: Schema.optionalKey(Schema.String),

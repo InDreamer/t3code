@@ -255,7 +255,7 @@ describe("PaService", () => {
             Effect.sync(() => {
               if (event.type !== "snapshot") return;
               // The reader stalls on its first event while the engine keeps producing.
-              for (let i = 0; i < 2_000; i += 1) {
+              for (let i = 0; i < 3_000; i += 1) {
                 feeds[0]!.onEvent({ type: "reasoning.delta", sessionId: "s-1", text: "x" });
               }
             }),
@@ -265,6 +265,72 @@ describe("PaService", () => {
       );
       expect(Exit.isFailure(result)).toBe(true);
       expect(Exit.isFailure(result) && JSON.stringify(result.cause)).toContain("fell behind");
+    }),
+  );
+
+  it.effect(
+    "serves a legitimate catch-up longer than 1,024 events without cutting the reader",
+    () =>
+      Effect.gen(function* () {
+        const { engine, feeds } = makeEngine();
+        const { service } = makeService([engine]);
+        const input = { botId: "fake:main", sessionId: "s-1" };
+        const [snapshot] = Array.from(
+          yield* service.subscribeSession(input).pipe(Stream.take(1), Stream.runCollect),
+        );
+        for (let i = 0; i < 1_200; i += 1) {
+          feeds[0]!.onEvent({ type: "reasoning.delta", sessionId: "s-1", text: "x" });
+        }
+        const resumed = Array.from(
+          yield* service
+            .subscribeSession({ ...input, resumeToken: snapshot!.resumeToken })
+            .pipe(Stream.take(1_201), Stream.runCollect),
+        );
+        service.dispose();
+        expect(resumed[0]).toMatchObject({ type: "snapshot", snapshotRequired: false });
+        expect(resumed).toHaveLength(1_201);
+        expect(resumed.at(-1)).toMatchObject({ type: "reasoning.delta" });
+      }),
+  );
+
+  it.effect("drops an answered request from the shared feed before the engine settles it", () =>
+    Effect.gen(function* () {
+      const answered: string[] = [];
+      const { engine, feeds } = makeEngine({
+        requests: {
+          respond: async (_ref, _sessionId, answer) => {
+            answered.push(answer.requestId);
+          },
+        },
+      });
+      const { service } = makeService([engine]);
+      const input = { botId: "fake:main", sessionId: "s-1" };
+      yield* service.subscribeSession(input).pipe(Stream.take(1), Stream.runDrain);
+      feeds[0]!.onEvent({ type: "turn.started", sessionId: "s-1" });
+      for (const requestId of ["r1", "r2"]) {
+        feeds[0]!.onEvent({
+          type: "request.opened",
+          sessionId: "s-1",
+          request: { requestId, kind: "approval", title: "Run?", detail: "" },
+        });
+      }
+
+      yield* service.respondRequest({ ...input, requestId: "r1", decision: "once" });
+      const [afterAnswer] = Array.from(
+        yield* service.subscribeSession(input).pipe(Stream.take(1), Stream.runCollect),
+      );
+      expect(answered).toEqual(["r1"]);
+      expect(afterAnswer).toMatchObject({
+        type: "snapshot",
+        openRequests: [expect.objectContaining({ requestId: "r2" })],
+      });
+
+      feeds[0]!.onEvent({ type: "turn.completed", sessionId: "s-1", status: "complete" });
+      const [afterTurn] = Array.from(
+        yield* service.subscribeSession(input).pipe(Stream.take(1), Stream.runCollect),
+      );
+      service.dispose();
+      expect(afterTurn).toMatchObject({ type: "snapshot", running: false, openRequests: [] });
     }),
   );
 });

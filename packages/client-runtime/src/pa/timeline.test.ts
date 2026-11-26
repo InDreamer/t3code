@@ -9,6 +9,7 @@ import {
   findPaLiveFinalTextIndex,
   formatPaDurationMs,
   mergePaMessagesByTime,
+  nextPaLocalTimestamp,
   paNoticeMessage,
   reducePaStreamEvent,
   summarizePaWorkGroup,
@@ -273,5 +274,95 @@ describe("PA live turn reducer", () => {
     expect(state.statusText).toBe("Compressing context");
     expect(reduceAll([{ type: "notice", message: "Saved", persistent: true }], state)).toBe(state);
     expect(reduceAll([{ type: "error", message: "boom" }]).error).toBe("boom");
+  });
+});
+
+describe("PA local rows and stream edges", () => {
+  it("never extends a commentary block with answer text, even as the last block", () => {
+    const state = reduceAll([
+      { type: "turn.started" },
+      { type: "text.delta", text: "Checking", role: "answer", segmentId: "seg-1" },
+      { type: "text.delta", text: "", role: "commentary", segmentId: "seg-1" },
+      { type: "text.delta", text: "It is sunny.", role: "answer", segmentId: "seg-1" },
+    ]);
+    expect(
+      state.blocks.map((b) => (b.kind === "text" ? [b.text, b.commentary === true] : b.kind)),
+    ).toEqual([
+      ["Checking", true],
+      ["It is sunny.", false],
+    ]);
+  });
+
+  it("orders a command and its output after every shown row despite clock skew", () => {
+    // The engine's clock runs ahead of this device's, and two rows can share a millisecond.
+    const server = [
+      msg({ id: "u0", role: "user", text: "hi", timestamp: 50_000 }),
+      msg({ id: "a0", role: "assistant", text: "hello", timestamp: 50_000 }),
+    ];
+    const userAt = nextPaLocalTimestamp(server, 1_000);
+    const user = msg({ id: "local-user", role: "user", text: "/status", timestamp: userAt });
+    const notice = paNoticeMessage(
+      { message: "ok", inputId: "in-1" },
+      nextPaLocalTimestamp([...server, user], 1_000),
+    );
+    expect(userAt).toBe(50_001);
+    expect(notice.timestamp).toBe(50_002);
+    expect(mergePaMessagesByTime(server, [user, notice]).map((m) => m.id)).toEqual([
+      "u0",
+      "a0",
+      "local-user",
+      "notice-in-1",
+    ]);
+    expect(nextPaLocalTimestamp([], 1_000)).toBe(1_000);
+  });
+
+  it("settles a turn that a stream error ends so its blocks clear with the transcript", () => {
+    const state = reduceAll([
+      { type: "turn.started" },
+      { type: "text.delta", text: "Partial", role: "answer", segmentId: "s" },
+      { type: "error", message: "model overloaded" },
+    ]);
+    expect(state).toMatchObject({ phase: "settling", settleToken: 1, error: "model overloaded" });
+    expect(clearSettledPaLiveTurn(state, state.settleToken)).toMatchObject({
+      phase: "idle",
+      blocks: [],
+      error: "model overloaded",
+    });
+  });
+});
+
+describe("PA open requests across turn boundaries", () => {
+  const request = { requestId: "r1", kind: "approval" as const, title: "t", detail: "d" };
+  const sessionRequest = { ...request, requestId: "choice", scope: "session" as const };
+  const withRequest = () =>
+    reduceAll([
+      { type: "turn.started" },
+      { type: "text.delta", text: "x", role: "answer" },
+      { type: "request.opened", request },
+      { type: "request.opened", request: sessionRequest },
+    ]);
+
+  it.each([
+    ["turn.completed", { type: "turn.completed", status: "complete", text: "x" }],
+    ["error", { type: "error", message: "boom" }],
+    ["turn.started", { type: "turn.started" }],
+  ] as const)("keeps only session requests when a %s arrives", (_name, event) => {
+    expect(withRequest().openRequests).toEqual([request, sessionRequest]);
+    const next = reduceAll([event], withRequest());
+    expect(next.openRequests).toEqual([sessionRequest]);
+    expect(
+      reduceAll([{ type: "request.resolved", requestId: "choice" }], next).openRequests,
+    ).toEqual([]);
+  });
+
+  it("keeps still-open requests when the transcript replaces settled live blocks", () => {
+    const settled = reduceAll([{ type: "turn.completed", status: "complete" }], withRequest());
+    const reopened = reduceAll([{ type: "request.opened", request }], settled);
+    const cleared = clearSettledPaLiveTurn(reopened, reopened.settleToken);
+    expect(cleared).toMatchObject({
+      phase: "idle",
+      blocks: [],
+      openRequests: [sessionRequest, request],
+    });
   });
 });

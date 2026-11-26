@@ -109,7 +109,7 @@ export const paApi = {
     sessionId: string,
     handlers: {
       readonly onEvent: (event: PaStreamEvent) => void;
-      readonly onFailure: (error: unknown) => void;
+      readonly onFailure: (error: unknown, status: { readonly retrying: boolean }) => void;
     },
   ): () => void {
     let stop: (() => void) | null = null;
@@ -120,7 +120,7 @@ export const paApi = {
         stop = pa.followSession(appAtomRegistry, { environmentId, botId, sessionId, ...handlers });
       },
       (error: unknown) => {
-        if (!stopped) handlers.onFailure(error);
+        if (!stopped) handlers.onFailure(error, { retrying: false });
       },
     );
     return () => {

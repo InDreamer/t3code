@@ -249,4 +249,201 @@ describe("PaSessionHub", () => {
     await expect(hub.attach(listen().listener)).rejects.toMatchObject({ reason: "NotFound" });
     expect(disposed).toBe(true);
   });
+
+  it("retries a feed that drops mid-handshake from one loop, leaking no upstream subscription", async () => {
+    const clock = manualTimers();
+    const opened: Array<{ resume: boolean; released: number; subscriber: PaSessionSubscriber }> =
+      [];
+    let dropDuringHandshake = false;
+    const hub = new PaSessionHub(
+      "s-1",
+      async (subscriber, { resume }) => {
+        const feed = { resume, released: 0, subscriber };
+        opened.push(feed);
+        subscriber.onEvent({
+          type: "snapshot",
+          sessionId: "s-1",
+          running: false,
+          openRequests: [],
+          snapshotRequired: false,
+        });
+        if (dropDuringHandshake) {
+          dropDuringHandshake = false;
+          // The socket closes before the adapter has handed back its release.
+          subscriber.onClose("closed while bootstrapping");
+          subscriber.onClose("closed again");
+        }
+        return () => {
+          feed.released += 1;
+        };
+      },
+      { capacity: 10, lingerMs: 1_000, reconnectDelaysMs: [10, 20, 30], timers: clock.timers },
+      () => undefined,
+    );
+    const a = listen();
+    await hub.attach(a.listener);
+
+    dropDuringHandshake = true;
+    opened[0]!.subscriber.onClose("socket closed");
+    opened[0]!.subscriber.onClose("socket closed");
+    expect(clock.pendingDelays()).toEqual([10]);
+    clock.fireAll();
+    for (let i = 0; i < 4; i += 1) await flush();
+    // The handshake feed was released and only the one loop waits for its next attempt.
+    expect(opened).toHaveLength(2);
+    expect(opened[1]!.released).toBe(1);
+    expect(clock.pendingDelays()).toEqual([20]);
+
+    clock.fireAll();
+    for (let i = 0; i < 4; i += 1) await flush();
+    expect(opened).toHaveLength(3);
+    expect(clock.pendingDelays()).toEqual([]);
+    expect(opened.map((feed) => feed.released)).toEqual([0, 1, 0]);
+
+    const before = a.events.length;
+    opened[2]!.subscriber.onEvent({ type: "turn.started", sessionId: "s-1" });
+    // A dead feed's late frame is ignored, and the live one reaches the listener exactly once.
+    opened[1]!.subscriber.onEvent({ type: "turn.started", sessionId: "s-1" });
+    expect(a.events.slice(before).map((e) => e.type)).toEqual(["turn.started"]);
+
+    hub.dispose();
+    expect(opened[2]!.released).toBe(1);
+  });
+
+  it("stops reconnecting at once on a permanent failure and reports the original error", async () => {
+    const clock = manualTimers();
+    let opens = 0;
+    const subscribers: PaSessionSubscriber[] = [];
+    const hub = new PaSessionHub(
+      "s-1",
+      async (subscriber) => {
+        opens += 1;
+        if (opens > 1) throw new PaError({ reason: "NotFound", message: "session deleted" });
+        subscribers.push(subscriber);
+        subscriber.onEvent({
+          type: "snapshot",
+          sessionId: "s-1",
+          running: false,
+          openRequests: [],
+          snapshotRequired: false,
+        });
+        return () => undefined;
+      },
+      { capacity: 3, lingerMs: 1_000, reconnectDelaysMs: [10, 20, 30], timers: clock.timers },
+      () => undefined,
+    );
+    const a = listen();
+    await hub.attach(a.listener);
+    subscribers[0]!.onClose("socket closed");
+    clock.fireAll();
+    for (let i = 0; i < 4; i += 1) await flush();
+    expect(opens).toBe(2);
+    expect(clock.pendingDelays()).toEqual([]);
+    expect(a.failures).toEqual([
+      expect.objectContaining({ reason: "NotFound", message: "session deleted" }),
+    ]);
+  });
+
+  it("keeps reconnecting when a reopened feed drops right as the reconnect loop finishes", async () => {
+    for (let lag = 0; lag < 6; lag += 1) {
+      const clock = manualTimers();
+      const subscribers: PaSessionSubscriber[] = [];
+      const hub = new PaSessionHub(
+        "s-1",
+        async (subscriber, { resume }) => {
+          subscribers.push(subscriber);
+          subscriber.onEvent({
+            type: "snapshot",
+            sessionId: "s-1",
+            running: false,
+            openRequests: [],
+            snapshotRequired: false,
+          });
+          if (resume) {
+            let drop = Promise.resolve();
+            for (let i = 0; i < lag; i += 1) drop = drop.then(() => undefined);
+            void drop.then(() => subscriber.onClose("dropped again"));
+          }
+          return () => undefined;
+        },
+        { capacity: 3, lingerMs: 1_000, reconnectDelaysMs: [10, 20, 30], timers: clock.timers },
+        () => undefined,
+      );
+      const a = listen();
+      await hub.attach(a.listener);
+      subscribers[0]!.onClose("socket closed");
+      clock.fireAll();
+      for (let i = 0; i < 12; i += 1) await flush();
+      // Never wedged: another attempt is scheduled whichever microtask the drop landed on.
+      expect({ lag, pending: clock.pendingDelays().length }).toEqual({ lag, pending: 1 });
+      expect(a.failures).toEqual([]);
+      hub.dispose();
+    }
+  });
+
+  it("clears its reconnect backoff timer when disposed", async () => {
+    const { hub, clock, feeds } = makeHub();
+    await hub.attach(listen().listener);
+    feeds[0]!.subscriber.onClose("socket closed");
+    expect(clock.pendingDelays()).toEqual([10]);
+    hub.dispose();
+    expect(clock.pendingDelays()).toEqual([]);
+  });
+
+  it("drops a turn's open requests when it ends, and resolves an answered one once", async () => {
+    const { hub, emit } = makeHub({ capacity: 10 });
+    const a = listen();
+    await hub.attach(a.listener);
+    const request = (requestId: string) => ({
+      type: "request.opened" as const,
+      sessionId: "s-1",
+      request: { requestId, kind: "approval" as const, title: "t", detail: "d" },
+    });
+    emit({ type: "turn.started", sessionId: "s-1" });
+    emit(request("r1"));
+    emit(request("r2"));
+
+    hub.resolveRequest("r1");
+    hub.resolveRequest("r1");
+    expect(a.events.filter((e) => e.type === "request.resolved")).toEqual([
+      expect.objectContaining({ requestId: "r1" }),
+    ]);
+    const joiner = listen();
+    await hub.attach(joiner.listener);
+    expect(joiner.events[0]).toMatchObject({
+      openRequests: [expect.objectContaining({ requestId: "r2" })],
+    });
+
+    emit({ type: "turn.completed", sessionId: "s-1", status: "interrupted" });
+    const late = listen();
+    await hub.attach(late.listener);
+    expect(late.events[0]).toMatchObject({ running: false, openRequests: [] });
+  });
+  it.each([
+    { type: "turn.started" },
+    { type: "turn.completed", status: "complete" },
+    { type: "error", message: "failed" },
+  ] as const)(
+    "retains only session requests in a late viewer's snapshot after $type",
+    async (event) => {
+      const { hub, emit } = makeHub();
+      await hub.attach(listen().listener);
+      const request = { kind: "clarify" as const, title: "t", detail: "d" };
+      const choice = { ...request, requestId: "choice", scope: "session" as const };
+      emit({ type: "request.opened", sessionId: "s-1", request: choice });
+      emit({
+        type: "request.opened",
+        sessionId: "s-1",
+        request: { ...request, requestId: "canonical" },
+      });
+      emit({ ...event, sessionId: "s-1" });
+      const late = listen();
+      await hub.attach(late.listener);
+      expect(late.events[0]).toMatchObject({ openRequests: [choice] });
+      emit({ type: "request.resolved", sessionId: "s-1", requestId: "choice" });
+      const afterCancel = listen();
+      await hub.attach(afterCancel.listener);
+      expect(afterCancel.events[0]).toMatchObject({ openRequests: [] });
+    },
+  );
 });

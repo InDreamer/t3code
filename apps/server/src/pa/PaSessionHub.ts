@@ -2,6 +2,7 @@
 import * as NodeCrypto from "node:crypto";
 
 import { PaError, type PaPendingRequest, type PaStreamEvent } from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
 
 import type { PaAdapterEvent, PaSessionSubscriber } from "./types.ts";
 
@@ -42,6 +43,17 @@ export const DEFAULT_PA_HUB_OPTIONS: PaHubOptions = {
   },
 };
 
+/** Reopening cannot fix these: the session is gone, refused, or not ours to watch. */
+const PERMANENT_FEED_FAILURES: ReadonlySet<PaError["reason"]> = new Set([
+  "NotFound",
+  "Invalid",
+  "Forbidden",
+  "Unsupported",
+  "Conflict",
+]);
+
+const isPaError = Schema.is(PaError);
+
 interface BufferedEvent {
   readonly seq: number;
   readonly event: PaStreamEvent;
@@ -65,6 +77,8 @@ export class PaSessionHub {
   private openRequests: ReadonlyArray<PaPendingRequest> = [];
   private release: (() => void) | null = null;
   private lingerTimer: unknown = null;
+  private reconnectTimer: unknown = null;
+  private reconnecting = false;
   private disposed = false;
   private readonly ready: Promise<void>;
 
@@ -89,11 +103,11 @@ export class PaSessionHub {
   private async open(resume: boolean): Promise<void> {
     let initial = !resume;
     let current: (() => void) | null = null;
-    let closedEarly = false;
+    let ended = false;
     const release = await this.feed(
       {
         onEvent: (event) => {
-          if (this.disposed) return;
+          if (this.disposed || ended) return;
           if (initial && event.type === "snapshot") {
             initial = false;
             this.running = event.running;
@@ -103,33 +117,70 @@ export class PaSessionHub {
           this.publish(event);
         },
         onClose: (reason) => {
-          // A feed may end while it is still bootstrapping, before it has handed back `release`.
-          if (current === null) closedEarly = true;
-          else if (this.release === current) this.release = null;
-          if (!this.disposed) void this.reconnect(reason);
+          if (ended) return;
+          ended = true;
+          // Still bootstrapping: `open` sees `ended` and fails, so its caller owns the retry.
+          if (current === null) return;
+          if (this.release === current) this.release = null;
+          this.reconnect(reason);
         },
       },
       { resume },
     );
     current = release;
-    if (this.disposed) {
+    if (ended || this.disposed) {
       release();
+      if (ended && !this.disposed) {
+        throw new PaError({
+          reason: "Unavailable",
+          message: "The session feed closed while opening",
+        });
+      }
       return;
     }
-    if (!closedEarly) this.release = release;
+    const previous = this.release;
+    this.release = release;
+    previous?.();
   }
 
-  private async reconnect(reason: string | undefined): Promise<void> {
+  /** Single-flight: a feed that drops while a reconnect is running is picked up by that loop. */
+  private reconnect(reason: string | undefined): void {
+    if (this.disposed || this.reconnecting) return;
+    this.reconnecting = true;
+    void this.runReconnect(reason);
+  }
+
+  private async runReconnect(reason: string | undefined): Promise<void> {
+    try {
+      await this.reconnectLoop(reason);
+    } finally {
+      this.reconnecting = false;
+    }
+    // A feed that dropped after the loop last looked found `reconnecting` still set: retry it.
+    if (!this.disposed && this.release === null) this.reconnect(reason);
+  }
+
+  private async reconnectLoop(reason: string | undefined): Promise<void> {
     for (const delay of this.options.reconnectDelaysMs) {
       if (this.disposed) return;
-      await new Promise<void>((resolve) => this.options.timers.set(resolve, delay));
+      await new Promise<void>((resolve) => {
+        this.reconnectTimer = this.options.timers.set(() => {
+          this.reconnectTimer = null;
+          resolve();
+        }, delay);
+      });
       if (this.disposed) return;
       try {
         await this.open(true);
-        return;
-      } catch {
-        // Retried below; the last failure ends every listener.
+      } catch (cause) {
+        if (isPaError(cause) && PERMANENT_FEED_FAILURES.has(cause.reason)) {
+          this.failAll(cause);
+          return;
+        }
+        continue;
       }
+      // The reopened feed may already have dropped again; keep going until one holds.
+      if (this.release !== null || this.disposed) return;
     }
     this.failAll(
       new PaError({
@@ -150,11 +201,10 @@ export class PaSessionHub {
         this.openRequests = stamped.openRequests;
         break;
       case "turn.started":
-        this.running = true;
-        break;
       case "turn.completed":
       case "error":
-        this.running = false;
+        this.running = stamped.type === "turn.started";
+        this.openRequests = this.openRequests.filter((request) => request.scope === "session");
         break;
       case "request.opened":
         this.openRequests = [
@@ -169,6 +219,12 @@ export class PaSessionHub {
         break;
     }
     for (const listener of this.listeners) listener.onEvent(stamped);
+  }
+
+  /** An answered prompt, published at once so no viewer (or later snapshot) still offers it. */
+  resolveRequest(requestId: string): void {
+    if (this.disposed || !this.openRequests.some((r) => r.requestId === requestId)) return;
+    this.publish({ type: "request.resolved", sessionId: this.sessionId, requestId });
   }
 
   /** For output the engine never streams or stores, such as a command's immediate result. */
@@ -239,6 +295,8 @@ export class PaSessionHub {
     if (this.disposed) return;
     this.disposed = true;
     if (this.lingerTimer !== null) this.options.timers.clear(this.lingerTimer);
+    if (this.reconnectTimer !== null) this.options.timers.clear(this.reconnectTimer);
+    this.reconnectTimer = null;
     this.listeners.clear();
     this.release?.();
     this.release = null;

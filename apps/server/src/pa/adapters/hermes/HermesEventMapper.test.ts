@@ -7,6 +7,7 @@ import type { HermesTrackedRequest } from "./HermesNormalizers.ts";
 function makeMapper() {
   const opened: HermesTrackedRequest[] = [];
   const resolved: string[] = [];
+  let turnBoundaries = 0;
   let generation = 3;
   const mapper = new HermesEventMapper("s-1", {
     currentGeneration: () => generation,
@@ -15,10 +16,19 @@ function makeMapper() {
     },
     onRequestOpened: (tracked) => opened.push(tracked),
     onRequestResolved: (id) => resolved.push(id),
+    onTurnBoundary: () => {
+      turnBoundaries += 1;
+    },
   });
   const map = (event: string, payload: Record<string, unknown> = {}, extra = {}) =>
     mapper.map({ event, session_id: "s-1", payload, ...extra });
-  return { map, opened, resolved, generation: () => generation };
+  return {
+    map,
+    opened,
+    resolved,
+    generation: () => generation,
+    turnBoundaries: () => turnBoundaries,
+  };
 }
 
 const texts = (events: ReadonlyArray<PaAdapterEvent>) =>
@@ -143,6 +153,44 @@ describe("HermesEventMapper", () => {
     ]);
     expect(map("notice", { message: "Saved" })).toEqual([
       { type: "notice", sessionId: "s-1", message: "Saved", persistent: true },
+    ]);
+  });
+});
+
+describe("HermesEventMapper turn boundaries", () => {
+  it("forgets streamed reasoning and commentary when a turn completes", () => {
+    const { map } = makeMapper();
+    map("message.start", { turn_id: "t1" });
+    map("reasoning.delta", { text: "thinking" });
+    map("message.delta", { text: "Looking", offset: 0, turn_id: "t1" });
+    map("message.interim", { text: "Looking", already_streamed: true });
+    map("message.complete", { text: "Done" });
+
+    // The next turn starts without `message.start`: its own trace must still show.
+    expect(map("reasoning.available", { text: "next trace" })).toEqual([
+      { type: "reasoning.delta", sessionId: "s-1", text: "next trace" },
+    ]);
+    const answer = texts(map("message.delta", { text: "Answer", offset: 0, turn_id: "t2" }));
+    expect(answer).toEqual([["answer", "Answer", "t2:0"]]);
+  });
+
+  it("resets offset, segment, reasoning and commentary after an error frame", () => {
+    const { map, turnBoundaries } = makeMapper();
+    map("message.start", { turn_id: "t1" });
+    map("reasoning.delta", { text: "thinking" });
+    map("message.delta", { text: "Partial answer", offset: 0, turn_id: "t1" });
+    map("message.interim", { text: "Partial answer", already_streamed: true });
+    expect(map("error", { message: "boom" })).toEqual([
+      { type: "error", sessionId: "s-1", message: "boom" },
+    ]);
+    expect(turnBoundaries()).toBe(2);
+
+    // Without `message.start`, the next turn's offset-0 text is new, in a fresh answer segment.
+    expect(map("reasoning.available", { text: "next trace" })).toEqual([
+      { type: "reasoning.delta", sessionId: "s-1", text: "next trace" },
+    ]);
+    expect(texts(map("message.delta", { text: "Fresh", offset: 0 }))).toEqual([
+      ["answer", "Fresh", "turn-2:0"],
     ]);
   });
 });

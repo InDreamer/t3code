@@ -638,12 +638,14 @@ export function normalizePendingRequest(
     executionGeneration,
     ...(channel === "server_request" ? { lockedAnswers: extractLockedAnswers(params) } : {}),
   };
+  const scope = channel === "server_request" ? { scope: "session" as const } : {};
   if (method === "approval") {
     const command = nonEmptyString(params?.command);
     return {
       ...routing,
       request: {
         requestId,
+        ...scope,
         kind: "approval",
         title: "Approval requested",
         detail:
@@ -687,6 +689,7 @@ export function normalizePendingRequest(
     ...routing,
     request: {
       requestId,
+      ...scope,
       kind: "clarify",
       title: "Clarification requested",
       detail,

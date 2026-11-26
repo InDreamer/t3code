@@ -21,6 +21,7 @@ import { Input } from "../ui/input";
 import {
   countPaSlashTabs,
   isCompletePaSlashCommand,
+  parsePaClientSlashAction,
   selectPaSlashCommands,
   type PaSlashTab,
 } from "@t3tools/client-runtime/pa/slash";
@@ -34,6 +35,11 @@ import type {
 import { PaModelPicker } from "./PaModelPicker";
 
 export type PaClarifyAnswers = Readonly<Record<string, PaClarifyAnswer>>;
+
+/** Safari ends an IME composition before its keydown; keyCode 229 still marks that Enter. */
+function isImeKeyDown(event: React.KeyboardEvent): boolean {
+  return event.nativeEvent.isComposing || event.keyCode === 229;
+}
 
 function PaPendingRequestBanner({
   req,
@@ -156,7 +162,13 @@ function PaPendingRequestBanner({
                     value={currentVal}
                     onChange={(e) => onClarifyAnswerChange(question.id, e.target.value)}
                     onKeyDown={(e) => {
-                      if (e.key === "Enter" && !e.nativeEvent.isComposing && !responding) {
+                      // With several questions, Enter on one must not submit the others blank.
+                      if (
+                        e.key === "Enter" &&
+                        !isImeKeyDown(e) &&
+                        !responding &&
+                        req.questions?.length === 1
+                      ) {
                         e.preventDefault();
                         onRespond();
                       }
@@ -260,7 +272,10 @@ export function PaComposer({
     (matchingCommands.length > 0 || (slashQuery === "" && slashCommands.length > 0));
   const clampedSlashIndex =
     matchingCommands.length === 0 ? 0 : Math.min(slashIndex, matchingCommands.length - 1);
-  const canSend = !running && !disabled && !sending && draft.trim().length > 0;
+  // Client commands (/stop, /new, /model) run while a turn streams; messages wait for it.
+  const isClientCommand = parsePaClientSlashAction(draft, slashCommands) !== null;
+  const canSend = (!running || isClientCommand) && !disabled && !sending && draft.trim().length > 0;
+  const canInterrupt = capabilities?.execution.interrupt !== false;
 
   const completeCommand = (command: PaSlashCommand) => {
     onDraftChange(`${command.name} `);
@@ -269,7 +284,7 @@ export function PaComposer({
   };
 
   const handleKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (event.nativeEvent.isComposing) return;
+    if (isImeKeyDown(event)) return;
     if (matchingCommands.length > 0) {
       if (event.key === "Escape") {
         event.preventDefault();
@@ -337,16 +352,20 @@ export function PaComposer({
 
   return (
     <div className="pointer-events-auto relative mx-auto w-full min-w-0 max-w-(--chat-content-max-width)">
-      {openRequests.map((req) => (
-        <PaPendingRequestBanner
-          key={req.requestId}
-          req={req}
-          responding={respondingIds.has(req.requestId)}
-          clarifyAnswerMap={clarifyAnswers[req.requestId] ?? {}}
-          onClarifyAnswerChange={(qId, val) => onClarifyAnswerChange(req.requestId, qId, val)}
-          onRespond={(decision) => onRespondRequest(req, decision)}
-        />
-      ))}
+      {openRequests.length > 0 ? (
+        <div className="mb-2 max-h-[min(22rem,50dvh)] min-w-0 overflow-y-auto overscroll-contain [&>*:last-child]:mb-0">
+          {openRequests.map((req) => (
+            <PaPendingRequestBanner
+              key={req.requestId}
+              req={req}
+              responding={respondingIds.has(req.requestId)}
+              clarifyAnswerMap={clarifyAnswers[req.requestId] ?? {}}
+              onClarifyAnswerChange={(qId, val) => onClarifyAnswerChange(req.requestId, qId, val)}
+              onRespond={(decision) => onRespondRequest(req, decision)}
+            />
+          ))}
+        </div>
+      ) : null}
 
       {error ? (
         <div
@@ -503,7 +522,7 @@ export function PaComposer({
                 ) : null}
 
                 <div className="shrink-0">
-                  {running ? (
+                  {running && !isClientCommand && canInterrupt ? (
                     <Button
                       type="button"
                       size="icon-sm-pill"

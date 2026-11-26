@@ -127,6 +127,7 @@ import * as ProviderSessionManager from "./orchestration-v2/ProviderSessionManag
 import * as PullRequestReviewGuideService from "./pullRequest/PullRequestReviewGuideService.ts";
 import * as IssueService from "./issue/IssueService.ts";
 import * as PaService from "./pa/PaService.ts";
+import { hermesRequiredScope } from "./pa/adapters/hermes/HermesNormalizers.ts";
 import * as ThreadIssueService from "./orchestration-v2/ThreadIssueService.ts";
 import * as IssueTrackerConnections from "./issue/IssueTrackerConnections.ts";
 import * as PullRequestService from "./pullRequest/PullRequestService.ts";
@@ -2901,6 +2902,110 @@ const layerWorkflowRpcTest = Layer.mergeAll(
   Layer.fresh(layerConfigSources),
   Layer.mock(PreviewAutomationBroker.PreviewAutomationBroker)({}),
   Layer.mock(ServerBrowser.ServerBrowser)({}),
+);
+
+const paTags = [WS_METHODS.paSendMessage, WS_METHODS.paMutateSchedule] as const;
+const paRpcs = WsRpcGroup.omit(
+  ...[...WsRpcGroup.requests.keys()].filter(
+    (
+      tag,
+    ): tag is Exclude<keyof typeof RpcAuthorization.RPC_REQUIRED_SCOPES, (typeof paTags)[number]> =>
+      !(paTags as ReadonlyArray<string>).includes(tag),
+  ),
+);
+
+/** A client for the PA RPCs whose session holds `scopes`; `calls` records what reached the service. */
+const makePaClient = Effect.fn("test.makePaClient")(function* (
+  scopes: ReadonlyArray<AuthEnvironmentScope>,
+  calls: Array<string>,
+) {
+  const services = Layer.mergeAll(
+    layerUnusedConfigRpcServices,
+    Layer.mock(ExternalLauncher.ExternalLauncher)({}),
+    Layer.mock(ProviderRegistry.ProviderRegistry)({}),
+    Layer.mock(UsageLimitSources.UsageLimitSources)({}),
+    Layer.mock(RemoteOpenTargets.RemoteOpenTargets)({}),
+    Layer.mock(DirectEndpoints.DirectEndpoints)({}),
+    Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({ namedProjectsRoot: "/unused" }),
+    Layer.mock(ScratchThreadPromotion.ScratchThreadPromotion)({}),
+    Layer.mock(ServerEnvironment.ServerEnvironment)({}),
+    Layer.mock(EnvironmentAuth.EnvironmentAuth)({}),
+    Layer.mock(PaService.PaService)({
+      // Hermes's own command policy, so the handler's scope check is the real one.
+      requiredScopeForMessage: (_botId, text) => Effect.succeed(hermesRequiredScope(text)),
+      sendMessage: (input) =>
+        Effect.sync(() => {
+          calls.push(`send:${input.text}`);
+          return { kind: "output" as const, sessionId: input.sessionId, output: "ok" };
+        }),
+      mutateSchedule: (input) =>
+        Effect.sync(() => {
+          calls.push(`schedule:${input.action}`);
+          return [];
+        }),
+    }),
+  );
+  return yield* RpcTest.makeClient(paRpcs).pipe(
+    Effect.provide(
+      layerWsRpc(
+        {
+          sessionId: AuthSessionId.make("pa-test"),
+          subject: "pa-test",
+          method: "browser-session-cookie",
+          scopes: [...scopes],
+        },
+        {},
+        yield* ServerBrowser.ServerBrowser,
+        () => Effect.void,
+        { secretReferences: true },
+      ).pipe(Layer.provide(services), Layer.merge(RpcAuthorization.layer(scopes))),
+    ),
+  );
+});
+
+it.effect("a PA message that changes the agent needs providers:manage, not just operate", () =>
+  Effect.gen(function* () {
+    const calls: Array<string> = [];
+    const send = (text: string) => ({ botId: "hermes:default", sessionId: "s-1", text });
+    const operator = yield* makePaClient([AuthOrchestrationOperateScope], calls);
+
+    const refused = yield* operator[WS_METHODS.paSendMessage](send("/config set x 1")).pipe(
+      Effect.flip,
+    );
+    assert.strictEqual(refused._tag, "EnvironmentAuthorizationError");
+    assert.deepEqual(calls, []);
+
+    yield* operator[WS_METHODS.paSendMessage](send("/status"));
+    yield* operator[WS_METHODS.paSendMessage](send("hello"));
+    assert.deepEqual(calls, ["send:/status", "send:hello"]);
+
+    const manager = yield* makePaClient(
+      [AuthOrchestrationOperateScope, AuthProvidersManageScope],
+      calls,
+    );
+    yield* manager[WS_METHODS.paSendMessage](send("/config set x 1"));
+    assert.deepEqual(calls.at(-1), "send:/config set x 1");
+  }).pipe(Effect.provide(layerWorkflowRpcTest), Effect.scoped),
+);
+
+it.effect("a PA schedule change needs both providers:manage and orchestration:operate", () =>
+  Effect.gen(function* () {
+    const calls: Array<string> = [];
+    const pause = { botId: "hermes:default", action: "pause" as const, scheduleId: "job-1" };
+    for (const scopes of [[AuthProvidersManageScope], [AuthOrchestrationOperateScope]]) {
+      const client = yield* makePaClient(scopes, calls);
+      const refused = yield* client[WS_METHODS.paMutateSchedule](pause).pipe(Effect.flip);
+      assert.strictEqual(refused._tag, "EnvironmentAuthorizationError");
+    }
+    assert.deepEqual(calls, []);
+
+    const both = yield* makePaClient(
+      [AuthProvidersManageScope, AuthOrchestrationOperateScope],
+      calls,
+    );
+    yield* both[WS_METHODS.paMutateSchedule](pause);
+    assert.deepEqual(calls, ["schedule:pause"]);
+  }).pipe(Effect.provide(layerWorkflowRpcTest), Effect.scoped),
 );
 
 /** A client for the ACP Registry RPCs; `calls` records what reached the agent or the catalog. */

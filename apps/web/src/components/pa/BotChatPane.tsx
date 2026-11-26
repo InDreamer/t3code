@@ -17,6 +17,7 @@ import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
 import { WorkspacePageHeader } from "../WorkspacePageHeader";
+import { paErrorReason } from "@t3tools/client-runtime/pa/environment";
 import { parsePaClientSlashAction } from "@t3tools/client-runtime/pa/slash";
 import {
   buildPaTimelineItems,
@@ -24,6 +25,7 @@ import {
   createInitialPaLiveTurn,
   findActivePaToolAction,
   mergePaMessagesByTime,
+  nextPaLocalTimestamp,
   paNoticeMessage,
   reducePaStreamEvent,
   type PaLiveTurnState,
@@ -38,6 +40,7 @@ import type {
   PaSlashCommand,
   PaStreamEvent,
 } from "@t3tools/contracts";
+import { sendPaChatMessage, trackAdmittedPaRow } from "./BotChatPane.logic";
 import { BotAvatar } from "./BotAvatar";
 import { paApi, paErrorMessage } from "./paApi";
 import { PaComposer, type PaClarifyAnswers } from "./PaComposer";
@@ -52,23 +55,20 @@ import {
 } from "./PaTimelineRows";
 
 const QUICK_COMMAND_COUNT = 3;
+const NO_SLASH_COMMANDS: ReadonlyArray<PaSlashCommand> = [];
 const SCROLL_NEAR_BOTTOM_PX = 96;
 
 let localMessageSeq = 0;
 
-function createLocalMessage(role: PaMessage["role"], text: string): PaMessage {
+function createLocalMessage(role: PaMessage["role"], text: string, timestamp: number): PaMessage {
   localMessageSeq += 1;
   return {
     id: `local-${role}-${localMessageSeq}`,
     role,
     text,
-    timestamp: Date.now(),
+    timestamp,
     rowKind: "message",
   };
-}
-
-function noticeMessageNow(notice: Parameters<typeof paNoticeMessage>[0]): PaMessage {
-  return paNoticeMessage(notice, Date.now());
 }
 
 function makeInputId(): string {
@@ -127,7 +127,7 @@ export function BotChatPane({
     {},
   );
   const [loadingMessagesFor, setLoadingMessagesFor] = useState<string | null>(null);
-  const [slashCommands, setSlashCommands] = useState<ReadonlyArray<PaSlashCommand>>([]);
+  const [loadedSlashCommands, setSlashCommands] = useState<ReadonlyArray<PaSlashCommand>>([]);
   const [liveTurnState, setLiveTurnState] = useState<PaLiveTurnState>(() =>
     createInitialPaLiveTurn(null),
   );
@@ -135,7 +135,10 @@ export function BotChatPane({
   const activeSessionIdRef = useRef<string | null>(activeSessionId);
 
   const messages = messagesState.sessionId === activeSessionId ? messagesState.items : [];
-  const loadingMessages = activeSessionId !== null && loadingMessagesFor === activeSessionId;
+  // A session's transcript is read once its feed attaches; until then nothing for it is shown.
+  const loadingMessages =
+    activeSessionId !== null &&
+    (messagesState.sessionId !== activeSessionId || loadingMessagesFor === activeSessionId);
   const liveTurn =
     liveTurnState.sessionId === activeSessionId
       ? liveTurnState
@@ -143,6 +146,8 @@ export function BotChatPane({
   const running = liveTurn.phase === "running";
   const openRequests = liveTurn.openRequests;
   const streamError = liveTurn.error;
+  const localMessages = activeSessionId ? (localBySession[activeSessionId] ?? []) : [];
+  const mergedMessages = mergePaMessagesByTime(messages, localMessages);
 
   const setSessionMessages = (
     sessionId: string,
@@ -171,10 +176,17 @@ export function BotChatPane({
   const [clarifyAnswers, setClarifyAnswers] = useState<Record<string, PaClarifyAnswers>>({});
   const [respondingIds, setRespondingIds] = useState<ReadonlySet<string>>(() => new Set());
 
-  const completedTurnsRef = useRef(0);
-  const settleTokenRef = useRef(0);
+  const settleTokensRef = useRef(new Map<string, number>());
   const transcriptRequestRef = useRef(0);
-  const failedSendRef = useRef<{ text: string; inputId: string } | null>(null);
+  const failedSendRef = useRef(new Map<string, { text: string; inputId: string }>());
+  /** An admitted row can be reconciled by text, or by turn completion for rewritten prompts. */
+  const pendingUserRowsRef = useRef(new Map<string, Map<string, boolean>>());
+  const recoveredSessionsRef = useRef(new Set<string>());
+  const mountedRef = useRef(false);
+  const commandsSupported = capabilities?.commands.supported !== false;
+  const canCreateSession = capabilities?.sessions.create !== false;
+  const canInterrupt = capabilities?.execution.interrupt !== false;
+  const slashCommands = commandsSupported ? loadedSlashCommands : NO_SLASH_COMMANDS;
 
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
@@ -214,12 +226,36 @@ export function BotChatPane({
       if (showSpinner) {
         setLoadingMessagesFor(sessionId);
       }
+      // Only rows admitted before this read started can be in what it returns.
+      const candidates = new Map(pendingUserRowsRef.current.get(sessionId));
 
       return paApi
         .getMessages(bot.botId, sessionId)
         .then((loaded) => {
           if (!current()) return;
           setSessionMessages(sessionId, loaded);
+          if (candidates.size > 0) {
+            const storedUserTexts = new Set(
+              loaded.flatMap((item) => (item.role === "user" ? [item.text.trim()] : [])),
+            );
+            setLocalBySession((prev) => {
+              const existing = prev[sessionId] ?? [];
+              // Stored as typed, or (a command rewritten into a prompt) once its turn has ended.
+              const reconciled = new Set(
+                existing
+                  .filter(
+                    (item) =>
+                      candidates.has(item.id) &&
+                      (candidates.get(item.id) || storedUserTexts.has(item.text.trim())),
+                  )
+                  .map((item) => item.id),
+              );
+              if (reconciled.size === 0) return prev;
+              const pending = pendingUserRowsRef.current.get(sessionId);
+              for (const id of reconciled) pending?.delete(id);
+              return { ...prev, [sessionId]: existing.filter((item) => !reconciled.has(item.id)) };
+            });
+          }
           if (expectedSettleToken !== undefined) {
             // Clear the settling live blocks atomically once persisted messages are committed (zero flicker).
             updateLiveTurn(sessionId, (prev) => clearSettledPaLiveTurn(prev, expectedSettleToken));
@@ -227,6 +263,10 @@ export function BotChatPane({
         })
         .catch((err) => {
           if (current()) {
+            // A first read that fails still ends the spinner; a failed reload keeps what is shown.
+            setMessagesState((prev) =>
+              prev.sessionId === sessionId ? prev : { sessionId, items: [] },
+            );
             updateLiveTurn(sessionId, (prev) => ({
               ...prev,
               error: paErrorMessage(err, gt("加载消息失败")),
@@ -261,19 +301,36 @@ export function BotChatPane({
     }
   };
 
-  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- loads this Bot's sessions and native slash catalog once per Bot mount, and marks unread bots read
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- tracks mount so a late session create cannot navigate after this Bot's pane is gone
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- loads the engine's native slash catalog once per Bot
+  useEffect(() => {
+    if (!commandsSupported) return;
+    let cancelled = false;
+    paApi.listCommands(bot.botId).then(
+      (cmds) => {
+        if (!cancelled) setSlashCommands(cmds);
+      },
+      () => undefined,
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [bot.botId, commandsSupported]);
+
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- loads this Bot's sessions once per Bot mount, and marks unread bots read
   useEffect(() => {
     const controller = new AbortController();
-    const commandsSupported = capabilities?.commands.supported !== false;
-    Promise.all([
-      paApi.listSessions(bot.botId),
-      commandsSupported
-        ? paApi.listCommands(bot.botId).catch((): ReadonlyArray<PaSlashCommand> => [])
-        : Promise.resolve<ReadonlyArray<PaSlashCommand>>([]),
-    ])
-      .then(async ([sessionRes, cmds]) => {
+    paApi
+      .listSessions(bot.botId)
+      .then(async (sessionRes) => {
         if (controller.signal.aborted) return;
-        setSlashCommands(cmds);
         setSessions(sessionRes.sessions);
 
         const initialProp = getSelectedSessionProp();
@@ -282,12 +339,14 @@ export function BotChatPane({
             ? initialProp
             : sessionRes.primarySessionId;
 
-        if (!targetId) {
+        if (!targetId && canCreateSession) {
           const created = await paApi.ensurePrimarySession(bot.botId);
           if (controller.signal.aborted) return;
           targetId = created.sessionId;
           setSessions((prev) => [created, ...prev]);
         }
+        targetId ??= sessionRes.sessions[0]?.sessionId ?? null;
+        if (!targetId) return;
 
         activeSessionIdRef.current = targetId;
         setFallbackSessionId(targetId);
@@ -316,7 +375,7 @@ export function BotChatPane({
     return () => controller.abort();
   }, [
     bot.botId,
-    capabilities,
+    canCreateSession,
     gt,
     getSelectedSessionProp,
     updateLiveTurn,
@@ -325,42 +384,96 @@ export function BotChatPane({
     stableOnActivity,
   ]);
 
-  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- fetches the stored transcript whenever the active session changes
-  useEffect(() => {
-    activeSessionIdRef.current = activeSessionId;
-    if (!activeSessionId) return;
-    isNearBottomRef.current = true;
-    void loadTranscript(activeSessionId, true);
-    return () => {
-      transcriptRequestRef.current += 1;
-    };
-  }, [activeSessionId, loadTranscript]);
+  /** A session the engine no longer has (often a stale primary): move to one it does have. */
+  const recoverMissingSession = useStableCallback(async (missingId: string, cause: unknown) => {
+    if (recoveredSessionsRef.current.has(missingId)) return;
+    recoveredSessionsRef.current.add(missingId);
+    try {
+      const res = await paApi.listSessions(bot.botId);
+      if (!mountedRef.current || activeSessionIdRef.current !== missingId) return;
+      const remaining = res.sessions.filter((item) => item.sessionId !== missingId);
+      let nextId =
+        res.primarySessionId && res.primarySessionId !== missingId ? res.primarySessionId : null;
+      let nextSessions = remaining;
+      if (!nextId && canCreateSession) {
+        const created = await paApi.ensurePrimarySession(bot.botId);
+        if (!mountedRef.current || activeSessionIdRef.current !== missingId) return;
+        nextId = created.sessionId;
+        nextSessions = [created, ...remaining.map((item) => ({ ...item, isPrimary: false }))];
+      }
+      nextId ??= remaining[0]?.sessionId ?? null;
+      setSessions(nextSessions);
+      if (!nextId) {
+        // Nowhere to move and no way to start a conversation: say so instead of going blank.
+        updateLiveTurn(missingId, (prev) => ({
+          ...prev,
+          error: paErrorMessage(cause, gt("这个对话已不存在")),
+        }));
+        return;
+      }
+      activeSessionIdRef.current = nextId;
+      setFallbackSessionId(nextId);
+      stableSelectSession(nextId);
+    } catch (err) {
+      updateLiveTurn(missingId, (prev) => ({
+        ...prev,
+        error: paErrorMessage(err, gt("连接 Bot 会话失败")),
+      }));
+    }
+  });
 
   const appendLocalMessage = useStableCallback((sessionId: string, message: PaMessage) => {
     setLocalBySession((prev) => {
       const existing = prev[sessionId] ?? [];
       // A command's output arrives both as its send result and on the feed: show it once.
       if (existing.some((item) => item.id === message.id)) return prev;
-      return { ...prev, [sessionId]: [...existing, message] };
+      // Strictly after every local row, so a command's output never lands above its input.
+      const timestamp = nextPaLocalTimestamp(existing, message.timestamp ?? Date.now());
+      return { ...prev, [sessionId]: [...existing, { ...message, timestamp }] };
     });
   });
 
-  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- follows the session's live feed; the connection runtime reconnects and the server resumes from the last event
+  const removeLocalMessage = (sessionId: string, messageId: string) => {
+    pendingUserRowsRef.current.get(sessionId)?.delete(messageId);
+    setLocalBySession((prev) => {
+      const existing = prev[sessionId];
+      if (!existing?.some((item) => item.id === messageId)) return prev;
+      return { ...prev, [sessionId]: existing.filter((item) => item.id !== messageId) };
+    });
+  };
+
+  /** A timestamp no earlier than anything shown, whatever this device's clock says. */
+  const localTimestampNow = useStableCallback(() =>
+    nextPaLocalTimestamp(mergedMessages, Date.now()),
+  );
+
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- follows the session's live feed and reads the transcript once attached; the connection runtime reconnects and the server resumes from the last event
   useEffect(() => {
+    activeSessionIdRef.current = activeSessionId;
     if (!activeSessionId) return;
     const sessionId = activeSessionId;
     let closed = false;
+    // Read the transcript only once the feed is attached, so nothing lands between the two. A
+    // fallback read while the feed is down does not count: the first snapshot still reads again.
+    let transcriptRead = false;
+    let transcriptShown = false;
+    const readTranscript = () => {
+      void loadTranscript(sessionId, !transcriptShown);
+      transcriptRead = true;
+      transcriptShown = true;
+    };
+    isNearBottomRef.current = true;
 
     const handleEvent = (event: PaStreamEvent) => {
       if (closed || activeSessionIdRef.current !== sessionId) return;
       switch (event.type) {
         case "snapshot":
           updateLiveTurn(sessionId, (prev) => reducePaStreamEvent(prev, event, Date.now()));
-          if (event.snapshotRequired) void loadTranscript(sessionId, false);
+          if (!transcriptRead || event.snapshotRequired) readTranscript();
           return;
         case "notice":
           if (event.persistent) {
-            appendLocalMessage(sessionId, noticeMessageNow(event));
+            appendLocalMessage(sessionId, paNoticeMessage(event, localTimestampNow()));
             return;
           }
           break;
@@ -377,19 +490,24 @@ export function BotChatPane({
             ),
           );
           return;
-        case "turn.completed": {
-          completedTurnsRef.current += 1;
-          settleTokenRef.current += 1;
-          const token = settleTokenRef.current;
+        case "turn.completed":
+        case "error": {
+          // An error ends the turn too: a send that resolves after it must not re-mark it running.
+          const token = (settleTokensRef.current.get(sessionId) ?? 0) + 1;
+          settleTokensRef.current.set(sessionId, token);
+          const pending = pendingUserRowsRef.current.get(sessionId);
+          pending?.forEach((_ended, id) => pending.set(id, true));
           updateLiveTurn(sessionId, (prev) => ({
             ...reducePaStreamEvent(prev, event, Date.now()),
             settleToken: token,
           }));
           void loadTranscript(sessionId, false, token);
-          void paApi
-            .markRead(bot.botId)
-            .catch(() => undefined)
-            .finally(() => stableOnActivity());
+          if (event.type === "turn.completed") {
+            void paApi
+              .markRead(bot.botId)
+              .catch(() => undefined)
+              .finally(() => stableOnActivity());
+          }
           return;
         }
         default:
@@ -400,11 +518,23 @@ export function BotChatPane({
 
     const stop = paApi.followSession(bot.botId, sessionId, {
       onEvent: handleEvent,
-      onFailure: (error) => {
+      onFailure: (error, { retrying }) => {
         if (closed) return;
+        // The stored transcript is still worth showing while the live feed is down.
+        if (!transcriptShown) {
+          void loadTranscript(sessionId, true);
+          transcriptShown = true;
+        }
+        if (!retrying && paErrorReason(error) === "NotFound") {
+          void recoverMissingSession(sessionId, error);
+          return;
+        }
         updateLiveTurn(sessionId, (prev) => ({
           ...prev,
-          error: paErrorMessage(error, gt("会话连接中断，正在重连")),
+          error: paErrorMessage(
+            error,
+            retrying ? gt("会话连接中断，正在重连") : gt("连接 Bot 会话失败"),
+          ),
         }));
       },
     });
@@ -412,6 +542,7 @@ export function BotChatPane({
     return () => {
       closed = true;
       stop();
+      transcriptRequestRef.current += 1;
     };
   }, [
     bot.botId,
@@ -419,12 +550,12 @@ export function BotChatPane({
     appendLocalMessage,
     gt,
     loadTranscript,
+    localTimestampNow,
+    recoverMissingSession,
     updateLiveTurn,
     stableOnActivity,
   ]);
 
-  const localMessages = activeSessionId ? (localBySession[activeSessionId] ?? []) : [];
-  const mergedMessages = mergePaMessagesByTime(messages, localMessages);
   const timelineItems = buildPaTimelineItems(mergedMessages);
   const hasLiveTurn = liveTurn.phase !== "idle" || liveTurn.blocks.length > 0;
 
@@ -483,16 +614,19 @@ export function BotChatPane({
 
   const handleCreateNewSession = async (title = "") => {
     setSessionsOpen(false);
+    const fromSessionId = activeSessionId;
     let created: PaSessionSummary;
     try {
       created = await paApi.createSession(bot.botId, title || undefined);
     } catch (err) {
-      updateLiveTurn(activeSessionId, (prev) => ({
+      updateLiveTurn(fromSessionId, (prev) => ({
         ...prev,
         error: paErrorMessage(err, gt("新建对话失败")),
       }));
       return;
     }
+    // This pane belongs to one Bot: a create that lands after leaving it must not navigate back.
+    if (!mountedRef.current) return;
     setSessions((prev) => [created, ...prev.map((s) => ({ ...s, isPrimary: false }))]);
     activeSessionIdRef.current = created.sessionId;
     setFallbackSessionId(created.sessionId);
@@ -511,9 +645,23 @@ export function BotChatPane({
       updateLiveTurn(sessionId, (prev) => ({ ...prev, error: null }));
       switch (clientAction.kind) {
         case "new-session":
+          if (!canCreateSession) {
+            updateLiveTurn(sessionId, (prev) => ({
+              ...prev,
+              error: gt("这个 Bot 不支持新建对话"),
+            }));
+            return;
+          }
           await handleCreateNewSession(clientAction.title);
           return;
         case "interrupt":
+          if (!canInterrupt) {
+            updateLiveTurn(sessionId, (prev) => ({
+              ...prev,
+              error: gt("这个 Bot 不支持停止回复"),
+            }));
+            return;
+          }
           await handleInterrupt();
           return;
         case "model-picker":
@@ -527,27 +675,43 @@ export function BotChatPane({
     isNearBottomRef.current = true;
     setScrolledUpForSession(null);
 
-    const inputId =
-      failedSendRef.current && failedSendRef.current.text === text
-        ? failedSendRef.current.inputId
-        : makeInputId();
-
-    const optimisticMsg = createLocalMessage("user", text);
-    setSessionMessages(sessionId, (prev) => [...prev, optimisticMsg]);
-    const completedBeforeSend = completedTurnsRef.current;
-
+    // A local row until a reload shows it stored; only an admitted turn is ever stored.
+    const optimisticMsg = createLocalMessage("user", text, localTimestampNow());
+    appendLocalMessage(sessionId, optimisticMsg);
+    const completedBeforeSend = settleTokensRef.current.get(sessionId);
     try {
-      const res = await paApi.sendMessage(bot.botId, sessionId, text, inputId);
-      failedSendRef.current = null;
+      const { result: res, inputId } = await sendPaChatMessage(
+        failedSendRef.current,
+        sessionId,
+        text,
+        makeInputId,
+        (id) => paApi.sendMessage(bot.botId, sessionId, text, id),
+      );
+      const settleToken = settleTokensRef.current.get(sessionId);
+      const turnEnded = trackAdmittedPaRow(
+        pendingUserRowsRef.current,
+        sessionId,
+        optimisticMsg.id,
+        res,
+        settleToken !== completedBeforeSend,
+      );
+      // A turn that ended before this answer arrived was read without this row: read again.
       if (res.kind === "output") {
-        setSessionMessages(sessionId, (prev) => prev.filter((m) => m.id !== optimisticMsg.id));
-        appendLocalMessage(sessionId, optimisticMsg);
+        // The engine stores neither a command nor its output: both stay local rows.
         appendLocalMessage(
           sessionId,
-          noticeMessageNow({ message: res.output || res.notice || gt("命令已执行"), inputId }),
+          paNoticeMessage(
+            { message: res.output || res.notice || gt("命令已执行"), inputId },
+            localTimestampNow(),
+          ),
         );
         onActivity();
-      } else if (completedTurnsRef.current === completedBeforeSend) {
+      } else if (turnEnded) {
+        if (activeSessionIdRef.current === sessionId) {
+          void loadTranscript(sessionId, false, settleToken);
+        }
+        if (res.settled) onActivity();
+      } else {
         updateLiveTurn(sessionId, (prev) =>
           prev.phase === "running"
             ? prev
@@ -561,8 +725,7 @@ export function BotChatPane({
         );
       }
     } catch (err) {
-      failedSendRef.current = { text, inputId };
-      setSessionMessages(sessionId, (prev) => prev.filter((m) => m.id !== optimisticMsg.id));
+      removeLocalMessage(sessionId, optimisticMsg.id);
       if (rawOverride === undefined && activeSessionIdRef.current === sessionId) {
         setDraft((current) => (current ? current : text));
       }
@@ -579,12 +742,9 @@ export function BotChatPane({
     if (!activeSessionId) return;
     const sessionId = activeSessionId;
     try {
+      // The turn's own completion settles it: trailing frames may still be on their way.
       await paApi.interruptSession(bot.botId, sessionId);
-      updateLiveTurn(sessionId, (prev) => ({
-        ...prev,
-        phase: prev.blocks.length > 0 ? "settling" : "idle",
-        statusText: null,
-      }));
+      updateLiveTurn(sessionId, (prev) => ({ ...prev, statusText: null }));
     } catch (err) {
       updateLiveTurn(sessionId, (prev) => ({
         ...prev,
@@ -702,15 +862,17 @@ export function BotChatPane({
                 <span className="text-xs font-medium text-muted-foreground">
                   <T>切换对话记录</T>
                 </span>
-                <Button
-                  type="button"
-                  size="xs"
-                  variant="ghost"
-                  onClick={() => void handleCreateNewSession()}
-                >
-                  <MessageSquarePlusIcon className="size-3" />
-                  <T>新对话</T>
-                </Button>
+                {canCreateSession ? (
+                  <Button
+                    type="button"
+                    size="xs"
+                    variant="ghost"
+                    onClick={() => void handleCreateNewSession()}
+                  >
+                    <MessageSquarePlusIcon className="size-3" />
+                    <T>新对话</T>
+                  </Button>
+                ) : null}
               </div>
               <div className="max-h-72 space-y-1 overflow-y-auto">
                 {sessions.map((item) => (

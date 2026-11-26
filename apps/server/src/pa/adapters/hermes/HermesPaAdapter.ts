@@ -20,6 +20,7 @@ import type {
   PaSessionSubscriber,
 } from "../../types.ts";
 import {
+  HermesConnectionError,
   HermesConnectionPool,
   HermesRpcError,
   isValidHermesProfile,
@@ -27,8 +28,13 @@ import {
   type HermesRpcEventFrame,
   type HermesServerRequestFrame,
 } from "./HermesGatewayClient.ts";
-import { invalid, withPaErrors } from "./HermesErrors.ts";
-import { acceptHermesSeq, HermesEventMapper, type HermesSeqCursor } from "./HermesEventMapper.ts";
+import { invalid, isPaError, withPaErrors } from "./HermesErrors.ts";
+import {
+  acceptHermesSeq,
+  HermesEventMapper,
+  hermesResolvedRequestIds,
+  type HermesSeqCursor,
+} from "./HermesEventMapper.ts";
 import {
   HERMES_SECTION,
   hermesRequiredScope,
@@ -96,6 +102,7 @@ interface HermesReplayResult {
 }
 
 interface TrackedSessionState {
+  readonly profile: string;
   executionGeneration: number;
   replayEpoch: string | null;
   subscriptionId: string | null;
@@ -107,7 +114,58 @@ interface TrackedSessionState {
   /** Where the last feed for this session stopped, so a resumed feed replays only the gap. */
   readonly cursor: HermesSeqCursor;
   /** Open prompts this adapter has shown; `respond` only answers these. */
-  readonly requests: Map<string, HermesTrackedRequest>;
+  readonly requests: Map<string, FeedRequest>;
+  /** Kept across a same-epoch resume so a segment streamed before the drop keeps its id. */
+  mapper: HermesEventMapper | null;
+}
+
+type FeedRequest = HermesTrackedRequest & { readonly connection?: HermesRpcConnection };
+
+interface HermesSubmitReceipt {
+  readonly admission_id?: string;
+  readonly submission_id?: string;
+  /** `AdmissionStatus.status`: a retried input whose turn already ended answers `terminal`. */
+  readonly status?: string;
+  /** `CanonicalVoiceStopped`: a stop phrase ended voice chat and nothing was admitted. */
+  readonly voice_stopped?: boolean;
+}
+
+/** What `slash.exec` resolved a command to; a rewritten prompt is still submitted per attempt. */
+type SlashOutcome =
+  | { readonly kind: "output"; readonly output: string }
+  | { readonly kind: "prompt"; readonly message: string; readonly notice: string | undefined };
+
+interface SlashRun {
+  readonly text: string;
+  /** `unknown`: the request may have reached Hermes, so the command must not run again. */
+  status: "pending" | "settled" | "unknown";
+  readonly outcome: Promise<SlashOutcome>;
+}
+
+type BufferedFeedItem =
+  | { readonly kind: "event"; readonly frame: HermesRpcEventFrame }
+  | { readonly kind: "request"; readonly frame: HermesServerRequestFrame };
+
+/** Results of recent slash commands by input id: Hermes has no input-id dedupe for `slash.exec`. */
+const SLASH_RESULT_CACHE_SIZE = 256;
+/** Above Hermes's 30s quick-command limit, so a slow command is not reported as lost. */
+const SLASH_EXEC_TIMEOUT_MS = 40_000;
+
+const SLASH_REFUSALS = new Set([
+  "unsupported_command",
+  "invalid_params",
+  "not_found",
+  "forbidden",
+  "permission_denied",
+  "profile_mismatch",
+]);
+function isSlashRefusal(error: unknown): boolean {
+  if (isPaError(error)) return error.reason === "Unsupported";
+  return (
+    error instanceof HermesRpcError &&
+    error.code !== 5001 &&
+    (error.code === -32601 || error.code === -32602 || SLASH_REFUSALS.has(error.message))
+  );
 }
 
 const HERMES_CAPABILITIES: PaCapabilities = {
@@ -148,6 +206,10 @@ export class HermesPaAdapter implements PaEngineInstance {
 
   private readonly pool: HermesConnectionPool;
   private readonly sessionStates = new Map<string, TrackedSessionState>();
+  private readonly slashRuns = new Map<string, SlashRun>();
+  private readonly settledSlashRuns = new Map<string, SlashRun>();
+  /** Answers in flight by `profile::requestId`: Hermes request ids are unique per gateway. */
+  private readonly answering = new Map<string, symbol>();
   private versionCache: string | null = null;
   private versionProbe: Promise<void> | null = null;
 
@@ -157,6 +219,9 @@ export class HermesPaAdapter implements PaEngineInstance {
   }
 
   dispose = (): void => {
+    this.answering.clear();
+    this.slashRuns.clear();
+    this.settledSlashRuns.clear();
     this.sessionStates.clear();
     this.pool.closeAll();
   };
@@ -182,6 +247,7 @@ export class HermesPaAdapter implements PaEngineInstance {
     let state = this.sessionStates.get(key);
     if (!state) {
       state = {
+        profile,
         executionGeneration: 0,
         replayEpoch: null,
         subscriptionId: null,
@@ -190,10 +256,18 @@ export class HermesPaAdapter implements PaEngineInstance {
         subscribers: 0,
         cursor: { epoch: undefined, lastSeq: 0 },
         requests: new Map(),
+        mapper: null,
       };
       this.sessionStates.set(key, state);
     }
     return state;
+  }
+
+  /** An answered prompt is gone for every alias of its session on this profile. */
+  private forgetRequest(profile: string, requestId: string): void {
+    for (const state of this.sessionStates.values()) {
+      if (state.profile === profile) state.requests.delete(requestId);
+    }
   }
 
   listAgents = () =>
@@ -356,64 +430,166 @@ export class HermesPaAdapter implements PaEngineInstance {
       assertSession(profile, sessionId);
       const trimmed = text.trim();
       if (!trimmed) throw invalid("Message cannot be empty");
-      const conn = await this.pool.getConnection(profile);
-      const state = await this.ensureSessionAttached(profile, conn, sessionId);
-      const hermesSessionId = state.canonicalSessionId ?? sessionId;
       // Hermes canonical `prompt.submit` strictly requires `input_id` or `submission_id`.
-      const inputId = options.inputId?.trim() || NodeCrypto.randomUUID();
-      const submit = async (prompt: string) => {
-        const res = await conn.call<{ admission_id?: string; submission_id?: string }>(
-          "prompt.submit",
-          { session_id: hermesSessionId, text: prompt, input_id: inputId },
-        );
-        return res.admission_id ?? res.submission_id ?? inputId;
-      };
-
+      const clientInputId = options.inputId?.trim();
+      const inputId = clientInputId || NodeCrypto.randomUUID();
       if (!trimmed.startsWith("/")) {
-        return { kind: "turn", sessionId, submissionId: await submit(trimmed) };
+        return this.submitPrompt(profile, sessionId, trimmed, inputId, undefined);
       }
-
-      const execRes = await conn
-        .call<{
-          output?: string | null;
-          warning?: string | null;
-          type?: string | null;
-          message?: string | null;
-          notice?: string | null;
-          display?: string | null;
-        }>("slash.exec", { session_id: hermesSessionId, command: trimmed, profile })
-        .catch((err: unknown) => {
-          // `slash.exec` refuses client-local commands (session switches, terminal-only tools).
-          if (err instanceof HermesRpcError && /\bunsupported_command\b/.test(err.message)) {
-            const name = trimmed.split(/\s+/, 1)[0]!;
-            throw new PaError({
-              reason: "Unsupported",
-              message: [`${name} is not available in a web chat session.`, err.detail]
-                .filter(Boolean)
-                .join(" "),
-            });
-          }
-          throw err;
-        });
-
-      const notice = execRes.notice ?? execRes.display ?? undefined;
-      if (
-        (execRes.type === "send" || execRes.type === "skill") &&
-        typeof execRes.message === "string" &&
-        execRes.message.trim().length > 0
-      ) {
-        return {
-          kind: "turn",
-          sessionId,
-          submissionId: await submit(execRes.message),
-          ...(notice ? { notice } : {}),
-        };
+      const outcome = await this.runSlash(profile, sessionId, trimmed, clientInputId);
+      if (outcome.kind === "output") {
+        return { kind: "output", sessionId, output: outcome.output };
       }
-      const output = [execRes.output, execRes.warning, execRes.notice, execRes.display]
-        .filter((part): part is string => typeof part === "string" && part.trim().length > 0)
-        .join("\n\n");
-      return { kind: "output", sessionId, output: output || "Command executed." };
+      // The same input id each attempt: `prompt.submit` dedupes it and reports a finished turn.
+      return this.submitPrompt(profile, sessionId, outcome.message, inputId, outcome.notice);
     });
+
+  /** A retry after a lost response must not run a command (or a plugin) a second time. */
+  private async runSlash(
+    profile: string,
+    sessionId: string,
+    trimmed: string,
+    clientInputId: string | undefined,
+  ): Promise<SlashOutcome> {
+    const keyFor = (canonicalId: string) => JSON.stringify([profile, canonicalId, clientInputId]);
+    const cached = (key: string) => {
+      const existing = this.slashRuns.get(key) ?? this.settledSlashRuns.get(key);
+      if (!existing) return undefined;
+      if (existing.text !== trimmed) {
+        throw new PaError({
+          reason: "Conflict",
+          message: "This input id was already used for a different message",
+        });
+      }
+      if (existing.status === "unknown") {
+        throw new PaError({
+          reason: "Conflict",
+          message:
+            "The earlier attempt of this command may already have run; check the conversation before sending it again",
+        });
+      }
+      return existing.outcome;
+    };
+    if (clientInputId) {
+      const known = this.sessionStates.get(this.sessionKey(profile, sessionId));
+      const previous = cached(keyFor(known?.canonicalSessionId ?? sessionId));
+      if (previous) return previous;
+    }
+    const conn = await this.pool.getConnection(profile);
+    const state = await this.ensureSessionAttached(profile, conn, sessionId);
+    const canonicalId = state.canonicalSessionId ?? sessionId;
+    if (!clientInputId) return this.execSlash(conn, canonicalId, trimmed);
+    // Concurrent aliases can discover the same canonical id while awaiting resume.
+    const key = keyFor(canonicalId);
+    const previous = cached(key);
+    if (previous) return previous;
+    if (this.slashRuns.size >= SLASH_RESULT_CACHE_SIZE) {
+      throw new PaError({
+        reason: "Unavailable",
+        message: "Too many commands have pending or uncertain outcomes",
+      });
+    }
+    const outcome = this.execSlash(conn, canonicalId, trimmed);
+    const run: SlashRun = { text: trimmed, status: "pending", outcome };
+    this.slashRuns.set(key, run);
+    try {
+      const result = await outcome;
+      if (this.slashRuns.get(key) === run) {
+        this.slashRuns.delete(key);
+        run.status = "settled";
+        this.settledSlashRuns.set(key, run);
+        if (this.settledSlashRuns.size > SLASH_RESULT_CACHE_SIZE) {
+          this.settledSlashRuns.delete(this.settledSlashRuns.keys().next().value!);
+        }
+      }
+      return result;
+    } catch (err) {
+      if (this.slashRuns.get(key) === run) {
+        if (isSlashRefusal(err)) this.slashRuns.delete(key);
+        else run.status = "unknown";
+      }
+      throw err;
+    }
+  }
+
+  private async execSlash(
+    conn: HermesRpcConnection,
+    sessionId: string,
+    trimmed: string,
+  ): Promise<SlashOutcome> {
+    const execRes = await conn
+      .call<{
+        output?: string | null;
+        warning?: string | null;
+        type?: string | null;
+        message?: string | null;
+        notice?: string | null;
+        display?: string | null;
+      }>(
+        "slash.exec",
+        { session_id: sessionId, command: trimmed, profile: conn.profile },
+        SLASH_EXEC_TIMEOUT_MS,
+      )
+      .catch((err: unknown) => {
+        // `slash.exec` refuses client-local commands (session switches, terminal-only tools).
+        if (
+          err instanceof HermesRpcError &&
+          err.code !== 5001 &&
+          err.message === "unsupported_command"
+        ) {
+          const name = trimmed.split(/\s+/, 1)[0]!;
+          throw new PaError({
+            reason: "Unsupported",
+            message: [`${name} is not available in a web chat session.`, err.detail]
+              .filter(Boolean)
+              .join(" "),
+          });
+        }
+        throw err;
+      });
+
+    if (
+      (execRes.type === "send" || execRes.type === "skill") &&
+      typeof execRes.message === "string" &&
+      execRes.message.trim().length > 0
+    ) {
+      return {
+        kind: "prompt",
+        message: execRes.message,
+        notice: execRes.notice ?? execRes.display ?? undefined,
+      };
+    }
+    const output = [execRes.output, execRes.warning, execRes.notice, execRes.display]
+      .filter((part): part is string => typeof part === "string" && part.trim().length > 0)
+      .join("\n\n");
+    return { kind: "output", output: output || "Command executed." };
+  }
+
+  private async submitPrompt(
+    profile: string,
+    sessionId: string,
+    prompt: string,
+    inputId: string,
+    notice: string | undefined,
+  ): Promise<PaSendResult> {
+    const conn = await this.pool.getConnection(profile);
+    const state = await this.ensureSessionAttached(profile, conn, sessionId);
+    const res = await conn.call<HermesSubmitReceipt>("prompt.submit", {
+      session_id: state.canonicalSessionId ?? sessionId,
+      text: prompt,
+      input_id: inputId,
+    });
+    if (res.voice_stopped === true) {
+      return { kind: "output", sessionId, output: "Voice chat stopped. Nothing was sent." };
+    }
+    return {
+      kind: "turn",
+      sessionId,
+      submissionId: res.admission_id ?? res.submission_id ?? inputId,
+      ...(res.status === "terminal" ? { settled: true } : {}),
+      ...(notice ? { notice } : {}),
+    };
+  }
 
   interruptSession = (profile: string, sessionId: string) =>
     withPaErrors(async () => {
@@ -457,42 +633,96 @@ export class HermesPaAdapter implements PaEngineInstance {
         ) {
           throw invalid(`"${decision}" is not one of this request's choices`);
         }
-        const conn = await this.pool.getConnection(profile);
-        const questions = request.questions ?? [];
-
-        if (tracked.channel === "server_request") {
-          if (request.kind === "approval") {
-            conn.respondServerRequest(input.requestId, { choice: decision });
-          } else {
-            const locked = tracked.lockedAnswers ?? {};
-            const answers: Record<string, string> = {};
-            for (const question of questions) {
-              const provided = encodeClarifyAnswer(input.answers?.[question.id]);
-              // Omit untouched questions another viewer already locked: `clarify_batch.py`
-              // overlays the submitted map onto the locked one, so "" would wipe their answer.
-              if (provided !== "" || !(question.id in locked)) answers[question.id] = provided;
-            }
-            conn.respondServerRequest(input.requestId, { answers });
-          }
-        } else {
-          const base = {
-            session_id: state.canonicalSessionId ?? sessionId,
-            execution_generation: tracked.executionGeneration ?? state.executionGeneration,
-            prompt_id: input.requestId,
-          };
-          if (request.kind === "approval") {
-            await conn.call("approval.respond", { ...base, choice: decision });
-          } else {
-            const first = questions[0]?.id;
-            await conn.call("clarify.respond", {
-              ...base,
-              answer: encodeClarifyAnswer(first !== undefined ? input.answers?.[first] : undefined),
+        // Claimed before the first await: two viewers (or two aliases of one session) answering
+        // at once must not both succeed. Released however the answer ends.
+        const claimKey = `${profile}::${input.requestId}`;
+        if (this.answering.has(claimKey)) {
+          throw new PaError({
+            reason: "Conflict",
+            message: "This request is already being answered",
+          });
+        }
+        const claim = Symbol(claimKey);
+        this.answering.set(claimKey, claim);
+        try {
+          const outcome = await this.answerRequest(
+            profile,
+            sessionId,
+            state,
+            tracked,
+            input,
+            decision,
+          );
+          this.forgetRequest(profile, input.requestId);
+          if (outcome === "already_resolved") {
+            throw new PaError({
+              reason: "Conflict",
+              message: "This request was already answered elsewhere",
             });
           }
+        } finally {
+          if (this.answering.get(claimKey) === claim) this.answering.delete(claimKey);
         }
-        state.requests.delete(input.requestId);
       }),
   };
+
+  private async answerRequest(
+    profile: string,
+    sessionId: string,
+    state: TrackedSessionState,
+    tracked: FeedRequest,
+    input: {
+      readonly requestId: string;
+      readonly answers?: Readonly<Record<string, string | ReadonlyArray<string>>>;
+    },
+    decision: string,
+  ): Promise<"resolved" | "already_resolved"> {
+    const { request } = tracked;
+    const conn = await this.pool.getConnection(profile);
+    const questions = request.questions ?? [];
+    if (tracked.channel === "server_request") {
+      if (
+        state.requests.get(input.requestId) !== tracked ||
+        state.attachedConn !== conn ||
+        tracked.connection !== conn ||
+        !conn.isOpen()
+      ) {
+        throw new PaError({
+          reason: "Unavailable",
+          message: "The request changed or its feed disconnected. Wait for the session to refresh.",
+        });
+      }
+      if (request.kind === "approval") {
+        conn.respondServerRequest(input.requestId, { choice: decision });
+      } else {
+        const locked = tracked.lockedAnswers ?? {};
+        const answers: Record<string, string> = {};
+        for (const question of questions) {
+          const provided = encodeClarifyAnswer(input.answers?.[question.id]);
+          // Omit untouched questions another viewer already locked: `clarify_batch.py`
+          // overlays the submitted map onto the locked one, so "" would wipe their answer.
+          if (provided !== "" || !(question.id in locked)) answers[question.id] = provided;
+        }
+        conn.respondServerRequest(input.requestId, { answers });
+      }
+      return "resolved";
+    }
+    const base = {
+      session_id: state.canonicalSessionId ?? sessionId,
+      execution_generation: tracked.executionGeneration ?? state.executionGeneration,
+      prompt_id: input.requestId,
+    };
+    const first = questions[0]?.id;
+    // `session_pending_controls.respond`: the losing viewer of a race gets `already_resolved`.
+    const res =
+      request.kind === "approval"
+        ? await conn.call<{ status?: string }>("approval.respond", { ...base, choice: decision })
+        : await conn.call<{ status?: string }>("clarify.respond", {
+            ...base,
+            answer: encodeClarifyAnswer(first !== undefined ? input.answers?.[first] : undefined),
+          });
+    return res?.status === "already_resolved" ? "already_resolved" : "resolved";
+  }
 
   subscribeSession = (
     profile: string,
@@ -518,14 +748,23 @@ export class HermesPaAdapter implements PaEngineInstance {
     const ownsSession = (id: string | undefined) =>
       id === undefined || id === sessionId || id === state.canonicalSessionId;
     const openRequests = () => Array.from(state.requests.values(), (tracked) => tracked.request);
-    const mapper = new HermesEventMapper(sessionId, {
-      currentGeneration: () => state.executionGeneration,
-      onGeneration: (generation) => {
-        state.executionGeneration = generation;
-      },
-      onRequestOpened: (tracked) => state.requests.set(tracked.request.requestId, tracked),
-      onRequestResolved: (requestId) => state.requests.delete(requestId),
-    });
+    const makeMapper = () =>
+      new HermesEventMapper(sessionId, {
+        currentGeneration: () => state.executionGeneration,
+        onGeneration: (generation) => {
+          state.executionGeneration = generation;
+        },
+        onRequestOpened: (tracked) => state.requests.set(tracked.request.requestId, tracked),
+        onRequestResolved: (requestId) => {
+          state.requests.delete(requestId);
+        },
+        onTurnBoundary: () => {
+          for (const [id, tracked] of state.requests) {
+            if (tracked.channel === "canonical") state.requests.delete(id);
+          }
+        },
+      });
+    let mapper: HermesEventMapper | null = null;
 
     let closed = false;
     let release = () => {};
@@ -548,6 +787,7 @@ export class HermesPaAdapter implements PaEngineInstance {
         state.attachedConn = null;
         state.cursor.epoch = undefined;
         state.cursor.lastSeq = 0;
+        state.mapper = null;
         emit({
           type: "snapshot",
           sessionId,
@@ -559,18 +799,12 @@ export class HermesPaAdapter implements PaEngineInstance {
         return;
       }
       if (!acceptHermesSeq(state.cursor, frame.seq, frame.replay_epoch)) return;
-      for (const event of mapper.map(frame)) emit(event);
+      for (const event of mapper!.map(frame)) emit(event);
     };
 
-    // Live frames wait while replay and resume complete so nothing arrives out of order.
-    let bootstrapping = true;
-    const bufferedLive: HermesRpcEventFrame[] = [];
-    const unsubEvent = conn.onEvent((frame) => {
-      if (bootstrapping) bufferedLive.push(frame);
-      else deliver(frame);
-    });
-    const unsubRequest = conn.onServerRequest((req: HermesServerRequestFrame) => {
-      // Session ids repeat across the profile socket: only surface this session's requests.
+    const deliverRequest = (req: HermesServerRequestFrame) => {
+      // Session ids repeat across the profile socket: only surface this session's requests. Checked
+      // on delivery, so one buffered before `session.resume` names the canonical id is kept.
       if (closed || !req.session_id || !ownsSession(req.session_id)) return;
       const tracked = normalizePendingRequest(
         req.request_id,
@@ -579,15 +813,33 @@ export class HermesPaAdapter implements PaEngineInstance {
         "server_request",
         state.executionGeneration,
       );
-      if (!tracked) return;
-      state.requests.set(tracked.request.requestId, tracked);
+      if (!tracked || state.requests.has(tracked.request.requestId)) return;
+      state.requests.set(tracked.request.requestId, { ...tracked, connection: conn });
       emit({ type: "request.opened", sessionId, request: tracked.request });
+    };
+
+    // Live frames and prompts wait while replay and resume complete so nothing arrives out of
+    // order, and a prompt raised mid-handshake is not wiped by the snapshot that replaces requests.
+    let bootstrapping = true;
+    const buffered: BufferedFeedItem[] = [];
+    const unsubEvent = conn.onEvent((frame) => {
+      if (bootstrapping) buffered.push({ kind: "event", frame });
+      else deliver(frame);
+    });
+    const unsubRequest = conn.onServerRequest((req: HermesServerRequestFrame) => {
+      if (closed) return;
+      if (bootstrapping) buffered.push({ kind: "request", frame: req });
+      else deliverRequest(req);
     });
     const unsubClose = conn.onClose(() => {
-      state.subscriptionId = null;
-      state.attachedConn = null;
-      state.requests.clear();
-      closeFeed("Hermes gateway connection closed");
+      if (state.attachedConn === conn) {
+        state.subscriptionId = null;
+        state.attachedConn = null;
+        state.requests.clear();
+      }
+      // While bootstrapping the open itself fails; only an established feed reports a close.
+      if (bootstrapping) release();
+      else closeFeed("Hermes gateway connection closed");
     });
 
     release = () => {
@@ -600,7 +852,7 @@ export class HermesPaAdapter implements PaEngineInstance {
       if (state.subscribers > 0) return;
       state.requests.clear();
       const subId = state.subscriptionId;
-      if (!subId) return;
+      if (!subId || state.attachedConn !== conn) return;
       state.subscriptionId = null;
       state.attachedConn = null;
       // A redirected session and its canonical id share one Hermes subscription_id on this
@@ -619,8 +871,16 @@ export class HermesPaAdapter implements PaEngineInstance {
           .catch(() => undefined);
       }
     };
+    const throwIfClosed = () => {
+      if (!closed) return;
+      release();
+      throw new HermesConnectionError("Hermes gateway connection closed");
+    };
 
+    // A cursor from an earlier feed can replay even from seq 0: a session that was empty when
+    // the feed dropped must still get the turn that ran while it was away.
     const sinceSeq = resume ? state.cursor.lastSeq : 0;
+    const canReplay = resume && state.cursor.epoch !== undefined;
     let snapshot: HermesResumeSnapshot;
     let replayFrames: HermesRpcEventFrame[] = [];
     let replayEpoch: string | undefined;
@@ -628,17 +888,16 @@ export class HermesPaAdapter implements PaEngineInstance {
     try {
       // Hermes's reconnect contract: `session.events.since` BEFORE `session.resume`. The resume
       // then writes whatever was published in between ahead of its reply (SessionEvents.catch_up).
-      if (sinceSeq > 0) {
-        const targetEpoch = state.cursor.epoch ?? state.replayEpoch ?? undefined;
-        const replay = targetEpoch
-          ? await conn
-              .call<HermesReplayResult>("session.events.since", {
-                session_id: state.canonicalSessionId ?? sessionId,
-                last_sequence: sinceSeq,
-                replay_epoch: targetEpoch,
-              })
-              .catch(() => null)
-          : null;
+      if (canReplay) {
+        const targetEpoch = state.cursor.epoch;
+        const replay = await conn
+          .call<HermesReplayResult>("session.events.since", {
+            session_id: state.canonicalSessionId ?? sessionId,
+            last_sequence: sinceSeq,
+            replay_epoch: targetEpoch,
+          })
+          .catch(() => null);
+        throwIfClosed();
         if (!replay || replay.snapshot_required || replay.truncated) {
           snapshotRequired = true;
         } else {
@@ -658,20 +917,84 @@ export class HermesPaAdapter implements PaEngineInstance {
         omit_messages: true,
         defer_history: true,
       });
+      throwIfClosed();
     } catch (err) {
       // No fake idle snapshot: the caller reports the failure and retries.
       release();
       throw err;
     }
     this.applyResumeSnapshot(state, conn, snapshot);
-    if (sinceSeq > 0 && !snapshotRequired && replayEpoch && replayEpoch !== state.replayEpoch) {
+    if (canReplay && !snapshotRequired && replayEpoch && replayEpoch !== state.replayEpoch) {
       // The epoch rolled over between `events.since` and `resume`; reload instead of mixing.
       snapshotRequired = true;
       replayFrames = [];
     }
+    const replaying = canReplay && !snapshotRequired;
+    if (resume && !replaying && (snapshot.last_sequence ?? 0) > sinceSeq) {
+      // Events were published that this feed cannot replay: the client must reload.
+      snapshotRequired = true;
+    }
+
+    // A replay starts from our own cursor so every replayed frame (seq > sinceSeq) is accepted;
+    // otherwise the snapshot's watermark is the baseline for live frames.
+    state.cursor.epoch = state.replayEpoch ?? undefined;
+    state.cursor.lastSeq = replaying ? sinceSeq : (snapshot.last_sequence ?? 0);
+    // Only a gapless same-epoch resume continues the previous feed's turn and segment ids.
+    mapper = replaying && state.mapper !== null ? state.mapper : makeMapper();
+    state.mapper = mapper;
+    const items = buffered.splice(0);
+    // A prompt settled or cancelled later in the same backlog never reaches the viewer.
+    const settledLater = new Set<string>();
+    const skip = new Set<BufferedFeedItem>();
+    for (let i = items.length - 1; i >= 0; i -= 1) {
+      const item = items[i]!;
+      if (!ownsSession(item.frame.session_id)) continue;
+      if (item.kind === "event") {
+        for (const id of hermesResolvedRequestIds(item.frame) ?? []) settledLater.add(id);
+      } else if (settledLater.has(item.frame.request_id)) {
+        skip.add(item);
+      }
+    }
+    const preSnapshot: HermesRpcEventFrame[] = [];
+    const postSnapshot: BufferedFeedItem[] = [];
+    for (const item of items) {
+      if (skip.has(item)) continue;
+      if (
+        replaying &&
+        item.kind === "event" &&
+        item.frame.event !== "session.replay_gap" &&
+        typeof snapshot.last_sequence === "number" &&
+        typeof item.frame.seq === "number" &&
+        item.frame.seq <= snapshot.last_sequence &&
+        (item.frame.replay_epoch === undefined || item.frame.replay_epoch === state.replayEpoch)
+      ) {
+        preSnapshot.push(item.frame);
+      } else {
+        postSnapshot.push(item);
+      }
+    }
+
+    // Replayed frames all predate the snapshot, so they go first: an old turn's completion must
+    // not end the turn, or clear the prompts, that the snapshot reports as current.
+    for (const frame of replayFrames) deliver(frame);
+    for (const frame of preSnapshot) deliver(frame);
+    // Hermes silently omits catch_up when its ring truncated before resume.
+    if (
+      replaying &&
+      typeof snapshot.last_sequence === "number" &&
+      state.cursor.lastSeq < snapshot.last_sequence
+    ) {
+      snapshotRequired = true;
+      state.cursor.lastSeq = snapshot.last_sequence;
+      mapper = makeMapper();
+      state.mapper = mapper;
+    }
+    if (typeof snapshot.execution_generation === "number") {
+      state.executionGeneration = snapshot.execution_generation;
+    }
 
     // The snapshot is authoritative: prompts settled while detached cannot linger and be answered.
-    state.requests.clear();
+    const authoritative = new Map<string, FeedRequest>();
     for (const entry of snapshot.open_requests ?? []) {
       const tracked = normalizePendingRequest(
         entry.id ?? entry.request_id ?? "",
@@ -680,7 +1003,7 @@ export class HermesPaAdapter implements PaEngineInstance {
         "server_request",
         state.executionGeneration,
       );
-      if (tracked) state.requests.set(tracked.request.requestId, tracked);
+      if (tracked) authoritative.set(tracked.request.requestId, { ...tracked, connection: conn });
     }
     for (const prompt of snapshot.prompts ?? []) {
       const tracked = normalizePendingRequest(
@@ -692,16 +1015,13 @@ export class HermesPaAdapter implements PaEngineInstance {
           ? prompt.execution_generation
           : state.executionGeneration,
       );
-      if (tracked && !state.requests.has(tracked.request.requestId)) {
-        state.requests.set(tracked.request.requestId, tracked);
+      if (tracked && !authoritative.has(tracked.request.requestId)) {
+        authoritative.set(tracked.request.requestId, tracked);
       }
     }
+    state.requests.clear();
+    for (const [requestId, tracked] of authoritative) state.requests.set(requestId, tracked);
 
-    // A replay starts from our own cursor so every replayed frame (seq > sinceSeq) is accepted;
-    // otherwise the snapshot's watermark is the baseline for live frames.
-    const replaying = sinceSeq > 0 && !snapshotRequired;
-    state.cursor.epoch = state.replayEpoch ?? undefined;
-    state.cursor.lastSeq = replaying ? sinceSeq : (snapshot.last_sequence ?? 0);
     emit({
       type: "snapshot",
       sessionId,
@@ -709,9 +1029,11 @@ export class HermesPaAdapter implements PaEngineInstance {
       openRequests: openRequests(),
       snapshotRequired,
     });
-    for (const frame of replayFrames) deliver(frame);
     bootstrapping = false;
-    for (const frame of bufferedLive.splice(0)) deliver(frame);
+    for (const item of [...postSnapshot, ...buffered.splice(0)]) {
+      if (item.kind === "event") deliver(item.frame);
+      else deliverRequest(item.frame);
+    }
     return release;
   }
 
@@ -738,9 +1060,12 @@ export class HermesPaAdapter implements PaEngineInstance {
     ) =>
       withPaErrors(async () => {
         assertProfile(profile);
+        const provider = input.provider.trim();
+        // `profiles.configure` silently skips a model pin without its provider.
+        if (!provider) throw invalid("Choose a provider for this model");
         const res = await this.configure(profile, {
           model: input.model,
-          ...(input.provider ? { provider: input.provider } : {}),
+          provider,
           ...(input.confirm ? { confirm_expensive_model: true } : {}),
         });
         if (res.confirm_required) {
@@ -749,9 +1074,15 @@ export class HermesPaAdapter implements PaEngineInstance {
             message: res.confirm_message ?? "Confirm before switching to this model.",
           };
         }
+        if (res.applied?.model !== true) {
+          throw new PaError({
+            reason: "Upstream",
+            message: res.error || "Hermes did not save the model change",
+          });
+        }
         return {
           status: "applied" as const,
-          current: { provider: input.provider || null, model: input.model },
+          current: { provider, model: input.model },
         };
       }),
   };
@@ -763,6 +1094,7 @@ export class HermesPaAdapter implements PaEngineInstance {
       confirm_required?: boolean | null;
       confirm_message?: string | null;
       error?: string | null;
+      applied?: Record<string, unknown>;
     }>("profiles.configure", { name: profile, ...params });
     if (!res.confirm_required && res.ok === false) {
       throw new PaError({

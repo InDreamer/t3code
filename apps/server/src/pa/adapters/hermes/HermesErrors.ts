@@ -4,7 +4,7 @@ import * as Schema from "effect/Schema";
 import { HermesConnectionError, HermesRpcError } from "./HermesGatewayClient.ts";
 
 /** Caller mistakes keep their own reason; only a gateway that is down or misbehaving is not. */
-const isPaError = Schema.is(PaError);
+export const isPaError = Schema.is(PaError);
 
 function toPaError(cause: unknown): PaError {
   if (isPaError(cause)) return cause;
@@ -14,7 +14,9 @@ function toPaError(cause: unknown): PaError {
   }
   if (cause instanceof HermesRpcError) {
     const detailed = [message, cause.detail].filter(Boolean).join(" ");
-    if (cause.code === 4062) return new PaError({ reason: "Conflict", message: detailed });
+    if (cause.code === 4062 || /\b(stale_generation|admission_conflict)\b/i.test(message)) {
+      return new PaError({ reason: "Conflict", message: detailed });
+    }
     if (/\bnot[\s_]found\b/i.test(message)) {
       return new PaError({ reason: "NotFound", message: detailed });
     }

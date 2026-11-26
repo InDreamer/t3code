@@ -36,6 +36,25 @@ export interface HermesEventMapperHooks {
   readonly onGeneration: (generation: number) => void;
   readonly onRequestOpened: (tracked: HermesTrackedRequest) => void;
   readonly onRequestResolved: (requestId: string) => void;
+  readonly onTurnBoundary: () => void;
+}
+
+/** The prompt ids a settle/cancel frame resolves, or null for any other frame. */
+export function hermesResolvedRequestIds(frame: HermesRpcEventFrame): ReadonlyArray<string> | null {
+  switch (frame.event) {
+    case "approval.settled":
+    case "clarify.settled":
+    case "request.cancel":
+    case "approval.cancelled": {
+      const p = frame.payload ?? {};
+      const ids = Array.isArray(p.request_ids)
+        ? p.request_ids.map((value) => String(value))
+        : [String(p.prompt_id ?? p.id ?? p.request_id ?? "")];
+      return ids.filter((id) => id.length > 0);
+    }
+    default:
+      return null;
+  }
 }
 
 const stringField = (value: unknown) =>
@@ -65,6 +84,7 @@ export class HermesEventMapper {
   }
 
   private startTurn(turnId: string | undefined): PaAdapterEvent {
+    this.hooks.onTurnBoundary();
     this.turnSerial += 1;
     this.turnId = turnId ?? null;
     this.segment = 0;
@@ -78,6 +98,19 @@ export class HermesEventMapper {
       sessionId: this.sessionId,
       ...(turnId ? { turnId } : {}),
     };
+  }
+
+  /** Ends the current turn: the next delta starts fresh segment, offset and reasoning state. */
+  private endTurn(): void {
+    this.turnId = null;
+    this.turnSerial += 1;
+    this.segment = 0;
+    this.offset = 0;
+    this.segmentId = null;
+    this.segmentKey = null;
+    this.commentarySegments.clear();
+    this.reasoningStreamed = false;
+    this.hooks.onTurnBoundary();
   }
 
   private answerSegmentId(base: string): string {
@@ -150,12 +183,7 @@ export class HermesEventMapper {
       case "message.complete": {
         const text = typeof p.text === "string" ? p.text : "";
         const error = stringField(p.error);
-        this.turnId = null;
-        this.turnSerial += 1;
-        this.segment = 0;
-        this.offset = 0;
-        this.segmentId = null;
-        this.segmentKey = null;
+        this.endTurn();
         return [
           {
             type: "turn.completed",
@@ -191,17 +219,11 @@ export class HermesEventMapper {
       case "approval.settled":
       case "clarify.settled":
       case "request.cancel":
-      case "approval.cancelled": {
-        const ids = Array.isArray(p.request_ids)
-          ? p.request_ids.map((value) => String(value))
-          : [String(p.prompt_id ?? p.id ?? p.request_id ?? "")];
-        return ids
-          .filter((id) => id.length > 0)
-          .map((requestId) => {
-            this.hooks.onRequestResolved(requestId);
-            return { type: "request.resolved", sessionId, requestId } as const;
-          });
-      }
+      case "approval.cancelled":
+        return (hermesResolvedRequestIds(frame) ?? []).map((requestId) => {
+          this.hooks.onRequestResolved(requestId);
+          return { type: "request.resolved", sessionId, requestId } as const;
+        });
       case "session.title":
       case "session.updated": {
         const title = stringField(p.title);
@@ -221,6 +243,7 @@ export class HermesEventMapper {
         return message ? [{ type: "notice", sessionId, message, persistent: true }] : [];
       }
       case "error":
+        this.endTurn();
         return [
           {
             type: "error",

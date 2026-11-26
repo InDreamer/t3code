@@ -25,6 +25,8 @@ import {
 } from "lucide-react";
 import { useEffect, useState } from "react";
 
+import { useStableCallback } from "~/hooks/useStableCallback";
+import { modelConfirmationForDraft } from "./BotSettingsSheet.logic";
 import { cn } from "../../lib/utils";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
@@ -70,6 +72,33 @@ function sameSectionValue(a: PaConfigSectionValue, b: PaConfigSectionValue): boo
 
 function draftsFor(config: PaBotConfig): Record<string, PaConfigSectionValue> {
   return Object.fromEntries(config.sections.map((s) => [s.id, initialSectionValue(s)]));
+}
+
+/**
+ * Moves drafts onto the config a section save returned. The saved section takes its stored value
+ * unless it was edited again meanwhile; any other section the user has not edited here follows
+ * the new config too, so a stale copy cannot overwrite another device's change on the next save.
+ */
+function rebaseDrafts(
+  drafts: Record<string, PaConfigSectionValue>,
+  previous: PaBotConfig | null,
+  next: PaBotConfig,
+  savedId: string,
+  submitted: PaConfigSectionValue,
+): Record<string, PaConfigSectionValue> {
+  const rebased = { ...drafts };
+  for (const section of next.sections) {
+    const draft = drafts[section.id];
+    const before = previous?.sections.find((entry) => entry.id === section.id);
+    const untouched =
+      section.id === savedId
+        ? draft === undefined || sameSectionValue(draft, submitted)
+        : draft === undefined ||
+          before === undefined ||
+          sameSectionValue(draft, initialSectionValue(before));
+    if (untouched) rebased[section.id] = initialSectionValue(section);
+  }
+  return rebased;
 }
 
 function ToggleListSection({
@@ -233,7 +262,12 @@ function BotSettingsBody({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [savedNotice, setSavedNotice] = useState<string | null>(null);
-  const [confirmMessage, setConfirmMessage] = useState<string | null>(null);
+  /** The model pick the engine asked to confirm; confirming resends exactly that pick. */
+  const [pendingConfirm, setPendingConfirm] = useState<{
+    readonly message: string;
+    readonly provider: string;
+    readonly model: string;
+  } | null>(null);
 
   const [name, setName] = useState(bot.name);
   const [avatarColor, setAvatarColor] = useState(bot.avatarColor);
@@ -251,6 +285,7 @@ function BotSettingsBody({
   const [catalog, setCatalog] = useState<PaModelCatalog | null>(null);
   const [provider, setProvider] = useState("");
   const [model, setModel] = useState("");
+  const getModelDraft = useStableCallback(() => ({ provider, model }));
 
   const [schedules, setSchedules] = useState<ReadonlyArray<PaSchedule>>([]);
   const [scheduleBusy, setScheduleBusy] = useState(false);
@@ -310,7 +345,9 @@ function BotSettingsBody({
     catalog?.providers.find((p) => p.isCurrent) ??
     null;
 
-  const handleSave = async (confirmModel = false) => {
+  const handleSave = async (
+    confirmed: { readonly provider: string; readonly model: string } | null = null,
+  ) => {
     const nextName = name.trim() || bot.agentRef;
     const metaPatch = {
       ...(nextName !== savedMeta.name ? { name: nextName } : {}),
@@ -323,13 +360,25 @@ function BotSettingsBody({
       return draft !== undefined && !sameSectionValue(draft, initialSectionValue(section));
     });
     const currentModel = catalog?.current ?? null;
+    const providerField = provider;
+    const modelField = model;
+    const submittedModel = confirmed?.model ?? model.trim();
+    // "Follow default" still pins a concrete provider: the engine cannot pin a model without one.
+    const submittedProvider =
+      confirmed?.provider ?? (provider || activeProvider?.id || currentModel?.provider || "");
     const modelChanged =
       catalog !== null &&
-      model.trim().length > 0 &&
-      (model.trim() !== currentModel?.model || (provider || null) !== currentModel?.provider);
+      submittedModel.length > 0 &&
+      (confirmed !== null ||
+        submittedModel !== currentModel?.model ||
+        (provider !== "" && provider !== currentModel?.provider));
 
     if (Object.keys(metaPatch).length === 0 && changedSections.length === 0 && !modelChanged) {
       setSavedNotice(gt("没有需要保存的修改"));
+      return;
+    }
+    if (modelChanged && !submittedProvider) {
+      setError(gt("请选择模型提供方"));
       return;
     }
     for (const section of changedSections) {
@@ -353,38 +402,54 @@ function BotSettingsBody({
     setSaving(true);
     setError(null);
     setSavedNotice(null);
-    setConfirmMessage(null);
+    setPendingConfirm(null);
+    // Each block that lands becomes the new baseline at once, so a later failure cannot leave
+    // saved edits looking unsaved; drafts typed during the save are kept, not overwritten.
     try {
       if (Object.keys(metaPatch).length > 0) {
         await paApi.updateBotMeta({ botId: bot.botId, ...metaPatch });
         setSavedMeta({ name: nextName, avatarColor, avatarShape, pinned });
-        setName(nextName);
+        const submittedName = name;
+        setName((current) => (current === submittedName ? nextName : current));
+        onSaved();
       }
-      let nextConfig = config;
+      let baseline = config;
       for (const section of changedSections) {
-        nextConfig = await paApi.patchBotConfig(bot.botId, section.id, drafts[section.id]!);
-      }
-      if (nextConfig && nextConfig !== config) {
+        const submitted = drafts[section.id]!;
+        const nextConfig = await paApi.patchBotConfig(bot.botId, section.id, submitted);
         setConfig(nextConfig);
-        setDrafts(draftsFor(nextConfig));
+        const previous = baseline;
+        baseline = nextConfig;
+        setDrafts((prev) => rebaseDrafts(prev, previous, nextConfig, section.id, submitted));
+        onSaved();
       }
       if (modelChanged && catalog) {
         const result = await paApi.selectBotModel({
           botId: bot.botId,
-          provider,
-          model: model.trim(),
-          ...(confirmModel ? { confirm: true } : {}),
+          provider: submittedProvider,
+          model: submittedModel,
+          ...(confirmed ? { confirm: true } : {}),
         });
         if (result.status === "confirmRequired") {
-          // Everything else already saved; keep the unconfirmed model pick for the resend.
-          setConfirmMessage(result.message);
-          onSaved();
+          setPendingConfirm(
+            modelConfirmationForDraft(
+              getModelDraft(),
+              { provider: providerField, model: modelField },
+              { provider: submittedProvider, model: submittedModel, message: result.message },
+            ),
+          );
           return;
         }
-        setCatalog({ ...catalog, current: result.current });
+        setCatalog((prev) => (prev ? { ...prev, current: result.current } : prev));
+        // "Follow default" is no longer offered once a provider is pinned: show the saved pick,
+        // unless the fields were changed while saving.
+        setProvider((current) =>
+          current === providerField ? (result.current.provider ?? "") : current,
+        );
+        setModel((current) => (current === modelField ? result.current.model : current));
+        onSaved();
       }
       setSavedNotice(gt("已保存"));
-      onSaved();
     } catch (err) {
       setError(paErrorMessage(err, gt("保存失败")));
     } finally {
@@ -516,11 +581,11 @@ function BotSettingsBody({
             </div>
           ) : null}
 
-          {confirmMessage ? (
+          {pendingConfirm ? (
             <div className="space-y-2 rounded-lg border border-warning/40 bg-warning-surface p-3 text-warning-foreground text-xs">
               <div className="flex items-start gap-2">
                 <AlertTriangleIcon className="mt-0.5 size-4 shrink-0" />
-                <p className="whitespace-pre-wrap">{confirmMessage}</p>
+                <p className="whitespace-pre-wrap">{pendingConfirm.message}</p>
               </div>
               <div className="flex justify-end gap-2">
                 <Button
@@ -528,7 +593,7 @@ function BotSettingsBody({
                   size="xs"
                   variant="outline"
                   disabled={saving}
-                  onClick={() => setConfirmMessage(null)}
+                  onClick={() => setPendingConfirm(null)}
                 >
                   <T>取消</T>
                 </Button>
@@ -536,7 +601,12 @@ function BotSettingsBody({
                   type="button"
                   size="xs"
                   disabled={saving}
-                  onClick={() => void handleSave(true)}
+                  onClick={() =>
+                    void handleSave({
+                      provider: pendingConfirm.provider,
+                      model: pendingConfirm.model,
+                    })
+                  }
                 >
                   <T>确认切换</T>
                 </Button>
@@ -680,7 +750,7 @@ function BotSettingsBody({
                   onChange={(e) => {
                     const next = e.target.value;
                     setProvider(next);
-                    setConfirmMessage(null);
+                    setPendingConfirm(null);
                     const found = catalog.providers.find((p) => p.id === next);
                     if (found?.models[0]) setModel(found.models[0].id);
                   }}
@@ -705,7 +775,7 @@ function BotSettingsBody({
                     value={model}
                     onChange={(e) => {
                       setModel(e.target.value);
-                      setConfirmMessage(null);
+                      setPendingConfirm(null);
                     }}
                     className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
                   >
@@ -724,7 +794,7 @@ function BotSettingsBody({
                     value={model}
                     onChange={(e) => {
                       setModel(e.target.value);
-                      setConfirmMessage(null);
+                      setPendingConfirm(null);
                     }}
                     placeholder={gt("输入模型名称")}
                   />
@@ -905,7 +975,7 @@ function BotSettingsBody({
             type="button"
             size="sm"
             disabled={saving || loading}
-            onClick={() => void handleSave(false)}
+            onClick={() => void handleSave()}
           >
             {saving ? (
               <Loader2Icon className="mr-1.5 size-3.5 animate-spin" />
