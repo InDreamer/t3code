@@ -1,3 +1,4 @@
+import type { PaAvatarShape, PaBotSummary, PaInstanceStatus } from "@t3tools/contracts";
 import { T, useGT, useMessages } from "gt-react";
 import { Loader2Icon, PlusIcon } from "lucide-react";
 import { useState } from "react";
@@ -19,43 +20,41 @@ import { Label } from "../ui/label";
 import { Switch } from "../ui/switch";
 import { Textarea } from "../ui/textarea";
 import { BotAvatar, PA_AVATAR_COLORS, PA_AVATAR_SHAPES } from "./BotAvatar";
-import { paApi } from "./paApi";
-import type { PaAdapterKind, PaAdapterStatus, PaAvatarShape, PaBotSummary } from "./paTypes";
+import { paApi, paErrorMessage } from "./paApi";
 
 export function CreateBotDialog({
   open,
   onOpenChange,
-  adapters,
+  instances,
   onCreated,
 }: {
   readonly open: boolean;
   readonly onOpenChange: (open: boolean) => void;
-  readonly adapters: ReadonlyArray<PaAdapterStatus>;
+  readonly instances: ReadonlyArray<PaInstanceStatus>;
   readonly onCreated: (bot: PaBotSummary) => void;
 }) {
   const gt = useGT();
   const m = useMessages();
-  const creatableAdapters = adapters.filter((a) => a.capabilities.create);
-  const [selectedAdapter, setSelectedAdapter] = useState<PaAdapterKind>("hermes");
+  const creatable = instances.filter((i) => i.capabilities.lifecycle.create);
+  const [selectedInstanceId, setSelectedInstanceId] = useState<string | null>(null);
   const [name, setName] = useState("");
-  const [profile, setProfile] = useState("");
+  const [agentRef, setAgentRef] = useState("");
   const [description, setDescription] = useState("");
-  const [soul, setSoul] = useState("");
+  const [instructions, setInstructions] = useState("");
   const [avatarColor, setAvatarColor] = useState<string>(PA_AVATAR_COLORS[1].value);
   const [avatarShape, setAvatarShape] = useState<PaAvatarShape>("blob");
   const [pinned, setPinned] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const activeAdapter =
-    creatableAdapters.find((a) => a.kind === selectedAdapter) ??
-    creatableAdapters.find((a) => a.online) ??
-    creatableAdapters[0] ??
+  const activeInstance =
+    creatable.find((i) => i.instanceId === selectedInstanceId) ??
+    creatable.find((i) => i.online) ??
+    creatable[0] ??
     null;
-  const canCreate = activeAdapter !== null && activeAdapter.online;
-  const hasOpenClaw = adapters.some((a) => a.kind === "openclaw");
+  const canCreate = activeInstance !== null && activeInstance.online;
 
-  const derivedSlug = (profile || name)
+  const derivedSlug = (agentRef || name)
     .trim()
     .toLowerCase()
     .replace(/[^a-z0-9_-]+/g, "-")
@@ -64,9 +63,9 @@ export function CreateBotDialog({
 
   const resetForm = () => {
     setName("");
-    setProfile("");
+    setAgentRef("");
     setDescription("");
-    setSoul("");
+    setInstructions("");
     setAvatarColor(PA_AVATAR_COLORS[1].value);
     setAvatarShape("blob");
     setPinned(false);
@@ -75,23 +74,23 @@ export function CreateBotDialog({
 
   const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
-    if (!activeAdapter || !activeAdapter.online) {
-      setError(gt("当前没有可用的在线 PA 引擎"));
+    if (!activeInstance || !activeInstance.online) {
+      setError(gt("当前没有可以创建 Bot 的在线引擎"));
       return;
     }
     if (!derivedSlug) {
-      setError(gt("请填写以英文或数字开头的 Profile 标识（例如 news-bot）"));
+      setError(gt("请填写以英文或数字开头的标识（例如 news-bot）"));
       return;
     }
     setSubmitting(true);
     setError(null);
     try {
       const bot = await paApi.createBot({
-        adapter: activeAdapter.kind,
-        profile: derivedSlug,
+        instanceId: activeInstance.instanceId,
+        agentRef: derivedSlug,
         name: name.trim() || derivedSlug,
         description: description.trim(),
-        soul: soul.trim() || undefined,
+        ...(instructions.trim() ? { instructions: instructions.trim() } : {}),
         avatarColor,
         avatarShape,
         pinned,
@@ -100,7 +99,7 @@ export function CreateBotDialog({
       onOpenChange(false);
       onCreated(bot);
     } catch (err) {
-      setError(err instanceof Error ? err.message : gt("创建 Bot 失败"));
+      setError(paErrorMessage(err, gt("创建 Bot 失败")));
     } finally {
       setSubmitting(false);
     }
@@ -121,7 +120,7 @@ export function CreateBotDialog({
               <T>新建 Bot</T>
             </DialogTitle>
             <DialogDescription>
-              <T>每个 Bot 对应一个独立的 PA Profile（独立记忆、人设、模型和定时任务）。</T>
+              <T>每个 Bot 是引擎里的一个独立 Agent，拥有自己的记忆、人设和模型。</T>
             </DialogDescription>
           </DialogHeader>
 
@@ -133,40 +132,39 @@ export function CreateBotDialog({
                   {name.trim() || derivedSlug || gt("新 Bot")}
                 </div>
                 <div className="mt-1 flex flex-wrap items-center gap-1.5">
-                  {adapters.map((adapter) => (
+                  {instances.map((instance) => (
                     <Badge
-                      key={adapter.kind}
-                      variant={adapter.online ? "success" : "warning"}
+                      key={instance.instanceId}
+                      variant={instance.online ? "success" : "warning"}
                       size="sm"
                     >
-                      {adapter.online
-                        ? gt("{label} 在线", { label: adapter.label })
-                        : gt("{label} 离线", { label: adapter.label })}
+                      {instance.online
+                        ? gt("{label} 在线", { label: instance.label })
+                        : gt("{label} 离线", { label: instance.label })}
                     </Badge>
                   ))}
-                  {!hasOpenClaw ? (
-                    <Badge variant="secondary" size="sm">
-                      <T>OpenClaw 即将支持</T>
-                    </Badge>
-                  ) : null}
                 </div>
               </div>
             </div>
 
-            {creatableAdapters.length > 1 ? (
+            {creatable.length > 1 ? (
               <div className="space-y-1.5">
-                <Label htmlFor="pa-create-adapter">
-                  <T>PA 引擎</T>
+                <Label htmlFor="pa-create-instance">
+                  <T>引擎</T>
                 </Label>
                 <select
-                  id="pa-create-adapter"
-                  value={activeAdapter?.kind ?? "hermes"}
-                  onChange={(e) => setSelectedAdapter(e.target.value as PaAdapterKind)}
+                  id="pa-create-instance"
+                  value={activeInstance?.instanceId ?? ""}
+                  onChange={(e) => setSelectedInstanceId(e.target.value)}
                   className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
                 >
-                  {creatableAdapters.map((adapter) => (
-                    <option key={adapter.kind} value={adapter.kind} disabled={!adapter.online}>
-                      {adapter.label}
+                  {creatable.map((instance) => (
+                    <option
+                      key={instance.instanceId}
+                      value={instance.instanceId}
+                      disabled={!instance.online}
+                    >
+                      {instance.label}
                     </option>
                   ))}
                 </select>
@@ -187,14 +185,14 @@ export function CreateBotDialog({
                 />
               </div>
               <div className="space-y-1.5">
-                <Label htmlFor="pa-create-profile">
-                  <T>Profile ID（英文/数字）</T>
+                <Label htmlFor="pa-create-agent-ref">
+                  <T>标识（英文/数字）</T>
                 </Label>
                 <Input
-                  id="pa-create-profile"
+                  id="pa-create-agent-ref"
                   placeholder={gt("例如：research-bot")}
-                  value={profile}
-                  onChange={(e) => setProfile(e.target.value)}
+                  value={agentRef}
+                  onChange={(e) => setAgentRef(e.target.value)}
                 />
               </div>
             </div>
@@ -257,15 +255,15 @@ export function CreateBotDialog({
             </div>
 
             <div className="space-y-1.5">
-              <Label htmlFor="pa-create-soul">
-                <T>人设 / 指令（SOUL.md，可选）</T>
+              <Label htmlFor="pa-create-instructions">
+                <T>人设 / 指令（可选）</T>
               </Label>
               <Textarea
-                id="pa-create-soul"
+                id="pa-create-instructions"
                 rows={4}
                 placeholder={gt("描述这个 Bot 的职责、回复风格和规则...")}
-                value={soul}
-                onChange={(e) => setSoul(e.target.value)}
+                value={instructions}
+                onChange={(e) => setInstructions(e.target.value)}
               />
             </div>
 

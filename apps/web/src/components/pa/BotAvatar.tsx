@@ -1,8 +1,8 @@
+import type { PaAvatarShape } from "@t3tools/contracts";
 import { msg } from "gt-react";
 import { StarIcon } from "lucide-react";
 
 import { cn } from "../../lib/utils";
-import type { PaAvatarShape } from "./paTypes";
 
 export const PA_AVATAR_COLORS = [
   { label: msg("橙色"), value: "#f97316" },

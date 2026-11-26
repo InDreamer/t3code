@@ -3,6 +3,7 @@ import {
   ArrowRightIcon,
   BotIcon,
   ChartNoAxesColumnIcon,
+  Code2Icon,
   SettingsIcon,
 } from "lucide-react";
 import type { ReactNode } from "react";
@@ -43,6 +44,7 @@ import { readPullRequestListPreferences } from "../pullRequest/pullRequestListPr
 import { readIssueListPreferences } from "../issue/issueListPreferences";
 import { IssueGlyph } from "../issue/issuePresentation";
 import { isSidebarUtilityPage, useNavigateToMainApp } from "./mainAppLocation";
+import { getLastPaBotId } from "../pa/paBotsStore";
 import { SidebarThreadUndoNotice } from "./SidebarThreadUndoNotice";
 import { SidebarProviderUpdatePill } from "./SidebarProviderUpdatePill";
 import { SidebarUpdateArchitectureWarning, SidebarUpdatePill } from "./SidebarUpdatePill";
@@ -231,6 +233,75 @@ function SidebarUtilityItem({
   );
 }
 
+export const SidebarModeSwitcher = memo(function SidebarModeSwitcher({
+  isBotsMode,
+}: {
+  readonly isBotsMode: boolean;
+}) {
+  const navigate = useNavigate();
+  const navigateToMainApp = useNavigateToMainApp();
+  const gt = useGT();
+
+  const switchToCode = () => {
+    if (!isBotsMode) return;
+    void navigateToMainApp();
+  };
+
+  const switchToBots = () => {
+    if (isBotsMode) return;
+    const lastBotId = getLastPaBotId();
+    void navigate({
+      to: "/bots",
+      search: lastBotId ? { bot: lastBotId } : {},
+    });
+  };
+
+  return (
+    <div className="shrink-0 px-2 pb-1.5">
+      <div
+        role="tablist"
+        aria-label={gt("Workspace mode")}
+        className="grid grid-cols-2 gap-0.5 rounded-lg bg-muted/60 p-0.5"
+      >
+        <button
+          type="button"
+          role="tab"
+          aria-selected={!isBotsMode}
+          onClick={switchToCode}
+          className={cn(
+            "flex h-7 cursor-pointer items-center justify-center gap-1.5 rounded-md px-2 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70",
+            !isBotsMode
+              ? "bg-background text-foreground shadow-xs"
+              : "text-sidebar-muted-foreground hover:text-sidebar-foreground",
+          )}
+        >
+          <Code2Icon className="size-3.5 shrink-0" aria-hidden />
+          <span className="truncate">
+            <T>Code</T>
+          </span>
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={isBotsMode}
+          onClick={switchToBots}
+          className={cn(
+            "flex h-7 cursor-pointer items-center justify-center gap-1.5 rounded-md px-2 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70",
+            isBotsMode
+              ? "bg-background text-foreground shadow-xs"
+              : "text-sidebar-muted-foreground hover:text-sidebar-foreground",
+          )}
+        >
+          <BotIcon className="size-3.5 shrink-0" aria-hidden />
+          <span className="truncate">
+            <T>Bots</T>
+          </span>
+        </button>
+      </div>
+    </div>
+  );
+});
+
 const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
   const navigate = useNavigate();
   const navigateToMainApp = useNavigateToMainApp();
@@ -267,11 +338,6 @@ const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
       setOpenMobile(false);
     }
     void navigate({ to: "/usage" });
-  };
-
-  const handleBotsClick = () => {
-    closeMobileSidebar();
-    void navigate({ to: "/bots", search: {} });
   };
 
   const handleBackClick = () => {
@@ -311,7 +377,6 @@ const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
               onClick={handleIssuesClick}
             />
           ) : null}
-          <SidebarUtilityItem icon={<BotIcon />} label={gt("Bots")} onClick={handleBotsClick} />
           <SidebarUtilityItem
             icon={<ChartNoAxesColumnIcon />}
             label={gt("Usage")}

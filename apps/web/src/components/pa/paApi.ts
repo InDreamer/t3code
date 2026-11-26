@@ -1,174 +1,94 @@
-import { readDesktopPrimaryBearerToken } from "../../environments/primary/desktopAuth";
-import { resolvePrimaryEnvironmentHttpUrl } from "../../environments/primary/target";
+import { createPaEnvironmentCommands } from "@t3tools/client-runtime/pa/environment";
+import {
+  runAtomCommand,
+  squashAtomCommandFailure,
+  type AtomCommand,
+} from "@t3tools/client-runtime/state/runtime";
 import type {
-  PaAdapterStatus,
-  PaBotDetail,
-  PaBotSummary,
+  EnvironmentId,
+  PaConfigSectionValue,
   PaCreateBotInput,
-  PaCronJob,
-  PaCronMutationInput,
-  PaMessage,
+  PaMutateScheduleInput,
   PaRespondRequestInput,
-  PaSendResult,
+  PaSelectBotModelInput,
   PaSessionSummary,
-  PaSlashCommand,
   PaStreamEvent,
-  PaUpdateBotInput,
-} from "./paTypes";
+  PaUpdateBotMetaInput,
+} from "@t3tools/contracts";
+import { msg } from "gt-react";
 
-function isSameOriginBrowser(): boolean {
-  if (
-    typeof window === "undefined" ||
-    window.desktopBridge !== undefined ||
-    !window.location.origin.startsWith("http")
-  ) {
-    return false;
-  }
-  return new URL(resolvePrimaryEnvironmentHttpUrl("/")).origin === window.location.origin;
-}
+import { connectionAtomRuntime } from "../../connection/runtime";
+import { m } from "../../i18n/messages";
+import { appAtomRegistry } from "../../rpc/atomRegistry";
+import { readPrimaryEnvironmentId } from "../../state/environments";
+import { primaryEnvironmentIdAtom } from "../../state/primaryEnvironment";
 
-async function buildAuthInit(extraHeaders?: Record<string, string>): Promise<{
-  readonly headers: Record<string, string>;
-  readonly credentials: RequestCredentials;
-}> {
-  const headers: Record<string, string> = { ...extraHeaders };
-  if (isSameOriginBrowser()) {
-    return { headers, credentials: "include" };
-  }
-  const bearer = await readDesktopPrimaryBearerToken().catch(() => null);
-  if (bearer) {
-    headers.authorization = `Bearer ${bearer}`;
-  }
-  return { headers, credentials: "omit" };
-}
+const pa = createPaEnvironmentCommands(connectionAtomRuntime);
 
-// @effect-diagnostics-next-line extendsNativeError:off -- rejected from fetch Promises; callers branch on `status`.
-class PaHttpError extends Error {
-  readonly status: number;
-  constructor(status: number, message: string) {
-    super(message);
-    this.name = "PaHttpError";
-    this.status = status;
-  }
-}
+const PRIMARY_ENVIRONMENT_WAIT_MS = 15_000;
 
-/** Auth or routing failures that a retry cannot fix. */
-export function isTerminalPaError(error: unknown): boolean {
-  return (
-    error instanceof PaHttpError &&
-    (error.status === 401 || error.status === 403 || error.status === 404)
-  );
-}
-
-async function requestJson<T>(
-  path: string,
-  options?: {
-    readonly method?: "GET" | "POST" | undefined;
-    readonly searchParams?: Record<string, string> | undefined;
-    readonly body?: unknown;
-    readonly signal?: AbortSignal | undefined;
-  },
-): Promise<T> {
-  const url = resolvePrimaryEnvironmentHttpUrl(`/api/pa${path}`, options?.searchParams);
-  const method = options?.method ?? "GET";
-  const auth = await buildAuthInit(
-    options?.body !== undefined ? { "content-type": "application/json" } : undefined,
-  );
-  const response = await fetch(url, {
-    method,
-    cache: "no-store",
-    credentials: auth.credentials,
-    headers: auth.headers,
-    ...(options?.body !== undefined ? { body: JSON.stringify(options.body) } : {}),
-    ...(options?.signal ? { signal: options.signal } : {}),
+/** The primary environment's id, waiting briefly while the app is still discovering it. */
+function primaryEnvironmentId(): Promise<EnvironmentId> {
+  const ready = readPrimaryEnvironmentId();
+  if (ready !== null) return Promise.resolve(ready);
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      unsubscribe();
+      reject(new Error(m(msg("还没有连接到服务器"))));
+    }, PRIMARY_ENVIRONMENT_WAIT_MS);
+    const unsubscribe = appAtomRegistry.subscribe(primaryEnvironmentIdAtom, (environmentId) => {
+      if (environmentId === null) return;
+      clearTimeout(timer);
+      unsubscribe();
+      resolve(environmentId);
+    });
   });
-  const payload = (await response.json().catch(() => ({}))) as { error?: string } & T;
-  if (!response.ok) {
-    throw new PaHttpError(response.status, payload.error || `Request failed (${response.status})`);
-  }
-  return payload;
 }
 
-const enc = (value: string) => encodeURIComponent(value);
+async function call<I, A, E>(
+  command: AtomCommand<{ readonly environmentId: EnvironmentId; readonly input: I }, A, E>,
+  input: I,
+): Promise<A> {
+  const result = await runAtomCommand(
+    appAtomRegistry,
+    command,
+    { environmentId: await primaryEnvironmentId(), input },
+    { reportFailure: false },
+  );
+  if (result._tag === "Success") return result.value;
+  throw squashAtomCommandFailure(result);
+}
+
+export function paErrorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error && error.message ? error.message : fallback;
+}
 
 // StrictMode mounts twice; without sharing the in-flight create each mount mints its own session.
 const primarySessionCreates = new Map<string, Promise<PaSessionSummary>>();
 
-function createSessionRequest(botId: string, setPrimary: boolean) {
-  return requestJson<{ readonly session: PaSessionSummary }>(`/bots/${enc(botId)}/sessions`, {
-    method: "POST",
-    body: { setPrimary },
-  }).then((res) => res.session);
-}
-
 export const paApi = {
-  listBots(signal?: AbortSignal) {
-    return requestJson<{
-      readonly adapters: ReadonlyArray<PaAdapterStatus>;
-      readonly bots: ReadonlyArray<PaBotSummary>;
-    }>("/bots", { signal });
-  },
-
-  createBot(input: PaCreateBotInput) {
-    return requestJson<{ readonly bot: PaBotSummary }>("/bots", {
-      method: "POST",
-      body: input,
-    }).then((res) => res.bot);
-  },
-
-  getBotDetail(botId: string, signal?: AbortSignal) {
-    return requestJson<{ readonly bot: PaBotDetail }>(`/bots/${enc(botId)}`, { signal }).then(
-      (res) => res.bot,
-    );
-  },
-
-  updateBot(botId: string, patch: PaUpdateBotInput) {
-    return requestJson<{ readonly bot: PaBotDetail }>(`/bots/${enc(botId)}/update`, {
-      method: "POST",
-      body: patch,
-    }).then((res) => res.bot);
-  },
-
-  markRead(botId: string) {
-    return requestJson<unknown>(`/bots/${enc(botId)}/update`, {
-      method: "POST",
-      body: { markRead: true },
-    }).then(() => undefined);
-  },
-
-  manageCron(botId: string, input: PaCronMutationInput) {
-    return requestJson<{ readonly cronJobs: ReadonlyArray<PaCronJob> }>(
-      `/bots/${enc(botId)}/cron`,
-      {
-        method: "POST",
-        body: input,
-      },
-    ).then((res) => res.cronJobs);
-  },
-
-  listSlashCommands(botId: string, signal?: AbortSignal) {
-    return requestJson<{ readonly commands: ReadonlyArray<PaSlashCommand> }>(
-      `/bots/${enc(botId)}/commands`,
-      { signal },
-    ).then((res) => res.commands);
-  },
-
-  listSessions(botId: string, signal?: AbortSignal) {
-    return requestJson<{
-      readonly primarySessionId: string | null;
-      readonly sessions: ReadonlyArray<PaSessionSummary>;
-    }>(`/bots/${enc(botId)}/sessions`, { signal });
-  },
-
-  createSession(botId: string, setPrimary = true) {
-    return createSessionRequest(botId, setPrimary);
-  },
-
+  listBots: () => call(pa.listBots, {}),
+  createBot: (input: PaCreateBotInput) => call(pa.createBot, input),
+  updateBotMeta: (input: PaUpdateBotMetaInput) => call(pa.updateBotMeta, input),
+  markRead: (botId: string) => call(pa.updateBotMeta, { botId, markRead: true }),
+  getBotModels: (botId: string, sessionId?: string) =>
+    call(pa.getBotModels, { botId, ...(sessionId ? { sessionId } : {}) }),
+  selectBotModel: (input: PaSelectBotModelInput) => call(pa.selectBotModel, input),
+  getBotConfig: (botId: string) => call(pa.getBotConfig, { botId }),
+  patchBotConfig: (botId: string, sectionId: string, value: PaConfigSectionValue) =>
+    call(pa.patchBotConfig, { botId, sectionId, value }),
+  listSchedules: (botId: string) => call(pa.listSchedules, { botId }).then((res) => res.schedules),
+  mutateSchedule: (input: PaMutateScheduleInput) =>
+    call(pa.mutateSchedule, input).then((res) => res.schedules),
+  listCommands: (botId: string) => call(pa.listCommands, { botId }).then((res) => res.commands),
+  listSessions: (botId: string) => call(pa.listSessions, { botId }),
+  createSession: (botId: string, title?: string) =>
+    call(pa.createSession, { botId, setPrimary: true, ...(title ? { title } : {}) }),
   /** Creates the Bot's primary session once, however many mounts ask concurrently. */
   ensurePrimarySession(botId: string) {
     const inFlight = primarySessionCreates.get(botId);
     if (inFlight) return inFlight;
-    const created = createSessionRequest(botId, true);
+    const created = call(pa.createSession, { botId, setPrimary: true });
     primarySessionCreates.set(botId, created);
     const forget = () => {
       if (primarySessionCreates.get(botId) === created) primarySessionCreates.delete(botId);
@@ -176,122 +96,36 @@ export const paApi = {
     void created.then(forget, forget);
     return created;
   },
-
-  getMessages(botId: string, sessionId: string, signal?: AbortSignal, limit?: number) {
-    const searchParams = limit !== undefined ? { limit: String(limit) } : undefined;
-    return requestJson<{ readonly messages: ReadonlyArray<PaMessage> }>(
-      `/bots/${enc(botId)}/sessions/${enc(sessionId)}/messages`,
-      { signal, searchParams },
-    ).then((res) => res.messages);
-  },
-
-  sendMessage(botId: string, sessionId: string, text: string, inputId?: string) {
-    return requestJson<PaSendResult>(`/bots/${enc(botId)}/sessions/${enc(sessionId)}/send`, {
-      method: "POST",
-      body: { text, ...(inputId ? { inputId } : {}) },
-    });
-  },
-
-  interruptSession(botId: string, sessionId: string) {
-    return requestJson<{ readonly ok: boolean }>(
-      `/bots/${enc(botId)}/sessions/${enc(sessionId)}/interrupt`,
-      { method: "POST" },
-    );
-  },
-
-  respondRequest(botId: string, sessionId: string, input: PaRespondRequestInput) {
-    return requestJson<{ readonly ok: boolean }>(
-      `/bots/${enc(botId)}/sessions/${enc(sessionId)}/respond`,
-      {
-        method: "POST",
-        body: input,
-      },
-    );
-  },
-
-  /**
-   * Subscribe to the SSE event stream for a PA session. Uses fetch streaming (not EventSource)
-   * so both cookie auth (iPhone Safari / browser) and bearer auth (Desktop Electron) work identically.
-   */
-  subscribeSessionEvents(
+  getMessages: (botId: string, sessionId: string) =>
+    call(pa.getMessages, { botId, sessionId }).then((res) => res.messages),
+  sendMessage: (botId: string, sessionId: string, text: string, inputId: string) =>
+    call(pa.sendMessage, { botId, sessionId, text, inputId }),
+  interruptSession: (botId: string, sessionId: string) =>
+    call(pa.interruptSession, { botId, sessionId }),
+  respondRequest: (input: PaRespondRequestInput) => call(pa.respondRequest, input),
+  /** Streams a session over the environment connection; resumes on its own after drops. */
+  followSession(
     botId: string,
     sessionId: string,
-    options: {
-      readonly sinceSeq?: number | undefined;
-      readonly replayEpoch?: string | undefined;
+    handlers: {
       readonly onEvent: (event: PaStreamEvent) => void;
-      readonly onDisconnect?: (error?: Error) => void;
+      readonly onFailure: (error: unknown) => void;
     },
   ): () => void {
-    const controller = new AbortController();
-
-    void (async () => {
-      try {
-        const searchParams: Record<string, string> = {};
-        if (options.sinceSeq !== undefined && options.sinceSeq > 0) {
-          searchParams.sinceSeq = String(options.sinceSeq);
-        }
-        if (options.replayEpoch) {
-          searchParams.replayEpoch = options.replayEpoch;
-        }
-        const url = resolvePrimaryEnvironmentHttpUrl(
-          `/api/pa/bots/${enc(botId)}/sessions/${enc(sessionId)}/events`,
-          Object.keys(searchParams).length > 0 ? searchParams : undefined,
-        );
-        const auth = await buildAuthInit({ accept: "text/event-stream" });
-        const response = await fetch(url, {
-          method: "GET",
-          cache: "no-store",
-          credentials: auth.credentials,
-          headers: auth.headers,
-          signal: controller.signal,
-        });
-        if (!response.ok || !response.body) {
-          throw new PaHttpError(response.status, `Event stream failed (${response.status})`);
-        }
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = "";
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          // SSE allows CRLF/CR line endings; a CR ending this chunk waits for a possible LF.
-          buffer = (buffer + decoder.decode(value, { stream: true })).replace(
-            /\r\n|\r(?!$)/g,
-            "\n",
-          );
-          let sepIndex = buffer.indexOf("\n\n");
-          while (sepIndex !== -1) {
-            const rawChunk = buffer.slice(0, sepIndex);
-            buffer = buffer.slice(sepIndex + 2);
-            sepIndex = buffer.indexOf("\n\n");
-
-            const dataLines = rawChunk
-              .split("\n")
-              .filter((line) => line.startsWith("data:"))
-              .map((line) => line.slice(5).trim());
-            if (dataLines.length === 0) continue;
-            try {
-              const parsed = JSON.parse(dataLines.join("\n")) as PaStreamEvent;
-              options.onEvent(parsed);
-            } catch {
-              // Skip malformed event frames safely.
-            }
-          }
-        }
-        if (!controller.signal.aborted) {
-          options.onDisconnect?.();
-        }
-      } catch (err) {
-        if (!controller.signal.aborted) {
-          options.onDisconnect?.(err instanceof Error ? err : new Error(String(err)));
-        }
-      }
-    })();
-
+    let stop: (() => void) | null = null;
+    let stopped = false;
+    primaryEnvironmentId().then(
+      (environmentId) => {
+        if (stopped) return;
+        stop = pa.followSession(appAtomRegistry, { environmentId, botId, sessionId, ...handlers });
+      },
+      (error: unknown) => {
+        if (!stopped) handlers.onFailure(error);
+      },
+    );
     return () => {
-      controller.abort();
+      stopped = true;
+      stop?.();
     };
   },
 };

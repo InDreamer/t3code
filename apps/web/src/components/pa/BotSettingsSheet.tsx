@@ -1,21 +1,31 @@
+import type {
+  PaAvatarShape,
+  PaBotConfig,
+  PaBotSummary,
+  PaCapabilities,
+  PaConfigSection,
+  PaConfigSectionValue,
+  PaModelCatalog,
+  PaSchedule,
+} from "@t3tools/contracts";
 import { T, useGT, useMessages, Var } from "gt-react";
 import {
   AlertTriangleIcon,
   ClockIcon,
   CpuIcon,
+  ExternalLinkIcon,
   Loader2Icon,
   PauseIcon,
   PlayIcon,
   PlusIcon,
   SaveIcon,
+  SlidersHorizontalIcon,
   Trash2Icon,
   UserRoundIcon,
-  WrenchIcon,
 } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import { cn } from "../../lib/utils";
-import { useStableCallback } from "~/hooks/useStableCallback";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
@@ -26,165 +36,318 @@ import { Sheet, SheetDescription, SheetHeader, SheetPopup, SheetTitle } from "..
 import { Switch } from "../ui/switch";
 import { Textarea } from "../ui/textarea";
 import { BotAvatar, PA_AVATAR_COLORS, PA_AVATAR_SHAPES } from "./BotAvatar";
-import { paApi } from "./paApi";
-import type { PaAvatarShape, PaBotDetail, PaCronJob, PaUpdateBotInput } from "./paTypes";
+import { paApi, paErrorMessage } from "./paApi";
 
-type SettingsTab = "profile" | "model" | "skills" | "cron";
+type SettingsTab = "profile" | "model" | "toggles" | "schedules";
 
-function setsEqual(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
-  if (a.size !== b.size) return false;
-  for (const item of a) {
-    if (!b.has(item)) return false;
+const TOGGLE_FILTER_THRESHOLD = 8;
+
+function initialSectionValue(section: PaConfigSection): PaConfigSectionValue {
+  switch (section.kind) {
+    case "document":
+      return { kind: "document", text: section.text };
+    case "toggleList":
+      return {
+        kind: "toggleList",
+        enabled: section.items.filter((item) => item.enabled).map((item) => item.id),
+      };
+    case "options":
+      return {
+        kind: "options",
+        values: Object.fromEntries(section.fields.map((field) => [field.id, field.value])),
+      };
   }
-  return true;
+}
+
+function sameSectionValue(a: PaConfigSectionValue, b: PaConfigSectionValue): boolean {
+  if (a.kind === "toggleList" && b.kind === "toggleList") {
+    const left = [...a.enabled].sort();
+    const right = [...b.enabled].sort();
+    return left.length === right.length && left.every((id, i) => id === right[i]);
+  }
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+function draftsFor(config: PaBotConfig): Record<string, PaConfigSectionValue> {
+  return Object.fromEntries(config.sections.map((s) => [s.id, initialSectionValue(s)]));
+}
+
+function ToggleListSection({
+  section,
+  value,
+  onChange,
+}: {
+  readonly section: Extract<PaConfigSection, { kind: "toggleList" }>;
+  readonly value: ReadonlyArray<string>;
+  readonly onChange: (enabled: ReadonlyArray<string>) => void;
+}) {
+  const gt = useGT();
+  const [filter, setFilter] = useState("");
+  const enabled = new Set(value);
+  const needle = filter.trim().toLowerCase();
+  const items = needle
+    ? section.items.filter(
+        (item) =>
+          item.label.toLowerCase().includes(needle) ||
+          (item.group ?? "").toLowerCase().includes(needle),
+      )
+    : section.items;
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between gap-2">
+        <Label>{section.label}</Label>
+        <Badge variant="outline" size="sm">
+          <T>
+            已启用 <Var>{enabled.size}</Var> / <Var>{section.items.length}</Var>
+          </T>
+        </Badge>
+      </div>
+      {section.description ? (
+        <p className="text-2xs text-muted-foreground">{section.description}</p>
+      ) : null}
+      {section.items.length > TOGGLE_FILTER_THRESHOLD ? (
+        <Input
+          placeholder={gt("搜索名称或分类...")}
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
+        />
+      ) : null}
+      {items.length === 0 ? (
+        <div className="py-6 text-center text-muted-foreground text-xs">
+          <T>没有匹配的项目</T>
+        </div>
+      ) : (
+        <div className="space-y-1.5">
+          {items.map((item) => (
+            <div
+              key={item.id}
+              className="flex items-center justify-between rounded-lg border border-border/50 px-3 py-2"
+            >
+              <div className="min-w-0 pr-3">
+                <div className="truncate font-medium text-xs">{item.label}</div>
+                {item.description || item.group ? (
+                  <div className="truncate text-2xs text-muted-foreground">
+                    {item.description ?? item.group}
+                  </div>
+                ) : null}
+              </div>
+              <Switch
+                size="sm"
+                checked={enabled.has(item.id)}
+                onCheckedChange={(next) => {
+                  const copy = new Set(enabled);
+                  if (next) copy.add(item.id);
+                  else copy.delete(item.id);
+                  onChange(Array.from(copy));
+                }}
+              />
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function OptionsSection({
+  section,
+  value,
+  onChange,
+}: {
+  readonly section: Extract<PaConfigSection, { kind: "options" }>;
+  readonly value: Readonly<Record<string, string | boolean>>;
+  readonly onChange: (values: Readonly<Record<string, string | boolean>>) => void;
+}) {
+  return (
+    <div className="space-y-3">
+      {section.fields.map((field) => {
+        const id = `pa-config-${section.id}-${field.id}`;
+        const current = value[field.id];
+        const set = (next: string | boolean) => onChange({ ...value, [field.id]: next });
+        switch (field.kind) {
+          case "text":
+            return (
+              <div key={field.id} className="space-y-1.5">
+                <Label htmlFor={id}>{field.label}</Label>
+                <Input
+                  id={id}
+                  value={typeof current === "string" ? current : ""}
+                  placeholder={field.placeholder}
+                  onChange={(e) => set(e.target.value)}
+                />
+              </div>
+            );
+          case "toggle":
+            return (
+              <div
+                key={field.id}
+                className="flex items-center justify-between rounded-lg border border-border/60 px-3 py-2.5"
+              >
+                <Label htmlFor={id}>{field.label}</Label>
+                <Switch id={id} checked={current === true} onCheckedChange={set} />
+              </div>
+            );
+          case "select":
+            return (
+              <div key={field.id} className="space-y-1.5">
+                <Label htmlFor={id}>{field.label}</Label>
+                <select
+                  id={id}
+                  value={typeof current === "string" ? current : ""}
+                  onChange={(e) => set(e.target.value)}
+                  className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
+                >
+                  {field.choices.map((choice) => (
+                    <option key={choice.id} value={choice.id}>
+                      {choice.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            );
+        }
+      })}
+    </div>
+  );
 }
 
 function BotSettingsBody({
-  botId,
+  bot,
+  capabilities,
   onClose,
   onSaved,
 }: {
-  readonly botId: string;
+  readonly bot: PaBotSummary;
+  readonly capabilities: PaCapabilities | null;
   readonly onClose: () => void;
-  readonly onSaved: (detail: PaBotDetail) => void;
+  readonly onSaved: () => void;
 }) {
   const gt = useGT();
   const m = useMessages();
+  const configSupported = capabilities?.config.supported === true;
+  const modelsSupported = capabilities?.models.supported === true;
+  const schedulesSupported = capabilities?.schedules.supported === true;
+
   const [tab, setTab] = useState<SettingsTab>("profile");
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(configSupported || modelsSupported || schedulesSupported);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [savedNotice, setSavedNotice] = useState<string | null>(null);
   const [confirmMessage, setConfirmMessage] = useState<string | null>(null);
-  const [detail, setDetail] = useState<PaBotDetail | null>(null);
 
-  const [name, setName] = useState("");
-  const [description, setDescription] = useState("");
-  const [soul, setSoul] = useState("");
-  const [avatarColor, setAvatarColor] = useState<string>(PA_AVATAR_COLORS[0].value);
-  const [avatarShape, setAvatarShape] = useState<PaAvatarShape>("blob");
-  const [pinned, setPinned] = useState(false);
-  const [provider, setProvider] = useState("");
-  const [model, setModel] = useState("");
-  const [disabledSkills, setDisabledSkills] = useState<Set<string>>(() => new Set());
-  const [enabledToolsets, setEnabledToolsets] = useState<Set<string>>(() => new Set());
-  const [skillFilter, setSkillFilter] = useState("");
-
-  const [cronJobs, setCronJobs] = useState<ReadonlyArray<PaCronJob>>([]);
-  const [cronBusy, setCronBusy] = useState(false);
-  const [newCronName, setNewCronName] = useState("");
-  const [newCronSchedule, setNewCronSchedule] = useState("every 1h");
-  const [newCronPrompt, setNewCronPrompt] = useState("");
-
-  const hydrateFromDetail = useStableCallback((loaded: PaBotDetail) => {
-    setDetail(loaded);
-    setName(loaded.name);
-    setDescription(loaded.description);
-    setSoul(loaded.soul);
-    setAvatarColor(loaded.avatarColor);
-    setAvatarShape(loaded.avatarShape);
-    setPinned(loaded.pinned);
-    setProvider(loaded.provider ?? loaded.modelOptions.find((p) => p.isCurrent)?.slug ?? "");
-    setModel(loaded.model ?? "");
-    setDisabledSkills(new Set(loaded.skills.filter((s) => !s.enabled).map((s) => s.name)));
-    setEnabledToolsets(new Set(loaded.toolsets.filter((t) => t.enabled).map((t) => t.name)));
-    setCronJobs(loaded.cronJobs);
+  const [name, setName] = useState(bot.name);
+  const [avatarColor, setAvatarColor] = useState(bot.avatarColor);
+  const [avatarShape, setAvatarShape] = useState<PaAvatarShape>(bot.avatarShape);
+  const [pinned, setPinned] = useState(bot.pinned);
+  const [savedMeta, setSavedMeta] = useState({
+    name: bot.name,
+    avatarColor: bot.avatarColor,
+    avatarShape: bot.avatarShape,
+    pinned: bot.pinned,
   });
 
-  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- loads the selected Bot's profile, model options, skills, toolsets, and cron jobs when opening the editor
+  const [config, setConfig] = useState<PaBotConfig | null>(null);
+  const [drafts, setDrafts] = useState<Record<string, PaConfigSectionValue>>({});
+  const [catalog, setCatalog] = useState<PaModelCatalog | null>(null);
+  const [provider, setProvider] = useState("");
+  const [model, setModel] = useState("");
+
+  const [schedules, setSchedules] = useState<ReadonlyArray<PaSchedule>>([]);
+  const [scheduleBusy, setScheduleBusy] = useState(false);
+  const [newScheduleName, setNewScheduleName] = useState("");
+  const [newScheduleSpec, setNewScheduleSpec] = useState("every 1h");
+  const [newSchedulePrompt, setNewSchedulePrompt] = useState("");
+
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- loads the agent's config sections, model catalog and schedules when the editor opens
   useEffect(() => {
-    const controller = new AbortController();
-    paApi
-      .getBotDetail(botId, controller.signal)
-      .then((loaded) => {
-        if (!controller.signal.aborted) {
-          hydrateFromDetail(loaded);
-        }
-      })
+    let cancelled = false;
+    const loads: Array<Promise<unknown>> = [];
+    if (configSupported) {
+      loads.push(
+        paApi.getBotConfig(bot.botId).then((loaded) => {
+          if (cancelled) return;
+          setConfig(loaded);
+          setDrafts(draftsFor(loaded));
+        }),
+      );
+    }
+    if (modelsSupported) {
+      loads.push(
+        paApi.getBotModels(bot.botId).then((loaded) => {
+          if (cancelled) return;
+          setCatalog(loaded);
+          setProvider(loaded.current?.provider ?? "");
+          setModel(loaded.current?.model ?? "");
+        }),
+      );
+    }
+    if (schedulesSupported) {
+      loads.push(
+        paApi.listSchedules(bot.botId).then((loaded) => {
+          if (!cancelled) setSchedules(loaded);
+        }),
+      );
+    }
+    Promise.all(loads)
       .catch((err) => {
-        if (!controller.signal.aborted) {
-          setError(err instanceof Error ? err.message : gt("加载 Bot 配置失败"));
-        }
+        if (!cancelled) setError(paErrorMessage(err, gt("加载 Bot 配置失败")));
       })
       .finally(() => {
-        if (!controller.signal.aborted) setLoading(false);
+        if (!cancelled) setLoading(false);
       });
-
-    return () => controller.abort();
-  }, [botId, gt, hydrateFromDetail]);
-
-  const activeProviderOption = detail
-    ? (detail.modelOptions.find((p) => p.slug === provider) ??
-      detail.modelOptions.find((p) => p.isCurrent) ??
-      detail.modelOptions[0] ??
-      null)
-    : null;
-
-  const q = skillFilter.trim().toLowerCase();
-  const filteredSkills = !detail
-    ? []
-    : !q
-      ? detail.skills
-      : detail.skills.filter(
-          (s) => s.name.toLowerCase().includes(q) || (s.category ?? "").toLowerCase().includes(q),
-        );
-
-  const enabledSkillsCount = detail ? Math.max(0, detail.skills.length - disabledSkills.size) : 0;
-
-  const handleSave = async (confirmExpensiveModel = false) => {
-    if (!detail) return;
-
-    // Hermes pins a model only together with a provider, so "跟随默认" means the current provider.
-    const currentProvider =
-      detail.provider ?? detail.modelOptions.find((p) => p.isCurrent)?.slug ?? "";
-    const initialProvider = currentProvider;
-    const initialModel = detail.model ?? "";
-    const initialDisabledSkills = new Set(
-      detail.skills.filter((s) => !s.enabled).map((s) => s.name),
-    );
-    const initialEnabledToolsets = new Set(
-      detail.toolsets.filter((t) => t.enabled).map((t) => t.name),
-    );
-
-    const nextName = name.trim() || detail.profile;
-    const nextModel = model.trim();
-    const nextProvider = provider.trim() || currentProvider;
-    const modelChanged = nextModel !== initialModel || nextProvider !== initialProvider;
-    const skillsChanged =
-      detail.skills.length > 0 && !setsEqual(disabledSkills, initialDisabledSkills);
-    const toolsetsChanged =
-      detail.toolsets.length > 0 && !setsEqual(enabledToolsets, initialEnabledToolsets);
-
-    const patch: PaUpdateBotInput = {
-      ...(nextName !== detail.name ? { name: nextName } : {}),
-      ...(description !== detail.description ? { description } : {}),
-      ...(avatarColor !== detail.avatarColor ? { avatarColor } : {}),
-      ...(avatarShape !== detail.avatarShape ? { avatarShape } : {}),
-      ...(pinned !== detail.pinned ? { pinned } : {}),
-      ...(soul !== detail.soul ? { soul } : {}),
-      ...(modelChanged && nextModel ? { model: nextModel } : {}),
-      ...(modelChanged && nextProvider ? { provider: nextProvider } : {}),
-      ...(confirmExpensiveModel ? { confirmExpensiveModel: true } : {}),
-      ...(skillsChanged ? { disabledSkills: Array.from(disabledSkills) } : {}),
-      ...(toolsetsChanged ? { enabledToolsets: Array.from(enabledToolsets) } : {}),
+    return () => {
+      cancelled = true;
     };
+  }, [bot.botId, configSupported, modelsSupported, schedulesSupported, gt]);
 
-    if (Object.keys(patch).length === 0) {
+  const sections = config?.sections ?? [];
+  const profileSections = sections.filter((s) => s.kind !== "toggleList");
+  const toggleSections = sections.filter(
+    (s): s is Extract<PaConfigSection, { kind: "toggleList" }> => s.kind === "toggleList",
+  );
+  const activeProvider =
+    catalog?.providers.find((p) => p.id === provider) ??
+    catalog?.providers.find((p) => p.isCurrent) ??
+    null;
+
+  const handleSave = async (confirmModel = false) => {
+    const nextName = name.trim() || bot.agentRef;
+    const metaPatch = {
+      ...(nextName !== savedMeta.name ? { name: nextName } : {}),
+      ...(avatarColor !== savedMeta.avatarColor ? { avatarColor } : {}),
+      ...(avatarShape !== savedMeta.avatarShape ? { avatarShape } : {}),
+      ...(pinned !== savedMeta.pinned ? { pinned } : {}),
+    };
+    const changedSections = sections.filter((section) => {
+      const draft = drafts[section.id];
+      return draft !== undefined && !sameSectionValue(draft, initialSectionValue(section));
+    });
+    const currentModel = catalog?.current ?? null;
+    const modelChanged =
+      catalog !== null &&
+      model.trim().length > 0 &&
+      (model.trim() !== currentModel?.model || (provider || null) !== currentModel?.provider);
+
+    if (Object.keys(metaPatch).length === 0 && changedSections.length === 0 && !modelChanged) {
       setSavedNotice(gt("没有需要保存的修改"));
       return;
     }
-    if (modelChanged && !nextModel) {
-      setError(gt("请先选择或输入模型名称"));
-      return;
-    }
-    if (modelChanged && nextModel && !nextProvider) {
-      setError(gt("请先选择模型服务商"));
-      return;
-    }
-    // Hermes treats an empty toolset list as "clear the pin", silently re-enabling every default.
-    if (toolsetsChanged && enabledToolsets.size === 0) {
-      setError(gt("至少需要启用一个工具集"));
-      return;
+    for (const section of changedSections) {
+      const draft = drafts[section.id];
+      if (
+        section.kind === "toggleList" &&
+        section.minEnabled !== undefined &&
+        draft?.kind === "toggleList" &&
+        draft.enabled.length < section.minEnabled
+      ) {
+        setError(
+          gt("「{section}」至少需要启用 {count} 项", {
+            section: section.label,
+            count: section.minEnabled,
+          }),
+        );
+        return;
+      }
     }
 
     setSaving(true);
@@ -192,73 +355,97 @@ function BotSettingsBody({
     setSavedNotice(null);
     setConfirmMessage(null);
     try {
-      const updated = await paApi.updateBot(botId, patch);
-      if (updated.confirmRequired) {
-        // Every other section already saved; keep the unconfirmed model pick for the resend.
-        const pendingModel = model;
-        const pendingProvider = provider;
-        hydrateFromDetail(updated);
-        setModel(pendingModel);
-        setProvider(pendingProvider);
-        onSaved(updated);
-        setConfirmMessage(updated.confirmRequired.message);
-        return;
+      if (Object.keys(metaPatch).length > 0) {
+        await paApi.updateBotMeta({ botId: bot.botId, ...metaPatch });
+        setSavedMeta({ name: nextName, avatarColor, avatarShape, pinned });
+        setName(nextName);
       }
-      hydrateFromDetail(updated);
-      setSavedNotice(gt("已保存到 Hermes Profile"));
-      onSaved(updated);
+      let nextConfig = config;
+      for (const section of changedSections) {
+        nextConfig = await paApi.patchBotConfig(bot.botId, section.id, drafts[section.id]!);
+      }
+      if (nextConfig && nextConfig !== config) {
+        setConfig(nextConfig);
+        setDrafts(draftsFor(nextConfig));
+      }
+      if (modelChanged && catalog) {
+        const result = await paApi.selectBotModel({
+          botId: bot.botId,
+          provider,
+          model: model.trim(),
+          ...(confirmModel ? { confirm: true } : {}),
+        });
+        if (result.status === "confirmRequired") {
+          // Everything else already saved; keep the unconfirmed model pick for the resend.
+          setConfirmMessage(result.message);
+          onSaved();
+          return;
+        }
+        setCatalog({ ...catalog, current: result.current });
+      }
+      setSavedNotice(gt("已保存"));
+      onSaved();
     } catch (err) {
-      setError(err instanceof Error ? err.message : gt("保存失败"));
+      setError(paErrorMessage(err, gt("保存失败")));
     } finally {
       setSaving(false);
     }
   };
 
-  const handleCronAction = async (action: "pause" | "resume" | "remove", job: PaCronJob) => {
-    setCronBusy(true);
+  const mutateSchedule = async (
+    input: Omit<Parameters<typeof paApi.mutateSchedule>[0], "botId">,
+    fallback: string,
+  ) => {
+    setScheduleBusy(true);
     setError(null);
     try {
-      const next = await paApi.manageCron(botId, {
-        action,
-        jobId: job.id,
-        name: job.name,
-      });
-      setCronJobs(next);
+      setSchedules(await paApi.mutateSchedule({ botId: bot.botId, ...input }));
+      return true;
     } catch (err) {
-      setError(err instanceof Error ? err.message : gt("定时任务操作失败"));
+      setError(paErrorMessage(err, fallback));
+      return false;
     } finally {
-      setCronBusy(false);
+      setScheduleBusy(false);
     }
   };
 
-  const handleAddCron = async (e: React.FormEvent) => {
+  const handleAddSchedule = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newCronPrompt.trim() || !newCronSchedule.trim()) return;
-    setCronBusy(true);
-    setError(null);
-    try {
-      const next = await paApi.manageCron(botId, {
+    if (!newSchedulePrompt.trim() || !newScheduleSpec.trim()) return;
+    const added = await mutateSchedule(
+      {
         action: "add",
-        name: newCronName.trim() || undefined,
-        schedule: newCronSchedule.trim(),
-        prompt: newCronPrompt.trim(),
-      });
-      setCronJobs(next);
-      setNewCronName("");
-      setNewCronPrompt("");
-    } catch (err) {
-      setError(err instanceof Error ? err.message : gt("新增定时任务失败"));
-    } finally {
-      setCronBusy(false);
+        ...(newScheduleName.trim() ? { name: newScheduleName.trim() } : {}),
+        schedule: newScheduleSpec.trim(),
+        prompt: newSchedulePrompt.trim(),
+      },
+      gt("新增定时任务失败"),
+    );
+    if (added) {
+      setNewScheduleName("");
+      setNewSchedulePrompt("");
     }
   };
 
   const tabs: ReadonlyArray<{ id: SettingsTab; label: string; icon: React.ReactNode }> = [
-    { id: "profile", label: gt("人设"), icon: <UserRoundIcon className="size-3.5" /> },
-    { id: "model", label: gt("模型"), icon: <CpuIcon className="size-3.5" /> },
-    { id: "skills", label: gt("技能"), icon: <WrenchIcon className="size-3.5" /> },
-    { id: "cron", label: gt("定时"), icon: <ClockIcon className="size-3.5" /> },
+    { id: "profile", label: gt("资料"), icon: <UserRoundIcon className="size-3.5" /> },
+    ...(modelsSupported
+      ? [{ id: "model" as const, label: gt("模型"), icon: <CpuIcon className="size-3.5" /> }]
+      : []),
+    ...(toggleSections.length > 0
+      ? [
+          {
+            id: "toggles" as const,
+            label: gt("能力"),
+            icon: <SlidersHorizontalIcon className="size-3.5" />,
+          },
+        ]
+      : []),
+    ...(schedulesSupported
+      ? [{ id: "schedules" as const, label: gt("定时"), icon: <ClockIcon className="size-3.5" /> }]
+      : []),
   ];
+  const activeTab = tabs.some((item) => item.id === tab) ? tab : "profile";
 
   return (
     <>
@@ -266,43 +453,51 @@ function BotSettingsBody({
         <SheetHeader>
           <div className="flex items-center gap-3 pr-8">
             <BotAvatar color={avatarColor} shape={avatarShape} size="sm" starred={pinned} />
-            <div className="min-w-0">
+            <div className="min-w-0 flex-1">
               <SheetTitle>
-                <span className="block truncate text-base">
-                  {name || detail?.name || gt("Bot 设置")}
-                </span>
+                <span className="block truncate text-base">{name || bot.name}</span>
               </SheetTitle>
               <SheetDescription>
                 <span className="block truncate text-xs">
-                  {detail
-                    ? gt("{adapter} · profile: {profile}", {
-                        adapter: detail.adapter,
-                        profile: detail.profile,
-                      })
-                    : gt("正在读取配置...")}
+                  {gt("{engine} · {agent}", { engine: bot.engineLabel, agent: bot.agentRef })}
                 </span>
               </SheetDescription>
             </div>
+            {config?.nativeConsoleUrl ? (
+              <Button
+                size="xs"
+                variant="ghost"
+                render={<a href={config.nativeConsoleUrl} target="_blank" rel="noreferrer" />}
+              >
+                <ExternalLinkIcon className="size-3.5" />
+                <T>高级设置</T>
+              </Button>
+            ) : null}
           </div>
 
-          <div className="mt-3 grid grid-cols-4 gap-1 rounded-lg bg-muted/60 p-1">
-            {tabs.map((item) => (
-              <button
-                key={item.id}
-                type="button"
-                onClick={() => setTab(item.id)}
-                className={cn(
-                  "flex items-center justify-center gap-1 rounded-md py-1.5 font-medium text-xs transition-colors",
-                  tab === item.id
-                    ? "bg-background text-foreground shadow-xs"
-                    : "text-muted-foreground hover:text-foreground",
-                )}
-              >
-                {item.icon}
-                <span>{item.label}</span>
-              </button>
-            ))}
-          </div>
+          {tabs.length > 1 ? (
+            <div
+              className="mt-3 grid gap-1 rounded-lg bg-muted/60 p-1"
+              style={{ gridTemplateColumns: `repeat(${tabs.length}, minmax(0, 1fr))` }}
+            >
+              {tabs.map((item) => (
+                <button
+                  key={item.id}
+                  type="button"
+                  onClick={() => setTab(item.id)}
+                  className={cn(
+                    "flex items-center justify-center gap-1 rounded-md py-1.5 font-medium text-xs transition-colors",
+                    activeTab === item.id
+                      ? "bg-background text-foreground shadow-xs"
+                      : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  {item.icon}
+                  <span>{item.label}</span>
+                </button>
+              ))}
+            </div>
+          ) : null}
         </SheetHeader>
       </div>
 
@@ -311,7 +506,7 @@ function BotSettingsBody({
           {loading ? (
             <div className="flex items-center justify-center py-12 text-muted-foreground text-sm">
               <Loader2Icon className="mr-2 size-4 animate-spin" />
-              <T>正在同步 Hermes 配置...</T>
+              <T>正在读取配置...</T>
             </div>
           ) : null}
 
@@ -355,25 +550,13 @@ function BotSettingsBody({
             </div>
           ) : null}
 
-          {!loading && detail && tab === "profile" ? (
+          {!loading && activeTab === "profile" ? (
             <div className="space-y-4">
               <div className="space-y-1.5">
                 <Label htmlFor="pa-edit-name">
                   <T>名称</T>
                 </Label>
                 <Input id="pa-edit-name" value={name} onChange={(e) => setName(e.target.value)} />
-              </div>
-
-              <div className="space-y-1.5">
-                <Label htmlFor="pa-edit-desc">
-                  <T>简介</T>
-                </Label>
-                <Input
-                  id="pa-edit-desc"
-                  placeholder={gt("这个 Bot 负责什么？")}
-                  value={description}
-                  onChange={(e) => setDescription(e.target.value)}
-                />
               </div>
 
               <div className="flex items-center justify-between rounded-lg border border-border/60 px-3 py-2.5">
@@ -433,45 +616,80 @@ function BotSettingsBody({
                 </div>
               </div>
 
-              <div className="space-y-1.5">
-                <Label htmlFor="pa-edit-soul">
-                  <T>人设指令（SOUL.md）</T>
-                </Label>
-                <Textarea
-                  id="pa-edit-soul"
-                  rows={8}
-                  value={soul}
-                  onChange={(e) => setSoul(e.target.value)}
-                  placeholder={gt("输入该 Bot 的系统提示词和行为规范...")}
-                />
-              </div>
+              {profileSections.map((section) => {
+                const draft = drafts[section.id];
+                if (section.kind === "document" && draft?.kind === "document") {
+                  const id = `pa-config-${section.id}`;
+                  return (
+                    <div key={section.id} className="space-y-1.5">
+                      <Label htmlFor={id}>
+                        {section.label}
+                        {section.description ? (
+                          <span className="font-normal text-muted-foreground">
+                            {" "}
+                            · {section.description}
+                          </span>
+                        ) : null}
+                      </Label>
+                      <Textarea
+                        id={id}
+                        rows={8}
+                        value={draft.text}
+                        placeholder={
+                          section.placeholder ?? gt("输入该 Bot 的系统提示词和行为规范...")
+                        }
+                        onChange={(e) =>
+                          setDrafts((prev) => ({
+                            ...prev,
+                            [section.id]: { kind: "document", text: e.target.value },
+                          }))
+                        }
+                      />
+                    </div>
+                  );
+                }
+                if (section.kind === "options" && draft?.kind === "options") {
+                  return (
+                    <OptionsSection
+                      key={section.id}
+                      section={section}
+                      value={draft.values}
+                      onChange={(values) =>
+                        setDrafts((prev) => ({
+                          ...prev,
+                          [section.id]: { kind: "options", values },
+                        }))
+                      }
+                    />
+                  );
+                }
+                return null;
+              })}
             </div>
           ) : null}
 
-          {!loading && detail && tab === "model" ? (
+          {!loading && activeTab === "model" && catalog ? (
             <div className="space-y-4">
               <div className="space-y-1.5">
                 <Label htmlFor="pa-model-provider">
-                  <T>模型服务商（Provider）</T>
+                  <T>模型服务商</T>
                 </Label>
                 <select
                   id="pa-model-provider"
                   value={provider}
                   onChange={(e) => {
-                    const nextSlug = e.target.value;
-                    setProvider(nextSlug);
+                    const next = e.target.value;
+                    setProvider(next);
                     setConfirmMessage(null);
-                    const found = detail.modelOptions.find((p) => p.slug === nextSlug);
-                    if (found?.models[0]) {
-                      setModel(found.models[0]);
-                    }
+                    const found = catalog.providers.find((p) => p.id === next);
+                    if (found?.models[0]) setModel(found.models[0].id);
                   }}
                   className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
                 >
-                  <option value="">{gt("跟随默认")}</option>
-                  {detail.modelOptions.map((opt) => (
-                    <option key={opt.slug} value={opt.slug}>
-                      {opt.name} ({opt.slug})
+                  {catalog.current?.provider ? null : <option value="">{gt("跟随默认")}</option>}
+                  {catalog.providers.map((opt) => (
+                    <option key={opt.id} value={opt.id}>
+                      {opt.label} ({opt.id})
                     </option>
                   ))}
                 </select>
@@ -481,7 +699,7 @@ function BotSettingsBody({
                 <Label htmlFor="pa-model-name">
                   <T>默认模型</T>
                 </Label>
-                {activeProviderOption && activeProviderOption.models.length > 0 ? (
+                {activeProvider && activeProvider.models.length > 0 ? (
                   <select
                     id="pa-model-name"
                     value={model}
@@ -491,16 +709,16 @@ function BotSettingsBody({
                     }}
                     className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
                   >
-                    {!activeProviderOption.models.includes(model) && model ? (
+                    {model && !activeProvider.models.some((item) => item.id === model) ? (
                       <option value={model}>{gt("{model}（当前）", { model })}</option>
                     ) : null}
-                    {activeProviderOption.models.map((item) => (
-                      <option key={item} value={item}>
-                        {item}
+                    {activeProvider.models.map((item) => (
+                      <option key={item.id} value={item.id}>
+                        {item.id}
                       </option>
                     ))}
                   </select>
-                ) : (
+                ) : catalog.allowCustom ? (
                   <Input
                     id="pa-model-name"
                     value={model}
@@ -508,135 +726,55 @@ function BotSettingsBody({
                       setModel(e.target.value);
                       setConfirmMessage(null);
                     }}
-                    placeholder={gt("例如：deepseek-flash")}
+                    placeholder={gt("输入模型名称")}
                   />
+                ) : (
+                  <div className="text-muted-foreground text-xs">
+                    <T>没有可选的模型</T>
+                  </div>
                 )}
               </div>
+            </div>
+          ) : null}
 
-              {detail.toolsets.length > 0 ? (
-                <>
-                  <Separator />
-                  <div className="space-y-2">
-                    <Label>
-                      <T>工具集开关（Toolsets）</T>
-                    </Label>
-                    <div className="space-y-1.5">
-                      {detail.toolsets.map((toolset) => {
-                        const checked = enabledToolsets.has(toolset.name);
-                        return (
-                          <div
-                            key={toolset.name}
-                            className="flex items-center justify-between rounded-lg border border-border/50 px-3 py-2"
-                          >
-                            <div className="min-w-0 pr-3">
-                              <div className="truncate font-medium text-xs">
-                                {toolset.label || toolset.name}
-                              </div>
-                              {toolset.description ? (
-                                <div className="truncate text-2xs text-muted-foreground">
-                                  {toolset.description}
-                                </div>
-                              ) : null}
-                            </div>
-                            <Switch
-                              size="sm"
-                              checked={checked}
-                              onCheckedChange={(next) => {
-                                setEnabledToolsets((prev) => {
-                                  const copy = new Set(prev);
-                                  if (next) copy.add(toolset.name);
-                                  else copy.delete(toolset.name);
-                                  return copy;
-                                });
-                              }}
-                            />
-                          </div>
-                        );
-                      })}
-                    </div>
+          {!loading && activeTab === "toggles" ? (
+            <div className="space-y-5">
+              {toggleSections.map((section, index) => {
+                const draft = drafts[section.id];
+                return (
+                  <div key={section.id} className="space-y-5">
+                    {index > 0 ? <Separator /> : null}
+                    <ToggleListSection
+                      section={section}
+                      value={draft?.kind === "toggleList" ? draft.enabled : []}
+                      onChange={(enabled) =>
+                        setDrafts((prev) => ({
+                          ...prev,
+                          [section.id]: { kind: "toggleList", enabled },
+                        }))
+                      }
+                    />
                   </div>
-                </>
-              ) : null}
+                );
+              })}
             </div>
           ) : null}
 
-          {!loading && detail && tab === "skills" ? (
-            <div className="space-y-3">
-              <div className="flex items-center justify-between">
-                <Label>
-                  <T>
-                    Skills 开关（共 <Var>{detail.skills.length}</Var> 个）
-                  </T>
-                </Label>
-                <Badge variant="outline" size="sm">
-                  <T>
-                    已启用 <Var>{enabledSkillsCount}</Var>
-                  </T>
-                </Badge>
-              </div>
-              <Input
-                placeholder={gt("搜索技能名称或分类...")}
-                value={skillFilter}
-                onChange={(e) => setSkillFilter(e.target.value)}
-              />
-              {filteredSkills.length === 0 ? (
-                <div className="py-8 text-center text-muted-foreground text-xs">
-                  <T>没有匹配的技能</T>
-                </div>
-              ) : (
-                <div className="space-y-1.5">
-                  {filteredSkills.map((skill) => {
-                    const enabled = !disabledSkills.has(skill.name);
-                    return (
-                      <div
-                        key={skill.name}
-                        className="flex items-center justify-between rounded-lg border border-border/50 px-3 py-2"
-                      >
-                        <div className="min-w-0 pr-3">
-                          <div className="truncate font-medium text-xs">{skill.name}</div>
-                          {skill.category ? (
-                            <div className="truncate text-2xs text-muted-foreground">
-                              {skill.category}
-                            </div>
-                          ) : null}
-                        </div>
-                        <Switch
-                          size="sm"
-                          checked={enabled}
-                          onCheckedChange={(next) => {
-                            setDisabledSkills((prev) => {
-                              const copy = new Set(prev);
-                              if (next) copy.delete(skill.name);
-                              else copy.add(skill.name);
-                              return copy;
-                            });
-                          }}
-                        />
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-          ) : null}
-
-          {!loading && detail && tab === "cron" ? (
+          {!loading && activeTab === "schedules" ? (
             <div className="space-y-4">
               <div className="space-y-2">
-                <div className="flex items-center justify-between">
-                  <Label>
-                    <T>
-                      已有定时任务（<Var>{cronJobs.length}</Var>）
-                    </T>
-                  </Label>
-                </div>
-                {cronJobs.length === 0 ? (
+                <Label>
+                  <T>
+                    已有定时任务（<Var>{schedules.length}</Var>）
+                  </T>
+                </Label>
+                {schedules.length === 0 ? (
                   <div className="rounded-lg border border-dashed border-border/60 py-6 text-center text-muted-foreground text-xs">
                     <T>这个 Bot 暂时还没有定时任务</T>
                   </div>
                 ) : (
                   <div className="space-y-2">
-                    {cronJobs.map((job) => (
+                    {schedules.map((job) => (
                       <div
                         key={job.id}
                         className={cn(
@@ -669,10 +807,13 @@ function BotSettingsBody({
                               size="icon"
                               variant="ghost"
                               className="size-7"
-                              disabled={cronBusy}
+                              disabled={scheduleBusy}
                               title={job.enabled ? gt("暂停") : gt("恢复")}
                               onClick={() =>
-                                handleCronAction(job.enabled ? "pause" : "resume", job)
+                                void mutateSchedule(
+                                  { action: job.enabled ? "pause" : "resume", scheduleId: job.id },
+                                  gt("定时任务操作失败"),
+                                )
                               }
                             >
                               {job.enabled ? (
@@ -686,9 +827,14 @@ function BotSettingsBody({
                               size="icon"
                               variant="ghost-destructive"
                               className="size-7"
-                              disabled={cronBusy}
+                              disabled={scheduleBusy}
                               title={gt("删除")}
-                              onClick={() => handleCronAction("remove", job)}
+                              onClick={() =>
+                                void mutateSchedule(
+                                  { action: "remove", scheduleId: job.id },
+                                  gt("定时任务操作失败"),
+                                )
+                              }
                             >
                               <Trash2Icon className="size-3.5" />
                             </Button>
@@ -707,34 +853,34 @@ function BotSettingsBody({
 
               <Separator />
 
-              <form onSubmit={handleAddCron} className="space-y-2.5">
+              <form onSubmit={handleAddSchedule} className="space-y-2.5">
                 <Label>
                   <T>新增定时任务</T>
                 </Label>
                 <Input
                   placeholder={gt("任务名称（例如：每日早报）")}
-                  value={newCronName}
-                  onChange={(e) => setNewCronName(e.target.value)}
+                  value={newScheduleName}
+                  onChange={(e) => setNewScheduleName(e.target.value)}
                 />
                 <Input
                   placeholder={gt("调度表达式（如 every 1h / 0 9 * * *）")}
-                  value={newCronSchedule}
-                  onChange={(e) => setNewCronSchedule(e.target.value)}
+                  value={newScheduleSpec}
+                  onChange={(e) => setNewScheduleSpec(e.target.value)}
                 />
                 <Textarea
                   rows={3}
                   placeholder={gt("到期时要让 Bot 执行的指令...")}
-                  value={newCronPrompt}
-                  onChange={(e) => setNewCronPrompt(e.target.value)}
+                  value={newSchedulePrompt}
+                  onChange={(e) => setNewSchedulePrompt(e.target.value)}
                 />
                 <Button
                   type="submit"
                   size="sm"
                   variant="secondary"
-                  disabled={cronBusy || !newCronPrompt.trim() || !newCronSchedule.trim()}
+                  disabled={scheduleBusy || !newSchedulePrompt.trim() || !newScheduleSpec.trim()}
                   className="w-full"
                 >
-                  {cronBusy ? (
+                  {scheduleBusy ? (
                     <Loader2Icon className="mr-1.5 size-3.5 animate-spin" />
                   ) : (
                     <PlusIcon className="mr-1.5 size-3.5" />
@@ -747,7 +893,7 @@ function BotSettingsBody({
         </div>
       </ScrollArea>
 
-      {tab !== "cron" ? (
+      {activeTab !== "schedules" ? (
         <div
           className="flex items-center justify-end gap-2 border-t border-border/60 px-5 py-3"
           style={{ paddingBottom: "max(0.75rem, env(safe-area-inset-bottom))" }}
@@ -758,7 +904,7 @@ function BotSettingsBody({
           <Button
             type="button"
             size="sm"
-            disabled={saving || loading || !detail}
+            disabled={saving || loading}
             onClick={() => void handleSave(false)}
           >
             {saving ? (
@@ -775,23 +921,26 @@ function BotSettingsBody({
 }
 
 export function BotSettingsSheet({
-  botId,
+  bot,
+  capabilities,
   open,
   onOpenChange,
   onSaved,
 }: {
-  readonly botId: string | null;
+  readonly bot: PaBotSummary | null;
+  readonly capabilities: PaCapabilities | null;
   readonly open: boolean;
   readonly onOpenChange: (open: boolean) => void;
-  readonly onSaved: (detail: PaBotDetail) => void;
+  readonly onSaved: () => void;
 }) {
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetPopup side="right" className="flex w-full max-w-md flex-col">
-        {open && botId ? (
+        {open && bot ? (
           <BotSettingsBody
-            key={botId}
-            botId={botId}
+            key={bot.botId}
+            bot={bot}
+            capabilities={capabilities}
             onClose={() => onOpenChange(false)}
             onSaved={onSaved}
           />

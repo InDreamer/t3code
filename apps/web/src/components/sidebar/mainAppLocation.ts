@@ -14,8 +14,7 @@ export function isSidebarUtilityPage(pathname: string) {
     pathname.startsWith("/projects/") ||
     pathname === "/pull-requests" ||
     pathname === "/issues" ||
-    pathname === "/workflows" ||
-    pathname === "/bots"
+    pathname === "/workflows"
   );
 }
 
@@ -44,7 +43,7 @@ export function startMainAppLocationTracking(router: AnyRouter): () => void {
     appModalReturnThreadTarget = resolveThreadRouteTarget(
       router.state.matches.at(-1)?.params ?? {},
     );
-    if (!isSidebarUtilityPage(pathname)) mainAppHref = href;
+    if (!isSidebarUtilityPage(pathname) && pathname !== "/bots") mainAppHref = href;
   };
   record();
   return router.subscribe("onResolved", record);
