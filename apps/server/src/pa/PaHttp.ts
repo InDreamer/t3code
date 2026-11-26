@@ -29,8 +29,9 @@ import * as SessionStore from "../auth/SessionStore.ts";
 import { eventStreamResponse } from "../eventStreamResponse.ts";
 import * as ServerHttp from "../http.ts";
 import { requestUrl } from "../requestUrl.ts";
+import { HermesConnectionError, HermesRpcError } from "./HermesGatewayClient.ts";
 import { layerLive as layerPaServiceLive, PaService, type PaServiceShape } from "./PaService.ts";
-import { isValidPaSessionId, parsePaBotId, type PaStreamEvent } from "./types.ts";
+import { isValidPaSessionId, PaRequestError, parsePaBotId, type PaStreamEvent } from "./types.ts";
 
 const PA_PREFIX = "/api/pa";
 
@@ -103,17 +104,110 @@ class PaRouteError extends Schema.TaggedError<PaRouteError, { readonly brand: un
   },
 ) {}
 
+/** Caller mistakes stay 4xx; only a gateway that is down (503) or misbehaving (502) is 5xx. */
+export function paErrorStatus(cause: unknown): number {
+  if (cause instanceof PaRequestError) return cause.status;
+  if (cause instanceof HermesConnectionError) return 503;
+  if (cause instanceof HermesRpcError) {
+    if (/\bnot_found\b/i.test(cause.message)) return 404;
+    if (/\b(invalid_params|invalid_selection)\b/i.test(cause.message)) return 400;
+    if (/\bpermission_denied\b/i.test(cause.message)) return 403;
+  }
+  return 502;
+}
+
 const tryPa = <A>(thunk: () => Promise<A>) =>
   Effect.tryPromise({
     try: thunk,
     catch: (cause) =>
       new PaRouteError({
-        status: 502,
+        status: paErrorStatus(cause),
         message: cause instanceof Error ? cause.message : String(cause),
       }),
   });
 
-const authenticatePaRoute = Effect.fnUntraced(function* (scope: AuthEnvironmentScope) {
+// Hermes slash commands (and aliases, hermes_cli/commands.py) that persist profile configuration,
+// credentials, schedules, skills, or tools. Hermes resolves names exactly, case-insensitively.
+const CONFIG_SLASH_COMMANDS: ReadonlySet<string> = new Set([
+  "export",
+  "import",
+  "config",
+  "model",
+  "codex-runtime",
+  "codex_runtime",
+  "personality",
+  "statusbar",
+  "sb",
+  "battery",
+  "timestamps",
+  "ts",
+  "verbose",
+  "focus",
+  "footer",
+  "yolo",
+  "approvals",
+  "reasoning",
+  "fast",
+  "skin",
+  "indicator",
+  "voice",
+  "wake",
+  "busy",
+  "autoprune",
+  "tools",
+  "toolsets",
+  "skills",
+  "memory",
+  "bundles",
+  "pet",
+  "hatch",
+  "generate-pet",
+  "learn",
+  "init",
+  "cron",
+  "suggestions",
+  "suggest",
+  "blueprint",
+  "bp",
+  "curator",
+  "kanban",
+  "reload",
+  "reload-mcp",
+  "reload_mcp",
+  "reload-skills",
+  "reload_skills",
+  "browser",
+  "plugins",
+  "profile",
+  "sethome",
+  "set-home",
+  "login",
+  "subscription",
+  "upgrade",
+  "topup",
+  "platforms",
+  "gateway",
+  "platform",
+  "update",
+  "restart",
+  "worktree",
+  "rollback",
+  "debug",
+  "mcp",
+  "provider",
+]);
+
+export function slashCommandRequiresProvidersManage(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("/")) return false;
+  const name = trimmed.slice(1).split(/\s/, 1)[0]!.toLowerCase();
+  return CONFIG_SLASH_COMMANDS.has(name);
+}
+
+const authenticatePaRoute = Effect.fnUntraced(function* (
+  scope: AuthEnvironmentScope,
+  ...additionalScopes: ReadonlyArray<AuthEnvironmentScope>
+) {
   const request = yield* HttpServerRequest.HttpServerRequest;
   const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
   const session = yield* serverAuth.authenticateHttpRequest(request).pipe(
@@ -127,8 +221,10 @@ const authenticatePaRoute = Effect.fnUntraced(function* (scope: AuthEnvironmentS
       failEnvironmentInternal("internal_error", error),
     ),
   );
-  if (!session.scopes.includes(scope)) {
-    return yield* failEnvironmentScopeRequired(scope);
+  for (const required of [scope, ...additionalScopes]) {
+    if (!session.scopes.includes(required)) {
+      return yield* failEnvironmentScopeRequired(required);
+    }
   }
   return session;
 });
@@ -144,14 +240,11 @@ const errorResponse = (error: PaRouteError) => jsonResponse({ error: error.messa
 const decodeJsonBody = Effect.fn("decodeJsonBody")(function* <A, I>(schema: Schema.Codec<A, I>) {
   const request = yield* HttpServerRequest.HttpServerRequest;
   const raw = yield* request.json.pipe(
-    Effect.mapError((err) => {
-      const reason =
-        err && typeof err === "object" && "reason" in err ? String(err.reason) : undefined;
-      if (reason === "MaxBodySize") {
-        return new PaRouteError({ status: 413, message: "Request body exceeds maximum size" });
-      }
-      return new PaRouteError({ status: 400, message: "Invalid JSON request body" });
-    }),
+    Effect.mapError((err) =>
+      err.reason._tag === "RequestParseError" && err.reason.reason === "BodyTooLarge"
+        ? new PaRouteError({ status: 413, message: "Request body exceeds maximum size" })
+        : new PaRouteError({ status: 400, message: "Invalid JSON request body" }),
+    ),
   );
   return yield* Schema.decodeUnknownEffect(schema)(raw).pipe(
     Effect.mapError(
@@ -187,7 +280,7 @@ function decodePathSegments(pathname: string): ReadonlyArray<string> | null {
   return decoded;
 }
 
-const makePaRequestHandler = Effect.fn("makePaRequestHandler")(
+export const makePaRequestHandler = Effect.fn("makePaRequestHandler")(
   function* (pa: PaServiceShape) {
     const request = yield* HttpServerRequest.HttpServerRequest;
     const urlOption = requestUrl(request);
@@ -267,9 +360,9 @@ const makePaRequestHandler = Effect.fn("makePaRequestHandler")(
         );
       }
 
-      // POST /api/pa/bots/:botId/cron (manages persistent scheduled execution -> requires providers:manage)
+      // POST /api/pa/bots/:botId/cron: persistent scheduled execution is both config and operation.
       if (method === "POST" && segments.length === 3 && segments[2] === "cron") {
-        yield* authenticatePaRoute(AuthProvidersManageScope);
+        yield* authenticatePaRoute(AuthProvidersManageScope, AuthOrchestrationOperateScope);
         return yield* decodeJsonBody(CronMutationBodySchema).pipe(
           Effect.flatMap((input) =>
             tryPa(() => pa.manageCron(botId, input)).pipe(
@@ -329,13 +422,20 @@ const makePaRequestHandler = Effect.fn("makePaRequestHandler")(
         }
 
         if (method === "POST" && action === "send") {
-          yield* authenticatePaRoute(AuthOrchestrationOperateScope);
-          return yield* decodeJsonBody(SendMessageBodySchema).pipe(
-            Effect.flatMap((body) =>
-              tryPa(() =>
-                pa.sendMessage(botId, sessionId, body.text, { inputId: body.inputId }),
-              ).pipe(Effect.map((result) => jsonResponse(result))),
-            ),
+          const authSession = yield* authenticatePaRoute(AuthOrchestrationOperateScope);
+          return yield* Effect.gen(function* () {
+            const body = yield* decodeJsonBody(SendMessageBodySchema);
+            if (
+              slashCommandRequiresProvidersManage(body.text) &&
+              !authSession.scopes.includes(AuthProvidersManageScope)
+            ) {
+              return yield* failEnvironmentScopeRequired(AuthProvidersManageScope);
+            }
+            const result = yield* tryPa(() =>
+              pa.sendMessage(botId, sessionId, body.text, { inputId: body.inputId }),
+            );
+            return jsonResponse(result);
+          }).pipe(
             Effect.catchTags({
               PaRouteError: (err) => Effect.succeed(errorResponse(err)),
             }),
@@ -384,14 +484,16 @@ const makePaRequestHandler = Effect.fn("makePaRequestHandler")(
                     sinceSeq,
                     replayEpoch,
                     onEvent: (event) => {
-                      Queue.offerUnsafe(queue, event);
+                      // A slow reader must not silently lose frames: end the stream instead, and
+                      // the browser's reconnect replays from its last delivered seq.
+                      if (!Queue.offerUnsafe(queue, event)) {
+                        Queue.endUnsafe(queue);
+                      }
                     },
                     onClose: (reason) => {
-                      Queue.offerUnsafe(queue, {
-                        type: "error",
-                        sessionId,
-                        message: reason ?? "Upstream PA stream disconnected",
-                      });
+                      if (reason !== undefined) {
+                        Queue.offerUnsafe(queue, { type: "error", sessionId, message: reason });
+                      }
                       Queue.endUnsafe(queue);
                     },
                   }),
@@ -410,7 +512,7 @@ const makePaRequestHandler = Effect.fn("makePaRequestHandler")(
                 ),
                 (unsubscribe) => Effect.sync(() => unsubscribe()),
               ),
-            { bufferSize: 256, strategy: "sliding" },
+            { bufferSize: 1024, strategy: "dropping" },
           );
 
           // Close SSE immediately if the authenticated T3 session/device is revoked.

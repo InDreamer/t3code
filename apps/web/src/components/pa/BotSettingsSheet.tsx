@@ -134,8 +134,10 @@ function BotSettingsBody({
   const handleSave = async (confirmExpensiveModel = false) => {
     if (!detail) return;
 
-    const initialProvider =
+    // Hermes pins a model only together with a provider, so "跟随默认" means the current provider.
+    const currentProvider =
       detail.provider ?? detail.modelOptions.find((p) => p.isCurrent)?.slug ?? "";
+    const initialProvider = currentProvider;
     const initialModel = detail.model ?? "";
     const initialDisabledSkills = new Set(
       detail.skills.filter((s) => !s.enabled).map((s) => s.name),
@@ -146,7 +148,7 @@ function BotSettingsBody({
 
     const nextName = name.trim() || detail.profile;
     const nextModel = model.trim();
-    const nextProvider = provider.trim();
+    const nextProvider = provider.trim() || currentProvider;
     const modelChanged = nextModel !== initialModel || nextProvider !== initialProvider;
     const skillsChanged =
       detail.skills.length > 0 && !setsEqual(disabledSkills, initialDisabledSkills);
@@ -171,6 +173,15 @@ function BotSettingsBody({
       setSavedNotice(gt("没有需要保存的修改"));
       return;
     }
+    if (modelChanged && nextModel && !nextProvider) {
+      setError(gt("请先选择模型服务商"));
+      return;
+    }
+    // Hermes treats an empty toolset list as "clear the pin", silently re-enabling every default.
+    if (toolsetsChanged && enabledToolsets.size === 0) {
+      setError(gt("至少需要启用一个工具集"));
+      return;
+    }
 
     setSaving(true);
     setError(null);
@@ -179,6 +190,13 @@ function BotSettingsBody({
     try {
       const updated = await paApi.updateBot(botId, patch);
       if (updated.confirmRequired) {
+        // Every other section already saved; keep the unconfirmed model pick for the resend.
+        const pendingModel = model;
+        const pendingProvider = provider;
+        hydrateFromDetail(updated);
+        setModel(pendingModel);
+        setProvider(pendingProvider);
+        onSaved(updated);
         setConfirmMessage(updated.confirmRequired.message);
         return;
       }

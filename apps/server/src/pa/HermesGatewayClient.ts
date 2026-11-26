@@ -37,6 +37,26 @@ export interface HermesServerRequestFrame {
   readonly params?: Record<string, unknown> | undefined;
 }
 
+/** A JSON-RPC error answered by the Hermes gateway (as opposed to a transport failure). */
+// @effect-diagnostics-next-line extendsNativeError:off -- rejected from plain Promises, mapped to HTTP status in PaHttp.
+export class HermesRpcError extends Error {
+  readonly code: number | string | undefined;
+  constructor(message: string, code: number | string | undefined) {
+    super(message);
+    this.name = "HermesRpcError";
+    this.code = code;
+  }
+}
+
+/** The gateway could not be reached or the socket dropped. */
+// @effect-diagnostics-next-line extendsNativeError:off -- rejected from plain Promises, mapped to HTTP 503 in PaHttp.
+export class HermesConnectionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "HermesConnectionError";
+  }
+}
+
 export interface HermesSocketLike {
   readonly readyState: number;
   send(data: string): void;
@@ -55,8 +75,11 @@ export interface HermesRpcConnection {
   respondServerRequest(requestId: string, result: Record<string, unknown>): void;
   rejectServerRequest(requestId: string, code: number, message: string): void;
   onEvent(listener: (frame: HermesRpcEventFrame) => void): () => void;
-  /** Listener returns true if it claimed ownership of the request; unclaimed requests receive JSON-RPC -32601. */
-  onServerRequest(listener: (frame: HermesServerRequestFrame) => boolean): () => void;
+  /**
+   * Hermes settles a server request with the FIRST response from any attached viewer (TUI, desktop,
+   * other PA tabs), so unclaimed requests are never answered here.
+   */
+  onServerRequest(listener: (frame: HermesServerRequestFrame) => void): () => void;
   onClose(listener: () => void): () => void;
   isOpen(): boolean;
   close(): void;
@@ -198,14 +221,16 @@ export function decodeWebSocketMessageData(data: unknown): string {
   return "";
 }
 
+export function hermesAttachArgs(profile: string): ReadonlyArray<string> {
+  // Always pass `-p`: without it the CLI follows HERMES_HOME / the sticky `active_profile`.
+  return ["-p", profile, "gateway", "attach", "--json"];
+}
+
 async function defaultHermesAttach(profile: string): Promise<HermesAttachResult> {
   if (!isValidPaProfile(profile)) {
     throw new Error(`Invalid Hermes profile name "${profile}"`);
   }
-  const args =
-    profile === "default"
-      ? ["gateway", "attach", "--json"]
-      : ["-p", profile, "gateway", "attach", "--json"];
+  const args = [...hermesAttachArgs(profile)];
   const { stdout } = await execFileAsync("hermes", args, {
     timeout: ATTACH_TIMEOUT_MS,
     maxBuffer: 2 * 1024 * 1024,
@@ -235,7 +260,7 @@ export class LiveHermesRpcConnection implements HermesRpcConnection {
     }
   >();
   private readonly eventListeners = new Set<(frame: HermesRpcEventFrame) => void>();
-  private readonly requestListeners = new Set<(frame: HermesServerRequestFrame) => boolean>();
+  private readonly requestListeners = new Set<(frame: HermesServerRequestFrame) => void>();
   private readonly closeListeners = new Set<() => void>();
   private readonly pingTimer: ReturnType<typeof setInterval> | null;
   private nextId = 1;
@@ -245,19 +270,14 @@ export class LiveHermesRpcConnection implements HermesRpcConnection {
     this.profile = profile;
     this.ws = ws;
     ws.addEventListener("message", (event) => {
-      const raw = decodeWebSocketMessageData(event.data);
-      if (!raw) return;
-      for (const line of raw.split("\n")) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        let parsed: Record<string, unknown>;
-        try {
-          parsed = JSON.parse(trimmed) as Record<string, unknown>;
-        } catch {
-          continue;
-        }
-        this.handleParsedObject(parsed);
+      if (typeof Blob !== "undefined" && event.data instanceof Blob) {
+        void event.data.text().then(
+          (text) => this.handleRaw(text),
+          () => undefined,
+        );
+        return;
       }
+      this.handleRaw(decodeWebSocketMessageData(event.data));
     });
 
     const handleDrop = () => {
@@ -270,7 +290,7 @@ export class LiveHermesRpcConnection implements HermesRpcConnection {
       // @effect-diagnostics globalTimers:off
       this.pingTimer = setInterval(() => {
         if (!this.isOpen()) return;
-        void this.call("ping", {}, 5_000).catch(() => {
+        void this.call("gateway.ping", {}, 5_000).catch(() => {
           this.close();
         });
       }, PING_INTERVAL_MS);
@@ -288,11 +308,29 @@ export class LiveHermesRpcConnection implements HermesRpcConnection {
     }
     for (const [id, entry] of this.pending) {
       clearTimeout(entry.timer);
-      entry.reject(new Error(`Hermes gateway connection closed while awaiting ${id}`));
+      entry.reject(
+        new HermesConnectionError(`Hermes gateway connection closed while awaiting ${id}`),
+      );
     }
     this.pending.clear();
     for (const listener of this.closeListeners) {
-      listener();
+      notifySafely(listener, undefined);
+    }
+  }
+
+  private handleRaw(raw: string): void {
+    if (!raw) return;
+    for (const line of raw.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(trimmed);
+      } catch {
+        continue;
+      }
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+      this.handleParsedObject(parsed as Record<string, unknown>);
     }
   }
 
@@ -309,7 +347,13 @@ export class LiveHermesRpcConnection implements HermesRpcConnection {
           typeof decoded.error.message === "string"
             ? decoded.error.message
             : `Hermes RPC error (${String(decoded.error.code ?? "unknown")})`;
-        entry.reject(new Error(message));
+        const code = decoded.error.code;
+        entry.reject(
+          new HermesRpcError(
+            message,
+            typeof code === "number" || typeof code === "string" ? code : undefined,
+          ),
+        );
       } else {
         entry.resolve(decoded.result);
       }
@@ -318,25 +362,14 @@ export class LiveHermesRpcConnection implements HermesRpcConnection {
 
     if (decoded.kind === "event") {
       for (const listener of this.eventListeners) {
-        listener(decoded.frame);
+        notifySafely(listener, decoded.frame);
       }
       return;
     }
 
     if (decoded.kind === "server_request") {
-      let claimed = false;
       for (const listener of this.requestListeners) {
-        if (listener(decoded.frame)) {
-          claimed = true;
-        }
-      }
-      // Never leave Hermes blocked waiting until deadline on unhandled server→client requests.
-      if (!claimed) {
-        this.rejectServerRequest(
-          decoded.frame.request_id,
-          -32601,
-          `Unhandled server request method "${decoded.frame.method}"`,
-        );
+        notifySafely(listener, decoded.frame);
       }
     }
   }
@@ -351,27 +384,39 @@ export class LiveHermesRpcConnection implements HermesRpcConnection {
     timeoutMs = DEFAULT_RPC_TIMEOUT_MS,
   ): Promise<T> {
     if (!this.isOpen()) {
-      return Promise.reject(new Error(`Hermes gateway socket for "${this.profile}" is not open`));
+      return Promise.reject(
+        new HermesConnectionError(`Hermes gateway socket for "${this.profile}" is not open`),
+      );
     }
     const id = `pa-${this.nextId++}`;
     return new Promise<T>((resolve, reject) => {
       // @effect-diagnostics globalTimers:off
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error(`Hermes RPC "${method}" timed out after ${timeoutMs}ms`));
+        reject(new HermesConnectionError(`Hermes RPC "${method}" timed out after ${timeoutMs}ms`));
       }, timeoutMs);
       this.pending.set(id, {
         resolve: (value) => resolve(value as T),
         reject,
         timer,
       });
-      this.ws.send(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+      try {
+        this.ws.send(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+      } catch (err) {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(
+          new HermesConnectionError(
+            `Failed to send Hermes RPC "${method}": ${err instanceof Error ? err.message : String(err)}`,
+          ),
+        );
+      }
     });
   }
 
   respondServerRequest(requestId: string, result: Record<string, unknown>): void {
     if (!this.isOpen()) {
-      throw new Error(`Hermes gateway socket for "${this.profile}" is closed`);
+      throw new HermesConnectionError(`Hermes gateway socket for "${this.profile}" is closed`);
     }
     this.ws.send(`${JSON.stringify({ jsonrpc: "2.0", id: requestId, result })}\n`);
   }
@@ -390,7 +435,7 @@ export class LiveHermesRpcConnection implements HermesRpcConnection {
     };
   }
 
-  onServerRequest(listener: (frame: HermesServerRequestFrame) => boolean): () => void {
+  onServerRequest(listener: (frame: HermesServerRequestFrame) => void): () => void {
     this.requestListeners.add(listener);
     return () => {
       this.requestListeners.delete(listener);
@@ -411,6 +456,14 @@ export class LiveHermesRpcConnection implements HermesRpcConnection {
     } catch {
       // Ignore close errors.
     }
+  }
+}
+
+function notifySafely<A>(listener: (value: A) => void, value: A): void {
+  try {
+    listener(value);
+  } catch {
+    // One failing subscriber must not starve the others sharing this profile socket.
   }
 }
 
@@ -440,8 +493,13 @@ export class HermesConnectionPool {
 
   private connect(profile: string): Promise<HermesRpcConnection> {
     const promise = (async () => {
-      const attach = await this.attachFn(profile);
+      const attach = await this.attachFn(profile).catch((err: unknown) => {
+        throw new HermesConnectionError(
+          `Hermes gateway attach failed for "${profile}": ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
       const ws = new WebSocket(attach.url, [...attach.protocols]);
+      ws.binaryType = "arraybuffer";
       await new Promise<void>((resolve, reject) => {
         const onOpen = () => {
           clearTimeout(timer);
@@ -451,7 +509,9 @@ export class HermesConnectionPool {
         const onError = () => {
           clearTimeout(timer);
           ws.removeEventListener("open", onOpen);
-          reject(new Error(`Failed to open Hermes gateway WebSocket for "${profile}"`));
+          reject(
+            new HermesConnectionError(`Failed to open Hermes gateway WebSocket for "${profile}"`),
+          );
         };
         // @effect-diagnostics globalTimers:off
         const timer = setTimeout(() => {
@@ -462,7 +522,9 @@ export class HermesConnectionPool {
           } catch {
             // Ignore close errors on timeout.
           }
-          reject(new Error(`Timed out connecting to Hermes gateway for "${profile}"`));
+          reject(
+            new HermesConnectionError(`Timed out connecting to Hermes gateway for "${profile}"`),
+          );
         }, 8_000);
         ws.addEventListener("open", onOpen, { once: true });
         ws.addEventListener("error", onError, { once: true });
@@ -487,11 +549,14 @@ export class HermesConnectionPool {
     })();
 
     this.connections.set(profile, promise);
-    promise.finally(() => {
+    // `.finally()` would return a second promise that re-rejects with nobody listening, crashing Node
+    // with an unhandledRejection whenever attach fails. `.then(f, f)` always settles fulfilled.
+    const forget = () => {
       if (this.connections.get(profile) === promise) {
         this.connections.delete(profile);
       }
-    });
+    };
+    void promise.then(forget, forget);
     return promise;
   }
 

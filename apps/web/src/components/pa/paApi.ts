@@ -42,6 +42,24 @@ async function buildAuthInit(extraHeaders?: Record<string, string>): Promise<{
   return { headers, credentials: "omit" };
 }
 
+// @effect-diagnostics-next-line extendsNativeError:off -- rejected from fetch Promises; callers branch on `status`.
+class PaHttpError extends Error {
+  readonly status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "PaHttpError";
+    this.status = status;
+  }
+}
+
+/** Auth or routing failures that a retry cannot fix. */
+export function isTerminalPaError(error: unknown): boolean {
+  return (
+    error instanceof PaHttpError &&
+    (error.status === 401 || error.status === 403 || error.status === 404)
+  );
+}
+
 async function requestJson<T>(
   path: string,
   options?: {
@@ -66,12 +84,22 @@ async function requestJson<T>(
   });
   const payload = (await response.json().catch(() => ({}))) as { error?: string } & T;
   if (!response.ok) {
-    throw new Error(payload.error || `Request failed (${response.status})`);
+    throw new PaHttpError(response.status, payload.error || `Request failed (${response.status})`);
   }
   return payload;
 }
 
 const enc = (value: string) => encodeURIComponent(value);
+
+// StrictMode mounts twice; without sharing the in-flight create each mount mints its own session.
+const primarySessionCreates = new Map<string, Promise<PaSessionSummary>>();
+
+function createSessionRequest(botId: string, setPrimary: boolean) {
+  return requestJson<{ readonly session: PaSessionSummary }>(`/bots/${enc(botId)}/sessions`, {
+    method: "POST",
+    body: { setPrimary },
+  }).then((res) => res.session);
+}
 
 export const paApi = {
   listBots(signal?: AbortSignal) {
@@ -101,6 +129,13 @@ export const paApi = {
     }).then((res) => res.bot);
   },
 
+  markRead(botId: string) {
+    return requestJson<unknown>(`/bots/${enc(botId)}/update`, {
+      method: "POST",
+      body: { markRead: true },
+    }).then(() => undefined);
+  },
+
   manageCron(botId: string, input: PaCronMutationInput) {
     return requestJson<{ readonly cronJobs: ReadonlyArray<PaCronJob> }>(
       `/bots/${enc(botId)}/cron`,
@@ -126,10 +161,20 @@ export const paApi = {
   },
 
   createSession(botId: string, setPrimary = true) {
-    return requestJson<{ readonly session: PaSessionSummary }>(`/bots/${enc(botId)}/sessions`, {
-      method: "POST",
-      body: { setPrimary },
-    }).then((res) => res.session);
+    return createSessionRequest(botId, setPrimary);
+  },
+
+  /** Creates the Bot's primary session once, however many mounts ask concurrently. */
+  ensurePrimarySession(botId: string) {
+    const inFlight = primarySessionCreates.get(botId);
+    if (inFlight) return inFlight;
+    const created = createSessionRequest(botId, true);
+    primarySessionCreates.set(botId, created);
+    const forget = () => {
+      if (primarySessionCreates.get(botId) === created) primarySessionCreates.delete(botId);
+    };
+    void created.then(forget, forget);
+    return created;
   },
 
   getMessages(botId: string, sessionId: string, signal?: AbortSignal, limit?: number) {
@@ -202,7 +247,7 @@ export const paApi = {
           signal: controller.signal,
         });
         if (!response.ok || !response.body) {
-          throw new Error(`Event stream failed (${response.status})`);
+          throw new PaHttpError(response.status, `Event stream failed (${response.status})`);
         }
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
@@ -211,7 +256,11 @@ export const paApi = {
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
-          buffer += decoder.decode(value, { stream: true });
+          // SSE allows CRLF/CR line endings; a CR ending this chunk waits for a possible LF.
+          buffer = (buffer + decoder.decode(value, { stream: true })).replace(
+            /\r\n|\r(?!$)/g,
+            "\n",
+          );
           let sepIndex = buffer.indexOf("\n\n");
           while (sepIndex !== -1) {
             const rawChunk = buffer.slice(0, sepIndex);

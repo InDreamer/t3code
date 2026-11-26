@@ -53,6 +53,60 @@ export function defaultVisualForBot(
   return { avatarColor: picked.color, avatarShape: picked.shape };
 }
 
+const AVATAR_SHAPES: ReadonlySet<string> = new Set([
+  "blob",
+  "pumpkin",
+  "cloud",
+  "drop",
+  "pill",
+  "circle",
+]);
+
+function sanitizeBotMeta(raw: unknown): { meta: PaBotLocalMeta; clean: boolean } | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const record = raw as Record<string, unknown>;
+  const meta: Record<string, unknown> = {};
+  let clean = true;
+  const keep = (key: keyof PaBotLocalMeta, valid: (value: unknown) => boolean) => {
+    if (!(key in record) || record[key] === undefined) return;
+    if (valid(record[key])) meta[key] = record[key];
+    else clean = false;
+  };
+  const isString = (value: unknown) => typeof value === "string";
+  keep("displayName", isString);
+  keep("avatarColor", isString);
+  keep("avatarShape", (value) => typeof value === "string" && AVATAR_SHAPES.has(value));
+  keep("pinned", (value) => typeof value === "boolean");
+  keep("primarySessionId", isString);
+  keep("lastReadAt", (value) => typeof value === "number" && Number.isFinite(value));
+  return { meta: meta as PaBotLocalMeta, clean };
+}
+
+function sanitizeStoreData(parsed: unknown): {
+  readonly bots: Record<string, PaBotLocalMeta>;
+  readonly clean: boolean;
+} {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { bots: {}, clean: false };
+  }
+  const rawBots = (parsed as { bots?: unknown }).bots;
+  if (!rawBots || typeof rawBots !== "object" || Array.isArray(rawBots)) {
+    return { bots: {}, clean: false };
+  }
+  const bots: Record<string, PaBotLocalMeta> = {};
+  let clean = true;
+  for (const [botId, value] of Object.entries(rawBots)) {
+    const entry = sanitizeBotMeta(value);
+    if (!entry) {
+      clean = false;
+      continue;
+    }
+    if (!entry.clean) clean = false;
+    bots[botId] = entry.meta;
+  }
+  return { bots, clean };
+}
+
 export class PaStore {
   private readonly filePath: string;
   private cache: PaStoreData | null = null;
@@ -75,23 +129,23 @@ export class PaStore {
       throw err;
     }
 
+    let parsed: unknown;
     try {
-      const parsed = JSON.parse(raw) as Partial<PaStoreData>;
-      if (parsed && typeof parsed === "object" && parsed.bots && typeof parsed.bots === "object") {
-        this.cache = { version: 1, bots: { ...parsed.bots } };
-        return this.cache;
-      }
+      parsed = JSON.parse(raw);
     } catch {
-      // Back up corrupt metadata rather than silently wiping it on next write.
+      parsed = undefined;
+    }
+    const sanitized = sanitizeStoreData(parsed);
+    if (!sanitized.clean) {
+      // Back up corrupt metadata rather than silently wiping it on the next write.
       try {
         // @effect-diagnostics globalDate:off
-        const backupPath = `${this.filePath}.corrupt-${Date.now()}.bak`;
-        NodeFS.copyFileSync(this.filePath, backupPath);
+        NodeFS.copyFileSync(this.filePath, `${this.filePath}.corrupt-${Date.now()}.bak`);
       } catch {
         // Best-effort backup.
       }
     }
-    this.cache = { version: 1, bots: {} };
+    this.cache = { version: 1, bots: sanitized.bots };
     return this.cache;
   }
 

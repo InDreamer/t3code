@@ -22,14 +22,16 @@ import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
 import { BotAvatar } from "./BotAvatar";
-import { paApi } from "./paApi";
-import type {
-  PaBotSummary,
-  PaMessage,
-  PaPendingRequest,
-  PaSessionSummary,
-  PaSlashCommand,
-  PaStreamEvent,
+import { isTerminalPaError, paApi } from "./paApi";
+import {
+  acceptPaSeq,
+  type PaBotSummary,
+  type PaMessage,
+  type PaPendingRequest,
+  type PaSeqCursor,
+  type PaSessionSummary,
+  type PaSlashCommand,
+  type PaStreamEvent,
 } from "./paTypes";
 
 function formatMessageTime(ts: number | null): string {
@@ -91,10 +93,29 @@ function splitMarkdownBlocks(text: string): ReadonlyArray<MarkdownBlock> {
   return parts;
 }
 
-const TRAILING_URL_PUNCTUATION = /[.,;:!?)。，；：！？、》】]+$/;
-const INLINE_TOKEN_RE =
-  /(`[^`]+`|\*\*[^*]+\*\*|\[[^\]\n]+\]\(https?:\/\/[^\s)]+\)|https?:\/\/[^\s<]+)/g;
-const MARKDOWN_LINK_RE = /^\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)$/;
+const TRAILING_URL_PUNCTUATION = ".,;:!?)。，；：！？、》】";
+// One level of balanced parentheses inside a link target, e.g. wiki/Function_(mathematics).
+const LINK_TARGET = String.raw`https?:\/\/(?:[^\s()]|\([^\s()]*\))+`;
+const INLINE_TOKEN_RE = new RegExp(
+  String.raw`(\`[^\`]+\`|\*\*[^*]+\*\*|\[[^\]\n]+\]\(${LINK_TARGET}\)|https?:\/\/[^\s<]+)`,
+  "g",
+);
+const MARKDOWN_LINK_RE = new RegExp(String.raw`^\[([^\]\n]+)\]\((${LINK_TARGET})\)$`);
+
+/** Splits sentence punctuation off a bare URL, keeping a ")" that closes a "(" in the URL. */
+function splitTrailingPunctuation(url: string): readonly [string, string] {
+  let end = url.length;
+  while (end > 0 && TRAILING_URL_PUNCTUATION.includes(url[end - 1]!)) {
+    if (url[end - 1] === ")") {
+      const body = url.slice(0, end);
+      const opens = body.split("(").length - 1;
+      const closes = body.split(")").length - 1;
+      if (opens >= closes) break;
+    }
+    end -= 1;
+  }
+  return [url.slice(0, end), url.slice(end)];
+}
 
 function PaMarkdownText({ text }: { readonly text: string }) {
   const blocks = splitMarkdownBlocks(text);
@@ -138,9 +159,7 @@ function PaMarkdownText({ text }: { readonly text: string }) {
         );
       }
       if (/^https?:\/\//.test(token)) {
-        const trailingMatch = TRAILING_URL_PUNCTUATION.exec(token);
-        const cleanUrl = trailingMatch ? token.slice(0, trailingMatch.index) : token;
-        const trailing = trailingMatch ? trailingMatch[0] : "";
+        const [cleanUrl, trailing] = splitTrailingPunctuation(token);
         return (
           <span key={key}>
             <a
@@ -183,6 +202,35 @@ function PaMarkdownText({ text }: { readonly text: string }) {
 }
 
 const QUICK_COMMANDS = ["/status", "/skills", "/model"] as const;
+const RECONNECT_BASE_MS = 1_500;
+const RECONNECT_MAX_MS = 30_000;
+
+/** Server rows can lack timestamps; they inherit the previous row's so local bubbles interleave stably. */
+function mergeByTime(
+  serverMessages: ReadonlyArray<PaMessage>,
+  localMessages: ReadonlyArray<PaMessage>,
+): ReadonlyArray<PaMessage> {
+  if (localMessages.length === 0) return serverMessages;
+  let carried = 0;
+  const keyed = serverMessages.map((message) => {
+    carried = message.timestamp ?? carried;
+    return { message, key: carried };
+  });
+  for (const message of localMessages) {
+    keyed.push({ message, key: message.timestamp ?? Number.MAX_SAFE_INTEGER });
+  }
+  return keyed.sort((a, b) => a.key - b.key).map((entry) => entry.message);
+}
+
+function clarifySelection(raw: string | undefined): ReadonlyArray<string> {
+  if (!raw) return [];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.map(String) : [];
+  } catch {
+    return [];
+  }
+}
 let localMessageSeq = 0;
 
 function createLocalMessage(role: PaMessage["role"], text: string): PaMessage {
@@ -213,6 +261,12 @@ function normalizeApprovalDecision(id: string): "once" | "session" | "always" | 
   if (lower === "always") return "always";
   if (lower === "session") return "session";
   return "once";
+}
+
+interface StreamTool {
+  readonly key: string;
+  readonly name: string;
+  readonly status: string;
 }
 
 interface DeltaCursor {
@@ -258,7 +312,7 @@ export function BotChatPane({
     readonly running: boolean;
     readonly text: string;
     readonly reasoning: string;
-    readonly tools: ReadonlyArray<{ readonly name: string; readonly status: string }>;
+    readonly tools: ReadonlyArray<StreamTool>;
     readonly openRequests: ReadonlyArray<PaPendingRequest>;
     readonly error: string | null;
   }>({
@@ -271,6 +325,8 @@ export function BotChatPane({
     error: null,
   });
 
+  const activeSessionIdRef = useRef<string | null>(activeSessionId);
+
   const messages = messagesState.sessionId === activeSessionId ? messagesState.items : [];
   const loadingMessages = activeSessionId !== null && loadingMessagesFor === activeSessionId;
   const isCurrentStream = streamState.sessionId === activeSessionId;
@@ -281,12 +337,14 @@ export function BotChatPane({
   const openRequests = isCurrentStream ? streamState.openRequests : [];
   const streamError = isCurrentStream ? streamState.error : null;
 
+  // Async work for a session the user already left must never overwrite the visible one.
   const setSessionMessages = (
     sessionId: string,
     updater:
       | ReadonlyArray<PaMessage>
       | ((prev: ReadonlyArray<PaMessage>) => ReadonlyArray<PaMessage>),
   ) => {
+    if (activeSessionIdRef.current !== sessionId) return;
     setMessagesState((prev) => {
       const current = prev.sessionId === sessionId ? prev.items : [];
       const nextItems = typeof updater === "function" ? updater(current) : updater;
@@ -301,18 +359,19 @@ export function BotChatPane({
         readonly running: boolean;
         readonly text: string;
         readonly reasoning: string;
-        readonly tools: ReadonlyArray<{ readonly name: string; readonly status: string }>;
+        readonly tools: ReadonlyArray<StreamTool>;
         readonly openRequests: ReadonlyArray<PaPendingRequest>;
         readonly error: string | null;
       }) => Partial<{
         readonly running: boolean;
         readonly text: string;
         readonly reasoning: string;
-        readonly tools: ReadonlyArray<{ readonly name: string; readonly status: string }>;
+        readonly tools: ReadonlyArray<StreamTool>;
         readonly openRequests: ReadonlyArray<PaPendingRequest>;
         readonly error: string | null;
       }>,
     ) => {
+      if (activeSessionIdRef.current !== sessionId) return;
       setStreamState((prev) => {
         const base =
           prev.sessionId === sessionId
@@ -322,7 +381,7 @@ export function BotChatPane({
                 running: false,
                 text: "",
                 reasoning: "",
-                tools: [] as ReadonlyArray<{ readonly name: string; readonly status: string }>,
+                tools: [] as ReadonlyArray<StreamTool>,
                 openRequests: [] as ReadonlyArray<PaPendingRequest>,
                 error: null as string | null,
               };
@@ -337,11 +396,12 @@ export function BotChatPane({
 
   const [clarifyInputs, setClarifyInputs] = useState<Record<string, string>>({});
   const [clarifyAnswers, setClarifyAnswers] = useState<Record<string, Record<string, string>>>({});
+  const [respondingIds, setRespondingIds] = useState<ReadonlySet<string>>(() => new Set());
 
-  const lastSeqRef = useRef<number>(0);
-  const replayEpochRef = useRef<string | undefined>(undefined);
+  const seqCursorRef = useRef<PaSeqCursor>({ epoch: undefined, lastSeq: 0 });
+  // Bumped on every message.complete so a late send ack cannot flip a finished turn back to running.
+  const completedTurnsRef = useRef(0);
   const deltaCursorRef = useRef<DeltaCursor>({ turnId: null, segment: 0, offset: 0 });
-  const activeSessionIdRef = useRef<string | null>(activeSessionId);
   const transcriptRequestRef = useRef<{ id: number; controller: AbortController | null }>({
     id: 0,
     controller: null,
@@ -440,7 +500,7 @@ export function BotChatPane({
             : sessionRes.primarySessionId;
 
         if (!targetId) {
-          const created = await paApi.createSession(bot.id, true);
+          const created = await paApi.ensurePrimarySession(bot.id);
           if (controller.signal.aborted) return;
           targetId = created.sessionId;
           setSessions((prev) => [created, ...prev]);
@@ -453,7 +513,7 @@ export function BotChatPane({
         }
         if (stableBotUnread()) {
           void paApi
-            .updateBot(bot.id, { markRead: true })
+            .markRead(bot.id)
             .then(() => stableOnActivity())
             .catch(() => undefined);
         }
@@ -485,8 +545,7 @@ export function BotChatPane({
     activeSessionIdRef.current = activeSessionId;
     if (!activeSessionId) return;
 
-    lastSeqRef.current = 0;
-    replayEpochRef.current = undefined;
+    seqCursorRef.current = { epoch: undefined, lastSeq: 0 };
     deltaCursorRef.current = { turnId: null, segment: 0, offset: 0 };
     isNearBottomRef.current = true;
 
@@ -505,6 +564,7 @@ export function BotChatPane({
     let wakeDebounceTimer: ReturnType<typeof setTimeout> | null = null;
     let unsubscribeCurrent: (() => void) | null = null;
     let closed = false;
+    let reconnectAttempts = 0;
 
     const appendLocalMessage = (msg: PaMessage) => {
       setLocalBySession((prev) => ({
@@ -517,9 +577,11 @@ export function BotChatPane({
       if (closed || activeSessionIdRef.current !== sessionId) return;
 
       if (event.type === "snapshot") {
-        replayEpochRef.current = event.replayEpoch;
+        reconnectAttempts = 0;
+        // The server reports the baseline its replay starts from (our own cursor on a replay), so
+        // adopt it as-is: advancing past it would drop every replayed frame.
+        seqCursorRef.current = { epoch: event.replayEpoch, lastSeq: event.lastSeq };
         if (event.snapshotRequired) {
-          lastSeqRef.current = event.lastSeq;
           deltaCursorRef.current = { turnId: null, segment: 0, offset: 0 };
           patchStream(sessionId, () => ({
             running: event.running,
@@ -527,25 +589,21 @@ export function BotChatPane({
             reasoning: "",
             tools: [],
             openRequests: event.openRequests,
+            error: null,
           }));
           void loadTranscript(sessionId, false);
         } else {
-          if (event.lastSeq > lastSeqRef.current) {
-            lastSeqRef.current = event.lastSeq;
-          }
           patchStream(sessionId, () => ({
             running: event.running,
             openRequests: event.openRequests,
+            error: null,
           }));
         }
         return;
       }
 
-      if ("seq" in event && typeof event.seq === "number" && event.seq > 0) {
-        if (event.seq <= lastSeqRef.current) {
-          return;
-        }
-        lastSeqRef.current = event.seq;
+      if ("seq" in event && !acceptPaSeq(seqCursorRef.current, event.seq, event.replayEpoch)) {
+        return;
       }
 
       switch (event.type) {
@@ -627,15 +685,19 @@ export function BotChatPane({
         case "reasoning.delta":
           patchStream(sessionId, (prev) => ({ reasoning: prev.reasoning + event.text }));
           break;
-        case "tool.progress":
+        case "tool.progress": {
+          // Concurrent calls of one tool share a name; only the call id tells them apart.
+          const key = event.toolId ?? event.toolName;
           patchStream(sessionId, (prev) => ({
             tools: [
-              ...prev.tools.filter((item) => item.name !== event.toolName),
-              { name: event.toolName, status: event.status },
+              ...prev.tools.filter((item) => item.key !== key),
+              { key, name: event.toolName, status: event.status },
             ],
           }));
           break;
+        }
         case "message.complete":
+          completedTurnsRef.current += 1;
           deltaCursorRef.current = { turnId: null, segment: 0, offset: 0 };
           patchStream(sessionId, (prev) => ({
             running: false,
@@ -646,7 +708,7 @@ export function BotChatPane({
           }));
           void loadTranscript(sessionId, false);
           void paApi
-            .updateBot(bot.id, { markRead: true })
+            .markRead(bot.id)
             .catch(() => undefined)
             .finally(() => stableOnActivity());
           break;
@@ -681,17 +743,26 @@ export function BotChatPane({
         reconnectTimer = null;
       }
       unsubscribeCurrent?.();
+      const cursor = seqCursorRef.current;
       unsubscribeCurrent = paApi.subscribeSessionEvents(bot.id, sessionId, {
-        sinceSeq: lastSeqRef.current > 0 ? lastSeqRef.current : undefined,
-        replayEpoch: replayEpochRef.current,
+        sinceSeq: cursor.lastSeq > 0 ? cursor.lastSeq : undefined,
+        replayEpoch: cursor.epoch,
         onEvent: handleEvent,
-        onDisconnect: () => {
+        onDisconnect: (error) => {
           if (closed) return;
           if (reconnectTimer) clearTimeout(reconnectTimer);
+          if (isTerminalPaError(error)) {
+            patchStream(sessionId, () => ({ running: false, error: error?.message ?? null }));
+            return;
+          }
+          // A hidden tab reconnects from the visibility handler instead of polling in the background.
+          if (document.visibilityState === "hidden") return;
+          const delay = Math.min(RECONNECT_BASE_MS * 2 ** reconnectAttempts, RECONNECT_MAX_MS);
+          reconnectAttempts += 1;
           reconnectTimer = setTimeout(() => {
             reconnectTimer = null;
             connect();
-          }, 1_500);
+          }, delay);
         },
       });
     };
@@ -704,6 +775,7 @@ export function BotChatPane({
       wakeDebounceTimer = setTimeout(() => {
         wakeDebounceTimer = null;
         if (closed || activeSessionIdRef.current !== sessionId) return;
+        reconnectAttempts = 0;
         void loadTranscript(sessionId, false);
         connect();
       }, 250);
@@ -722,10 +794,7 @@ export function BotChatPane({
   }, [bot.id, activeSessionId, loadTranscript, patchStream, stableOnActivity]);
 
   const localMessages = activeSessionId ? (localBySession[activeSessionId] ?? []) : [];
-  const mergedMessages =
-    localMessages.length === 0
-      ? messages
-      : [...messages, ...localMessages].sort((a, b) => (a.timestamp ?? 0) - (b.timestamp ?? 0));
+  const mergedMessages = mergeByTime(messages, localMessages);
 
   const scrollTargetCount = mergedMessages.length + streamText.length + openRequests.length;
   const isStreaming = running || streamText.length > 0;
@@ -805,6 +874,7 @@ export function BotChatPane({
 
     const optimisticMsg = createLocalMessage("user", text);
     setSessionMessages(sessionId, (prev) => [...prev, optimisticMsg]);
+    const completedBeforeSend = completedTurnsRef.current;
 
     try {
       const res = await paApi.sendMessage(bot.id, sessionId, text, inputId);
@@ -821,14 +891,14 @@ export function BotChatPane({
           [sessionId]: [...(prev[sessionId] ?? []), optimisticMsg, outputMsg],
         }));
         onActivity();
-      } else {
+      } else if (completedTurnsRef.current === completedBeforeSend) {
         patchStream(sessionId, () => ({ running: true }));
       }
     } catch (err) {
       // Roll back the failed optimistic bubble and preserve inputId for idempotent retry.
       failedSendRef.current = { text, inputId };
       setSessionMessages(sessionId, (prev) => prev.filter((m) => m.id !== optimisticMsg.id));
-      if (rawOverride === undefined) {
+      if (rawOverride === undefined && activeSessionIdRef.current === sessionId) {
         setDraft((current) => (current ? current : text));
       }
       patchStream(sessionId, () => ({
@@ -856,7 +926,7 @@ export function BotChatPane({
     req: PaPendingRequest,
     decision?: "once" | "session" | "always" | "deny",
   ) => {
-    if (!activeSessionId) return;
+    if (!activeSessionId || respondingIds.has(req.requestId)) return;
     const sessionId = activeSessionId;
     const perQuestion = clarifyAnswers[req.requestId];
     const hasQuestions = (req.questions?.length ?? 0) > 0;
@@ -866,6 +936,7 @@ export function BotChatPane({
         ? (perQuestion?.[firstQuestionId] ?? "")
         : ""
       : (clarifyInputs[req.requestId] ?? "");
+    setRespondingIds((prev) => new Set(prev).add(req.requestId));
     try {
       await paApi.respondRequest(bot.id, sessionId, {
         requestId: req.requestId,
@@ -885,6 +956,12 @@ export function BotChatPane({
       patchStream(sessionId, () => ({
         error: err instanceof Error ? err.message : gt("响应请求失败"),
       }));
+    } finally {
+      setRespondingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(req.requestId);
+        return next;
+      });
     }
   };
 
@@ -912,13 +989,20 @@ export function BotChatPane({
 
     if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
       event.preventDefault();
-      void handleSend();
+      // The Stop button replaces Send while a turn runs; Enter must not queue a second turn.
+      if (!running) void handleSend();
     }
   };
 
   return (
     <div className="flex min-h-0 flex-1 flex-col bg-background">
-      <header className="flex h-14 shrink-0 items-center justify-between gap-2 border-b border-border/60 px-3 sm:px-4">
+      <header
+        className="flex min-h-14 shrink-0 items-center justify-between gap-2 border-b border-border/60 px-3 sm:px-4"
+        style={{
+          paddingTop: "env(safe-area-inset-top)",
+          minHeight: "calc(3.5rem + env(safe-area-inset-top))",
+        }}
+      >
         <div className="flex min-w-0 items-center gap-2.5">
           {onBackMobile ? (
             <Button
@@ -1071,7 +1155,8 @@ export function BotChatPane({
                   <button
                     key={cmd}
                     type="button"
-                    onClick={() => void handleSend(cmd)}
+                    // `/model` needs an interactive picker; the settings sheet is that picker here.
+                    onClick={() => (cmd === "/model" ? onOpenSettings() : void handleSend(cmd))}
                     className="rounded-full border border-border/70 bg-muted/40 px-3 py-1 font-mono text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
                   >
                     {cmd}
@@ -1183,7 +1268,7 @@ export function BotChatPane({
                 {activeTools.length > 0 ? (
                   <div className="flex flex-wrap gap-1.5">
                     {activeTools.map((tool) => (
-                      <Badge key={tool.name} variant="secondary" size="sm">
+                      <Badge key={tool.key} variant="secondary" size="sm">
                         <WrenchIcon className="size-3" />
                         <span>
                           {tool.name} ({tool.status})
@@ -1210,145 +1295,179 @@ export function BotChatPane({
             </div>
           ) : null}
 
-          {openRequests.map((req) => (
-            <div
-              key={req.requestId}
-              className="space-y-2.5 rounded-xl border border-warning/40 bg-warning-surface p-3.5"
-            >
-              <div className="flex items-center gap-2 font-medium text-sm text-warning-foreground">
-                <ShieldAlertIcon className="size-4" />
-                <span>
-                  {req.title ||
-                    (req.kind === "approval" ? gt("需要确认执行") : gt("Bot 需要你补充信息"))}
-                </span>
-              </div>
-              {req.detail ? (
-                <p className="whitespace-pre-wrap text-xs text-foreground">{req.detail}</p>
-              ) : null}
-              {req.command ? (
-                <pre className="overflow-x-auto rounded-md bg-background/80 p-2 font-mono text-xs">
-                  {req.command}
-                </pre>
-              ) : null}
-              {req.kind === "approval" ? (
-                <div className="flex flex-wrap gap-2">
-                  {req.options && req.options.length > 0 ? (
-                    req.options.map((opt, idx) => {
-                      const decision = normalizeApprovalDecision(opt.id);
-                      return (
+          {openRequests.map((req) => {
+            const responding = respondingIds.has(req.requestId);
+            return (
+              <div
+                key={req.requestId}
+                className="space-y-2.5 rounded-xl border border-warning/40 bg-warning-surface p-3.5"
+              >
+                <div className="flex items-center gap-2 font-medium text-sm text-warning-foreground">
+                  <ShieldAlertIcon className="size-4" />
+                  <span>
+                    {req.title ||
+                      (req.kind === "approval" ? gt("需要确认执行") : gt("Bot 需要你补充信息"))}
+                  </span>
+                </div>
+                {req.detail ? (
+                  <p className="whitespace-pre-wrap text-xs text-foreground">{req.detail}</p>
+                ) : null}
+                {req.command ? (
+                  <pre className="overflow-x-auto rounded-md bg-background/80 p-2 font-mono text-xs">
+                    {req.command}
+                  </pre>
+                ) : null}
+                {req.kind === "approval" ? (
+                  <div className="flex flex-wrap gap-2">
+                    {req.options && req.options.length > 0 ? (
+                      req.options.map((opt, idx) => {
+                        const decision = normalizeApprovalDecision(opt.id);
+                        return (
+                          <Button
+                            key={opt.id}
+                            type="button"
+                            size="sm"
+                            variant={
+                              decision === "deny" ? "outline" : idx === 0 ? "default" : "secondary"
+                            }
+                            disabled={responding}
+                            onClick={() => void handleRespondRequest(req, decision)}
+                          >
+                            {opt.label}
+                          </Button>
+                        );
+                      })
+                    ) : (
+                      <>
                         <Button
-                          key={opt.id}
                           type="button"
                           size="sm"
-                          variant={
-                            decision === "deny" ? "outline" : idx === 0 ? "default" : "secondary"
-                          }
-                          onClick={() => void handleRespondRequest(req, decision)}
+                          disabled={responding}
+                          onClick={() => void handleRespondRequest(req, "once")}
                         >
-                          {opt.label}
+                          <T>允许一次</T>
                         </Button>
-                      );
-                    })
-                  ) : (
-                    <>
-                      <Button
-                        type="button"
-                        size="sm"
-                        onClick={() => void handleRespondRequest(req, "once")}
-                      >
-                        <T>允许一次</T>
-                      </Button>
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant="secondary"
-                        onClick={() => void handleRespondRequest(req, "session")}
-                      >
-                        <T>本次会话允许</T>
-                      </Button>
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant="outline"
-                        onClick={() => void handleRespondRequest(req, "deny")}
-                      >
-                        <T>拒绝</T>
-                      </Button>
-                    </>
-                  )}
-                </div>
-              ) : req.questions && req.questions.length > 0 ? (
-                <div className="space-y-3">
-                  {req.questions.map((question) => {
-                    const currentVal = clarifyAnswers[req.requestId]?.[question.id] ?? "";
-                    return (
-                      <div key={question.id} className="space-y-1.5">
-                        <div className="font-medium text-xs text-foreground">{question.prompt}</div>
-                        {question.options && question.options.length > 0 ? (
-                          <div className="flex flex-wrap gap-1.5">
-                            {question.options.map((opt) => (
-                              <button
-                                key={opt}
-                                type="button"
-                                onClick={() =>
-                                  setClarifyAnswers((prev) => ({
-                                    ...prev,
-                                    [req.requestId]: {
-                                      ...prev[req.requestId],
-                                      [question.id]: opt,
-                                    },
-                                  }))
-                                }
-                                className={cn(
-                                  "rounded-full border px-2.5 py-1 text-xs transition-colors",
-                                  currentVal === opt
-                                    ? "border-primary bg-primary/15 text-foreground"
-                                    : "border-border/70 bg-background/70 text-muted-foreground hover:text-foreground",
-                                )}
-                              >
-                                {opt}
-                              </button>
-                            ))}
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="secondary"
+                          disabled={responding}
+                          onClick={() => void handleRespondRequest(req, "session")}
+                        >
+                          <T>本次会话允许</T>
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          disabled={responding}
+                          onClick={() => void handleRespondRequest(req, "deny")}
+                        >
+                          <T>拒绝</T>
+                        </Button>
+                      </>
+                    )}
+                  </div>
+                ) : req.questions && req.questions.length > 0 ? (
+                  <div className="space-y-3">
+                    {req.questions.map((question) => {
+                      const currentVal = clarifyAnswers[req.requestId]?.[question.id] ?? "";
+                      // Multi-select answers travel as a JSON array of labels (Hermes's own encoding).
+                      const selected = question.multiSelect ? clarifySelection(currentVal) : [];
+                      const isPicked = (opt: string) =>
+                        question.multiSelect ? selected.includes(opt) : currentVal === opt;
+                      const pick = (opt: string) =>
+                        question.multiSelect
+                          ? JSON.stringify(
+                              selected.includes(opt)
+                                ? selected.filter((item) => item !== opt)
+                                : [...selected, opt],
+                            )
+                          : opt;
+                      return (
+                        <div key={question.id} className="space-y-1.5">
+                          <div className="font-medium text-xs text-foreground">
+                            {question.prompt}
                           </div>
-                        ) : null}
-                        <Input
-                          placeholder={gt("输入你的回复...")}
-                          value={currentVal}
-                          onChange={(e) =>
-                            setClarifyAnswers((prev) => ({
-                              ...prev,
-                              [req.requestId]: {
-                                ...prev[req.requestId],
-                                [question.id]: e.target.value,
-                              },
-                            }))
-                          }
-                        />
-                      </div>
-                    );
-                  })}
-                  <div className="flex justify-end">
-                    <Button type="button" size="sm" onClick={() => void handleRespondRequest(req)}>
+                          {question.options && question.options.length > 0 ? (
+                            <div className="flex flex-wrap gap-1.5">
+                              {question.options.map((opt) => (
+                                <button
+                                  key={opt}
+                                  type="button"
+                                  aria-pressed={isPicked(opt)}
+                                  onClick={() =>
+                                    setClarifyAnswers((prev) => ({
+                                      ...prev,
+                                      [req.requestId]: {
+                                        ...prev[req.requestId],
+                                        [question.id]: pick(opt),
+                                      },
+                                    }))
+                                  }
+                                  className={cn(
+                                    "rounded-full border px-2.5 py-1 text-xs transition-colors",
+                                    isPicked(opt)
+                                      ? "border-primary bg-primary/15 text-foreground"
+                                      : "border-border/70 bg-background/70 text-muted-foreground hover:text-foreground",
+                                  )}
+                                >
+                                  {opt}
+                                </button>
+                              ))}
+                            </div>
+                          ) : null}
+                          {question.multiSelect ? null : (
+                            <Input
+                              placeholder={gt("输入你的回复...")}
+                              value={currentVal}
+                              onChange={(e) =>
+                                setClarifyAnswers((prev) => ({
+                                  ...prev,
+                                  [req.requestId]: {
+                                    ...prev[req.requestId],
+                                    [question.id]: e.target.value,
+                                  },
+                                }))
+                              }
+                            />
+                          )}
+                        </div>
+                      );
+                    })}
+                    <div className="flex justify-end">
+                      <Button
+                        type="button"
+                        size="sm"
+                        disabled={responding}
+                        onClick={() => void handleRespondRequest(req)}
+                      >
+                        <T>提交</T>
+                      </Button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex gap-2">
+                    <Input
+                      placeholder={gt("输入你的回复...")}
+                      value={clarifyInputs[req.requestId] ?? ""}
+                      onChange={(e) =>
+                        setClarifyInputs((prev) => ({ ...prev, [req.requestId]: e.target.value }))
+                      }
+                    />
+                    <Button
+                      type="button"
+                      size="sm"
+                      disabled={responding}
+                      onClick={() => void handleRespondRequest(req)}
+                    >
                       <T>提交</T>
                     </Button>
                   </div>
-                </div>
-              ) : (
-                <div className="flex gap-2">
-                  <Input
-                    placeholder={gt("输入你的回复...")}
-                    value={clarifyInputs[req.requestId] ?? ""}
-                    onChange={(e) =>
-                      setClarifyInputs((prev) => ({ ...prev, [req.requestId]: e.target.value }))
-                    }
-                  />
-                  <Button type="button" size="sm" onClick={() => void handleRespondRequest(req)}>
-                    <T>提交</T>
-                  </Button>
-                </div>
-              )}
-            </div>
-          ))}
+                )}
+              </div>
+            );
+          })}
 
           {streamError ? (
             <div className="rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-destructive text-xs">

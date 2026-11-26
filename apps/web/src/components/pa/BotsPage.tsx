@@ -148,8 +148,11 @@ export function BotsPage() {
         )}
       >
         <header
-          className="flex h-14 shrink-0 items-center justify-between gap-2 px-4"
-          style={{ paddingTop: "env(safe-area-inset-top)" }}
+          className="flex min-h-14 shrink-0 items-center justify-between gap-2 px-4"
+          style={{
+            paddingTop: "env(safe-area-inset-top)",
+            minHeight: "calc(3.5rem + env(safe-area-inset-top))",
+          }}
         >
           <div className="flex items-center gap-2">
             <SidebarTrigger className="size-9" />

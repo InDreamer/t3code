@@ -6,6 +6,7 @@ import * as ServerConfig from "../config.ts";
 import { HermesPaAdapter } from "./HermesPaAdapter.ts";
 import { PaStore } from "./PaStore.ts";
 import {
+  PaRequestError,
   parsePaBotId,
   type PaAdapter,
   type PaAdapterKind,
@@ -32,7 +33,7 @@ export interface PaServiceShape {
   }>;
   readonly getBotDetail: (botId: string) => Promise<PaBotDetail>;
   readonly createBot: (input: PaCreateBotInput) => Promise<PaBotSummary>;
-  readonly updateBot: (botId: string, patch: PaUpdateBotInput) => Promise<PaBotDetail>;
+  readonly updateBot: (botId: string, patch: PaUpdateBotInput) => Promise<PaBotDetail | null>;
   readonly manageCron: (
     botId: string,
     input: PaCronMutationInput,
@@ -86,11 +87,11 @@ export function createPaService(adapters: ReadonlyArray<PaAdapter>): PaServiceSh
   const resolveBot = (botId: string): { readonly adapter: PaAdapter; readonly profile: string } => {
     const parsed = parsePaBotId(botId);
     if (!parsed) {
-      throw new Error(`Invalid bot id "${botId}"`);
+      throw new PaRequestError(400, `Invalid bot id "${botId}"`);
     }
     const adapter = byKind.get(parsed.adapter);
     if (!adapter) {
-      throw new Error(`PA adapter "${parsed.adapter}" is not registered`);
+      throw new PaRequestError(404, `PA adapter "${parsed.adapter}" is not registered`);
     }
     return { adapter, profile: parsed.profile };
   };
@@ -153,7 +154,7 @@ export function createPaService(adapters: ReadonlyArray<PaAdapter>): PaServiceSh
     async createBot(input) {
       const adapter = byKind.get(input.adapter);
       if (!adapter) {
-        throw new Error(`PA adapter "${input.adapter}" is not available yet`);
+        throw new PaRequestError(404, `PA adapter "${input.adapter}" is not available yet`);
       }
       return adapter.createBot(input);
     },

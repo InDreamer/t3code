@@ -132,6 +132,7 @@ export interface PaPendingRequest {
         readonly id: string;
         readonly prompt: string;
         readonly options?: ReadonlyArray<string> | undefined;
+        readonly multiSelect?: boolean | undefined;
       }>
     | undefined;
 }
@@ -208,6 +209,7 @@ export type PaStreamEvent =
       readonly sessionId: string;
       readonly turnId?: string | undefined;
       readonly seq?: number | undefined;
+      readonly replayEpoch?: string | undefined;
     }
   | {
       readonly type: "message.delta";
@@ -217,6 +219,7 @@ export type PaStreamEvent =
       readonly segment?: number | undefined;
       readonly offset?: number | undefined;
       readonly seq?: number | undefined;
+      readonly replayEpoch?: string | undefined;
     }
   | {
       readonly type: "message.interim";
@@ -224,20 +227,24 @@ export type PaStreamEvent =
       readonly text: string;
       readonly alreadyStreamed?: boolean | undefined;
       readonly seq?: number | undefined;
+      readonly replayEpoch?: string | undefined;
     }
   | {
       readonly type: "reasoning.delta";
       readonly sessionId: string;
       readonly text: string;
       readonly seq?: number | undefined;
+      readonly replayEpoch?: string | undefined;
     }
   | {
       readonly type: "tool.progress";
       readonly sessionId: string;
       readonly toolName: string;
+      readonly toolId?: string | undefined;
       readonly status: "started" | "completed" | "failed" | "progress";
       readonly preview?: string | undefined;
       readonly seq?: number | undefined;
+      readonly replayEpoch?: string | undefined;
     }
   | {
       readonly type: "message.complete";
@@ -247,6 +254,7 @@ export type PaStreamEvent =
       readonly status: "complete" | "error" | "interrupted";
       readonly error?: string | undefined;
       readonly seq?: number | undefined;
+      readonly replayEpoch?: string | undefined;
     }
   | {
       readonly type: "request.open";
@@ -268,3 +276,26 @@ export type PaStreamEvent =
       readonly sessionId: string;
       readonly message: string;
     };
+
+export interface PaSeqCursor {
+  epoch: string | undefined;
+  lastSeq: number;
+}
+
+/** Mutates `cursor`; false when `seq` was already delivered within the current replay epoch. */
+export function acceptPaSeq(
+  cursor: PaSeqCursor,
+  seq: number | undefined,
+  epoch: string | undefined,
+): boolean {
+  if (epoch !== undefined && epoch !== cursor.epoch) {
+    // Hermes restarts sequence numbering whenever it mints a new replay epoch.
+    cursor.epoch = epoch;
+    cursor.lastSeq = seq ?? 0;
+    return true;
+  }
+  if (seq === undefined || seq <= 0) return true;
+  if (seq <= cursor.lastSeq) return false;
+  cursor.lastSeq = seq;
+  return true;
+}

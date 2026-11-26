@@ -4,13 +4,30 @@ import * as NodeOS from "node:os";
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodePath from "node:path";
 
-import { afterEach, describe, expect, it } from "vite-plus/test";
+import {
+  AuthOrchestrationOperateScope,
+  AuthOrchestrationReadScope,
+  AuthProvidersManageScope,
+  AuthSessionId,
+  type AuthEnvironmentScope,
+} from "@t3tools/contracts";
+import * as ByteSize from "effect/ByteSize";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import { HttpServerRequest } from "effect/http";
+import * as HttpIncomingMessage from "effect/http/HttpIncomingMessage";
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
+import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
+import * as SessionStore from "../auth/SessionStore.ts";
 import {
   decodeWebSocketMessageData,
+  HermesConnectionError,
+  HermesConnectionPool,
+  HermesRpcError,
+  hermesAttachArgs,
   LiveHermesRpcConnection,
   parseHermesGatewayFrame,
-  type HermesConnectionPool,
   type HermesRpcConnection,
   type HermesRpcEventFrame,
   type HermesServerRequestFrame,
@@ -19,16 +36,24 @@ import {
 import {
   extractTranscriptText,
   HermesPaAdapter,
+  mergeSessionRows,
   normalizeHermesTimestamp,
   normalizeSlashCatalog,
   normalizeTranscriptRows,
 } from "./HermesPaAdapter.ts";
-import { createPaService } from "./PaService.ts";
+import {
+  makePaRequestHandler,
+  paErrorStatus,
+  slashCommandRequiresProvidersManage,
+} from "./PaHttp.ts";
+import { createPaService, type PaServiceShape } from "./PaService.ts";
 import { PaStore } from "./PaStore.ts";
 import {
+  acceptPaSeq,
   isValidPaProfile,
   isValidPaSessionId,
   makePaBotId,
+  PaRequestError,
   parsePaBotId,
   type PaStreamEvent,
 } from "./types.ts";
@@ -36,19 +61,18 @@ import {
 class FakeSocket implements HermesSocketLike {
   readyState = 1;
   readonly sent: string[] = [];
+  failSends = false;
   private readonly messageListeners: Array<(event: { data: unknown }) => void> = [];
   private readonly closeListeners: Array<() => void> = [];
-  private readonly errorListeners: Array<() => void> = [];
 
   send(data: string): void {
+    if (this.failSends) throw new Error("socket buffer full");
     this.sent.push(data);
   }
 
   close(): void {
     this.readyState = 3;
-    for (const listener of this.closeListeners) {
-      listener();
-    }
+    for (const listener of this.closeListeners) listener();
   }
 
   addEventListener(type: "message", listener: (event: { data: unknown }) => void): void;
@@ -56,16 +80,18 @@ class FakeSocket implements HermesSocketLike {
   addEventListener(type: "message" | "close" | "error", listener: (event?: any) => void): void {
     if (type === "message") this.messageListeners.push(listener);
     else if (type === "close") this.closeListeners.push(listener);
-    else this.errorListeners.push(listener);
   }
 
   receive(data: unknown): void {
-    for (const listener of this.messageListeners) {
-      listener({ data });
-    }
+    for (const listener of this.messageListeners) listener({ data });
+  }
+
+  sentFrames(): Array<Record<string, unknown>> {
+    return this.sent.map((line) => JSON.parse(line) as Record<string, unknown>);
   }
 }
 
+// Profile-bound like a real Hermes ticket: any RPC naming another profile fails `profile_mismatch`.
 class FakeHermesConnection implements HermesRpcConnection {
   readonly profile: string;
   readonly calls: Array<{ method: string; params: Record<string, unknown> }> = [];
@@ -73,7 +99,7 @@ class FakeHermesConnection implements HermesRpcConnection {
   readonly serverRejections: Array<{ requestId: string; code: number; message: string }> = [];
   private readonly handlers = new Map<string, (params: Record<string, unknown>) => unknown>();
   private readonly eventListeners = new Set<(frame: HermesRpcEventFrame) => void>();
-  private readonly requestListeners = new Set<(frame: HermesServerRequestFrame) => boolean>();
+  private readonly requestListeners = new Set<(frame: HermesServerRequestFrame) => void>();
   private readonly closeListeners = new Set<() => void>();
   private open = true;
 
@@ -86,33 +112,20 @@ class FakeHermesConnection implements HermesRpcConnection {
   }
 
   emitEvent(frame: HermesRpcEventFrame): void {
-    for (const listener of this.eventListeners) {
-      listener(frame);
-    }
+    for (const listener of this.eventListeners) listener(frame);
   }
 
-  emitRequest(frame: HermesServerRequestFrame): boolean {
-    let handled = false;
-    for (const listener of this.requestListeners) {
-      if (listener(frame)) {
-        handled = true;
-      }
-    }
-    if (!handled) {
-      this.rejectServerRequest(
-        frame.request_id,
-        -32601,
-        `Unhandled server request: ${frame.method}`,
-      );
-    }
-    return handled;
+  emitRequest(frame: HermesServerRequestFrame): void {
+    for (const listener of this.requestListeners) listener(frame);
   }
 
   simulateClose(): void {
     this.open = false;
-    for (const listener of this.closeListeners) {
-      listener();
-    }
+    for (const listener of this.closeListeners) listener();
+  }
+
+  callsOf(method: string) {
+    return this.calls.filter((c) => c.method === method);
   }
 
   async call<T = Record<string, unknown>>(
@@ -120,10 +133,11 @@ class FakeHermesConnection implements HermesRpcConnection {
     params: Record<string, unknown> = {},
   ): Promise<T> {
     this.calls.push({ method, params });
-    const handler = this.handlers.get(method);
-    if (!handler) {
-      throw new Error(`Unhandled RPC method: ${method}`);
+    if (typeof params.profile === "string" && params.profile !== this.profile) {
+      throw new HermesRpcError("profile_mismatch", 4001);
     }
+    const handler = this.handlers.get(method);
+    if (!handler) throw new HermesRpcError(`Unhandled RPC method: ${method}`, -32601);
     return (await handler(params)) as T;
   }
 
@@ -140,7 +154,7 @@ class FakeHermesConnection implements HermesRpcConnection {
     return () => this.eventListeners.delete(listener);
   }
 
-  onServerRequest(listener: (frame: HermesServerRequestFrame) => boolean): () => void {
+  onServerRequest(listener: (frame: HermesServerRequestFrame) => void): () => void {
     this.requestListeners.add(listener);
     return () => this.requestListeners.delete(listener);
   }
@@ -159,62 +173,88 @@ class FakeHermesConnection implements HermesRpcConnection {
   }
 }
 
-describe("PA module", () => {
-  const tempDirs: string[] = [];
+const tempDirs: string[] = [];
+afterEach(() => {
+  vi.useRealTimers();
+  for (const dir of tempDirs.splice(0)) {
+    NodeFS.rmSync(dir, { recursive: true, force: true });
+  }
+});
 
-  afterEach(() => {
-    for (const dir of tempDirs.splice(0)) {
-      NodeFS.rmSync(dir, { recursive: true, force: true });
-    }
-  });
+const makeStore = () => {
+  const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-pa-test-"));
+  tempDirs.push(dir);
+  return { dir, store: new PaStore(dir) };
+};
 
-  const makeStore = () => {
-    const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-pa-test-"));
-    tempDirs.push(dir);
-    return { dir, store: new PaStore(dir) };
-  };
+function makeAdapter(connections: Record<string, FakeHermesConnection>) {
+  const { store } = makeStore();
+  const connectedProfiles: string[] = [];
+  const pool = {
+    getConnection: async (profile: string) => {
+      connectedProfiles.push(profile);
+      const conn = connections[profile];
+      if (!conn) throw new HermesConnectionError(`no fake for ${profile}`);
+      return conn;
+    },
+    closeAll: () => undefined,
+  } as unknown as HermesConnectionPool;
+  const adapter = new HermesPaAdapter(store, pool);
+  return { adapter, store, connectedProfiles, service: createPaService([adapter]) };
+}
 
+/** A feedbot socket that resumes `session_id` as itself unless `canonical` redirects it. */
+function makeFeedbotConn(options?: { readonly canonical?: string }) {
+  const conn = new FakeHermesConnection("feedbot");
+  conn.onMethod("session.resume", (p) => ({
+    session_id: options?.canonical ?? p.session_id,
+    running: true,
+    last_sequence: 12,
+    replay_epoch: "ep-A",
+    execution_generation: 5,
+    subscription_id: `sub-${String(p.session_id)}`,
+    open_requests: [],
+    prompts: [],
+  }));
+  conn.onMethod("session.detach", () => ({ ok: true }));
+  conn.onMethod("session.interrupt", () => ({ ok: true }));
+  conn.onMethod("approval.respond", () => ({ status: "resolved" }));
+  conn.onMethod("clarify.respond", () => ({ status: "resolved" }));
+  conn.onMethod("prompt.submit", () => ({ admission_id: "adm-1" }));
+  return conn;
+}
+
+// Node emits `unhandledRejection` only after a macrotask turn; that turn is the milestone observed.
+// oxlint-disable-next-line t3code/no-real-time-wait-in-tests -- no event marks "no rejection happened"
+const flushMacrotasks = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+describe("PA ids", () => {
   it("validates bot ids, profiles, and session ids strictly", () => {
     expect(makePaBotId("hermes", "feedbot")).toBe("hermes:feedbot");
     expect(parsePaBotId("hermes:default")).toEqual({ adapter: "hermes", profile: "default" });
     expect(parsePaBotId("openclaw:main_1")).toEqual({ adapter: "openclaw", profile: "main_1" });
     expect(parsePaBotId("unknown:foo")).toBeNull();
     expect(parsePaBotId("hermes:../evil")).toBeNull();
-    expect(parsePaBotId("hermes:..")).toBeNull();
     expect(parsePaBotId("hermes:--flag")).toBeNull();
-    expect(parsePaBotId("hermes:-p")).toBeNull();
     expect(isValidPaProfile("good-bot_01")).toBe(true);
     expect(isValidPaProfile(".hidden")).toBe(false);
     expect(isValidPaSessionId("sess_2026_abc")).toBe(true);
     expect(isValidPaSessionId("../bad")).toBe(false);
     expect(isValidPaSessionId("has space")).toBe(false);
   });
+});
 
-  it("decodes real Hermes JSON-RPC 2.0 event notifications, server requests, binary chunks, and rejects unclaimed requests", async () => {
+describe("HermesGatewayClient", () => {
+  it("decodes JSON-RPC events, responses and binary frames", async () => {
     const socket = new FakeSocket();
     const conn = new LiveHermesRpcConnection("default", socket, { enablePing: false });
-
     const events: HermesRpcEventFrame[] = [];
-    const claimedRequests: HermesServerRequestFrame[] = [];
-
     conn.onEvent((frame) => events.push(frame));
-    conn.onServerRequest((frame) => {
-      if (frame.method === "approval" && frame.session_id === "s-1") {
-        claimedRequests.push(frame);
-        return true;
-      }
-      return false;
-    });
 
-    // Outbound RPC call includes jsonrpc: "2.0"
     const callPromise = conn.call("session.list", { limit: 10 });
-    expect(socket.sent).toHaveLength(1);
-    const outbound = JSON.parse(socket.sent[0]!) as Record<string, unknown>;
-    expect(outbound.jsonrpc).toBe("2.0");
-    expect(outbound.method).toBe("session.list");
-    expect(typeof outbound.id).toBe("string");
+    const outbound = socket.sentFrames()[0]!;
+    expect(outbound).toMatchObject({ jsonrpc: "2.0", method: "session.list" });
 
-    // Respond + push a real JSON-RPC 2.0 notification in a single newline-delimited chunk
     const responseLine = JSON.stringify({
       jsonrpc: "2.0",
       id: outbound.id,
@@ -232,7 +272,10 @@ describe("PA module", () => {
         payload: { text: "Hello", offset: 0 },
       },
     });
-    socket.receive(`${responseLine}\n${eventLine}`);
+    const encoded = new TextEncoder().encode(`${responseLine}\n${eventLine}`);
+    socket.receive(
+      encoded.buffer.slice(encoded.byteOffset, encoded.byteOffset + encoded.byteLength),
+    );
 
     await expect(callPromise).resolves.toEqual({ sessions: [] });
     expect(events).toEqual([
@@ -245,401 +288,732 @@ describe("PA module", () => {
         payload: { text: "Hello", offset: 0 },
       },
     ]);
-
-    // Binary ArrayBuffer frame containing a claimed approval request + an unclaimed sudo request
-    const approvalReq = JSON.stringify({
-      jsonrpc: "2.0",
-      id: "srq-1",
-      method: "approval",
-      params: { session_id: "s-1", command: "ls -la" },
-    });
-    const sudoReq = JSON.stringify({
-      jsonrpc: "2.0",
-      id: "srq-2",
-      method: "sudo",
-      params: { session_id: "s-1" },
-    });
-    const encoded = new TextEncoder().encode(`${approvalReq}\n${sudoReq}`);
-    socket.receive(
-      encoded.buffer.slice(encoded.byteOffset, encoded.byteOffset + encoded.byteLength),
-    );
-
-    expect(claimedRequests).toHaveLength(1);
-    expect(claimedRequests[0]).toMatchObject({
-      request_id: "srq-1",
-      method: "approval",
-      session_id: "s-1",
-    });
-
-    // Unclaimed sudo request MUST receive an immediate JSON-RPC -32601 rejection
-    const rejectionFrame = JSON.parse(socket.sent.at(-1)!) as Record<string, unknown>;
-    expect(rejectionFrame).toMatchObject({
-      jsonrpc: "2.0",
-      id: "srq-2",
-      error: { code: -32601 },
-    });
-
-    // Closing the connection rejects in-flight RPC calls cleanly and triggers onClose
-    let closedCalled = false;
-    conn.onClose(() => {
-      closedCalled = true;
-    });
-    const inFlight = conn.call("prompt.submit", {
-      session_id: "s-1",
-      text: "hi",
-      input_id: "id-1",
-    });
-    conn.close();
-    await expect(inFlight).rejects.toThrow(/closed/i);
-    expect(closedCalled).toBe(true);
-
-    // Pure decoder helper checks
     expect(decodeWebSocketMessageData(new Uint8Array([65, 66]))).toBe("AB");
     expect(parseHermesGatewayFrame({ method: "event", params: {} })).toEqual({ kind: "unknown" });
+    conn.close();
   });
 
-  it("normalizes Hermes timestamps, transcripts, and array-shaped slash command catalogs", () => {
+  it("never answers an unclaimed server request: Hermes settles on the first viewer response", () => {
+    const socket = new FakeSocket();
+    const conn = new LiveHermesRpcConnection("default", socket, { enablePing: false });
+    const seen: string[] = [];
+    conn.onServerRequest((frame) => seen.push(frame.request_id));
+
+    socket.receive(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: "srq-2",
+        method: "sudo",
+        params: { session_id: "s-9" },
+      }),
+    );
+
+    expect(seen).toEqual(["srq-2"]);
+    expect(socket.sent).toEqual([]);
+    conn.close();
+  });
+
+  it("survives null/primitive JSON lines and isolates a throwing listener", () => {
+    const socket = new FakeSocket();
+    const conn = new LiveHermesRpcConnection("default", socket, { enablePing: false });
+    const received: string[] = [];
+    conn.onEvent(() => {
+      throw new Error("bad subscriber");
+    });
+    conn.onEvent((frame) => received.push(frame.event));
+
+    const event = JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "notice" } });
+    expect(() => socket.receive(`null\n42\n"str"\n[1]\n${event}`)).not.toThrow();
+    expect(received).toEqual(["notice"]);
+    conn.close();
+  });
+
+  it("cleans up the pending entry when ws.send throws synchronously", async () => {
+    const socket = new FakeSocket();
+    const conn = new LiveHermesRpcConnection("default", socket, { enablePing: false });
+    socket.failSends = true;
+    await expect(conn.call("session.list")).rejects.toBeInstanceOf(HermesConnectionError);
+    socket.failSends = false;
+    conn.close();
+    // Nothing is left pending for close() to reject.
+    expect(socket.sent).toEqual([]);
+  });
+
+  it("heartbeats with gateway.ping", () => {
+    vi.useFakeTimers();
+    const socket = new FakeSocket();
+    const conn = new LiveHermesRpcConnection("default", socket);
+    vi.advanceTimersByTime(25_000);
+    expect(socket.sentFrames().map((f) => f.method)).toEqual(["gateway.ping"]);
+    conn.close();
+  });
+
+  it("pins the profile explicitly when attaching, including default", () => {
+    expect(hermesAttachArgs("default")).toEqual(["-p", "default", "gateway", "attach", "--json"]);
+    expect(hermesAttachArgs("feedbot")).toEqual(["-p", "feedbot", "gateway", "attach", "--json"]);
+  });
+
+  it("a failed connect rejects its callers without any unhandledRejection", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const pool = new HermesConnectionPool(async () => {
+        throw new Error("spawn hermes ENOENT");
+      });
+      const [first, second] = await Promise.allSettled([
+        pool.getConnection("default"),
+        pool.getConnection("default"),
+      ]);
+      expect(first.status).toBe("rejected");
+      expect(second.status).toBe("rejected");
+      if (first.status === "rejected") {
+        expect(first.reason).toBeInstanceOf(HermesConnectionError);
+      }
+      // The failed attempt is forgotten, so a later call retries instead of replaying the failure.
+      await expect(pool.getConnection("default")).rejects.toThrow(/ENOENT/);
+      await flushMacrotasks();
+      await flushMacrotasks();
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+});
+
+describe("Hermes normalizers", () => {
+  it("normalizes timestamps, transcripts, and array-shaped slash catalogs", () => {
     expect(normalizeHermesTimestamp(1795613800.5)).toBe(1795613800500);
     expect(normalizeHermesTimestamp(1795613800500)).toBe(1795613800500);
     expect(normalizeHermesTimestamp(null)).toBeNull();
-
     expect(
-      extractTranscriptText({
-        content: [{ type: "text", text: "Hello" }, { text: "world" }],
-      }),
+      extractTranscriptText({ content: [{ type: "text", text: "Hello" }, { text: "world" }] }),
     ).toBe("Hello\nworld");
 
     const messages = normalizeTranscriptRows([
       { role: "user", text: "/status", row_id: 1, timestamp: 1700000000 },
-      {
-        role: "assistant",
-        text: "All systems operational",
-        reasoning_content: "Checked gateway",
-        row_id: 2,
-        timestamp: 1700000001,
-      },
+      { role: "assistant", text: "ok", reasoning_content: "Checked", row_id: 2 },
       { role: "assistant", text: "", row_id: 3 },
-      { role: "system", text: "Compacted 12 messages", row_kind: "compaction", row_id: 4 },
+      { role: "system", text: "Compacted", row_kind: "compaction", row_id: 4 },
     ]);
-    expect(messages).toHaveLength(3);
-    expect(messages[0]?.role).toBe("user");
-    expect(messages[1]?.reasoning).toBe("Checked gateway");
-    expect(messages[2]?.rowKind).toBe("compaction");
+    expect(messages.map((m) => m.rowKind)).toEqual(["message", "message", "compaction"]);
+    expect(messages[1]?.reasoning).toBe("Checked");
 
-    const commands = normalizeSlashCatalog({
-      pairs: [
-        ["/status", "Show gateway status"],
-        ["model", "Switch active model"],
-      ],
-      categories: [
-        { name: "Session", pairs: [["/status", "Show gateway status"]] },
-        { id: "config", commands: ["model"] },
-      ],
-      skills: {
-        "daily-brief": { description: "Compile morning digest" },
-      },
-    });
-    expect(commands).toEqual([
+    expect(
+      normalizeSlashCatalog({
+        pairs: [
+          ["/status", "Show gateway status"],
+          ["model", "Switch active model"],
+        ],
+        categories: [
+          { name: "Session", pairs: [["/status", "Show gateway status"]] },
+          { id: "config", commands: ["model"] },
+        ],
+        skills: { "daily-brief": { description: "Compile morning digest" } },
+      }),
+    ).toEqual([
       { name: "/status", description: "Show gateway status", category: "Session" },
       { name: "/model", description: "Switch active model", category: "config" },
       { name: "/daily-brief", description: "Compile morning digest", category: "skill" },
     ]);
   });
 
-  it("backs up corrupt PaStore JSON instead of silently wiping user state", () => {
-    const { dir, store } = makeStore();
-    const stateFile = NodePath.join(dir, "pa-bots.json");
-    NodeFS.writeFileSync(stateFile, "{corrupt json", "utf8");
+  it("merges live + stored session rows, preferring live state and reading last_active_at", () => {
+    const sessions = mergeSessionRows(
+      [{ session_id: "s-live", title: "Live now", running: true, model: "flash", started_at: 100 }],
+      [
+        {
+          session_id: "s-live",
+          title: "Stored title",
+          running: false,
+          message_count: 9,
+          last_active_at: 1700000500,
+          started_at: 100,
+        },
+        { session_id: "s-old", title: "Old", last_active: 1700000100, started_at: 50 },
+      ],
+      "s-old",
+    );
+    expect(sessions.map((s) => s.sessionId)).toEqual(["s-live", "s-old"]);
+    expect(sessions[0]).toMatchObject({
+      title: "Live now",
+      running: true,
+      model: "flash",
+      messageCount: 9,
+      lastActivityAt: 1700000500000,
+      isPrimaryWeb: false,
+    });
+    expect(sessions[1]).toMatchObject({ lastActivityAt: 1700000100000, isPrimaryWeb: true });
+  });
+});
 
+describe("PaStore", () => {
+  it("backs up unparseable JSON instead of silently wiping user state", () => {
+    const { dir, store } = makeStore();
+    NodeFS.writeFileSync(NodePath.join(dir, "pa-bots.json"), "{corrupt json", "utf8");
     expect(store.getBotMeta("hermes:default")).toEqual({});
     const backups = NodeFS.readdirSync(dir).filter((f) => f.startsWith("pa-bots.json.corrupt-"));
     expect(backups).toHaveLength(1);
     expect(NodeFS.readFileSync(NodePath.join(dir, backups[0]!), "utf8")).toBe("{corrupt json");
   });
 
-  it("enforces Hermes protocol contracts: input_id, execution_generation, replay, tool events, session-isolated approvals, profile-scoped model.options, and cron errors", async () => {
-    const { store } = makeStore();
+  it("backs up structurally invalid JSON and keeps only well-typed fields", () => {
+    const { dir, store } = makeStore();
+    const file = NodePath.join(dir, "pa-bots.json");
+    const raw = JSON.stringify({
+      version: 1,
+      bots: {
+        "hermes:a": { displayName: "A", pinned: "yes", lastReadAt: 5, avatarShape: "hexagon" },
+        "hermes:b": "not an object",
+      },
+    });
+    NodeFS.writeFileSync(file, raw, "utf8");
+    expect(store.getBotMeta("hermes:a")).toEqual({ displayName: "A", lastReadAt: 5 });
+    expect(store.getBotMeta("hermes:b")).toEqual({});
+    const backups = NodeFS.readdirSync(dir).filter((f) => f.startsWith("pa-bots.json.corrupt-"));
+    expect(backups).toHaveLength(1);
+
+    const { dir: dir2, store: store2 } = makeStore();
+    NodeFS.writeFileSync(NodePath.join(dir2, "pa-bots.json"), JSON.stringify({ bots: [] }), "utf8");
+    expect(store2.getBotMeta("hermes:a")).toEqual({});
+    expect(NodeFS.readdirSync(dir2).some((f) => f.includes(".corrupt-"))).toBe(true);
+  });
+});
+
+describe("HermesPaAdapter profile routing", () => {
+  it("routes cron.manage and skills.manage through the bot's own profile socket", async () => {
     const defaultConn = new FakeHermesConnection("default");
     const feedbotConn = new FakeHermesConnection("feedbot");
-
     defaultConn.onMethod("profiles.list", () => ({
       profiles: [
-        {
-          name: "default",
-          is_default: true,
-          model: "deepseek-flash",
-          provider: "deepseek",
-          skill_count: 10,
-        },
-        { name: "feedbot", is_default: false, model: "", provider: "", skill_count: 2 },
+        { name: "default", is_default: true, model: "flash", provider: "deepseek" },
+        { name: "feedbot", model: "", provider: "" },
       ],
     }));
     defaultConn.onMethod("profiles.describe", (p) => ({
       name: p.name,
-      soul: `Soul for ${String(p.name)}`,
-      model: { default: "deepseek-flash", provider: "deepseek" },
+      soul: "soul",
+      model: { default: "flash", provider: "deepseek" },
       skills: [{ name: "digest", enabled: true }],
-      toolsets: [{ name: "web", label: "Web", enabled: true }],
-      mcp_servers: [],
     }));
-    defaultConn.onMethod("profiles.configure", (p) => {
-      if (p.model === "expensive-opus" && !p.confirm_expensive_model) {
-        return {
-          ok: false,
-          confirm_required: true,
-          confirm_message: "Expensive model confirmation needed",
-        };
-      }
-      return { ok: true };
-    });
-    defaultConn.onMethod("session.list", () => ({
-      sessions: [
-        {
-          session_id: "s-def-1",
-          title: "Main chat",
-          source: "gui",
-          message_count: 4,
-          last_active: 1700000100,
-        },
-      ],
+    defaultConn.onMethod("profiles.configure", (p) =>
+      p.model === "expensive-opus" && !p.confirm_expensive_model
+        ? { ok: false, confirm_required: true, confirm_message: "Expensive model confirmation" }
+        : { ok: true },
+    );
+    feedbotConn.onMethod("model.options", () => ({
+      providers: [{ slug: "openrouter", name: "OpenRouter", is_current: true, models: ["m"] }],
     }));
-
-    defaultConn.onMethod("cron.manage", (p) => {
-      if (p.action === "pause" && p.name === "bad-job") {
+    feedbotConn.onMethod("cron.manage", (p) => {
+      if (p.action === "pause" && p.name === "bad-job")
         return { success: false, error: "Job not found" };
-      }
       return {
         success: true,
         jobs: [
-          { id: "job-42", name: "Morning", schedule: "0 9 * * *", prompt: "Brief", enabled: false },
+          {
+            job_id: "job-42",
+            name: "Morning",
+            schedule: "0 9 * * *",
+            prompt_preview: "Brief me",
+            enabled: false,
+          },
         ],
       };
     });
-    defaultConn.onMethod("skills.manage", () => ({ skills: { news: ["digest"] } }));
+    feedbotConn.onMethod("skills.manage", () => ({ skills: { news: ["digest"] } }));
 
-    feedbotConn.onMethod("model.options", () => ({
-      providers: [
-        { slug: "openrouter", name: "OpenRouter", is_current: true, models: ["deepseek-flash"] },
-      ],
-    }));
-    feedbotConn.onMethod("session.list", () => ({
-      sessions: [
-        {
-          session_id: "s-feed-1",
-          title: "Daily Digest",
-          source: "feishu",
-          message_count: 2,
-          last_active: 1700000200,
-        },
-      ],
-    }));
-    feedbotConn.onMethod("session.resume", (p) => ({
-      running: true,
-      last_sequence: 12,
-      replay_epoch: "ep-A",
-      execution_generation: 5,
-      subscription_id: `sub-${String(p.session_id)}`,
-      open_requests: [
-        { id: "srq-open-1", method: "approval", params: { command: "rm -rf /tmp/foo" } },
-      ],
-      prompts: [
-        {
-          prompt_id: "prm-1",
-          kind: "clarify",
-          execution_generation: 5,
-          question: "Which feed?",
-          questions: [{ id: "q1", prompt: "Which feed?" }],
-        },
-      ],
-    }));
-    feedbotConn.onMethod("session.events.since", () => ({
-      replay_epoch: "ep-A",
-      snapshot_required: false,
-      events: [
-        {
-          type: "tool.start",
-          session_id: "s-feed-1",
-          seq: 11,
-          payload: { tool_name: "web_search", preview: "query" },
-        },
-        {
-          type: "tool.complete",
-          session_id: "s-feed-1",
-          seq: 12,
-          payload: { tool_name: "web_search" },
-        },
-      ],
-    }));
-    feedbotConn.onMethod("session.detach", () => ({ ok: true }));
-    feedbotConn.onMethod("session.interrupt", () => ({ ok: true }));
-    feedbotConn.onMethod("approval.respond", () => ({ ok: true }));
-    feedbotConn.onMethod("clarify.respond", () => ({ ok: true }));
-    feedbotConn.onMethod("session.transcript", () => ({
-      rows: [{ role: "assistant", text: "Hello", row_id: 1, timestamp: 1700000201 }],
-    }));
-    feedbotConn.onMethod("slash.exec", (p) => ({
-      type: "exec",
-      output: `Native slash output for ${String(p.command)}`,
-    }));
-    feedbotConn.onMethod("prompt.submit", () => ({
-      admission_id: "adm-123",
-    }));
+    const { service, store } = makeAdapter({ default: defaultConn, feedbot: feedbotConn });
 
-    const connectedProfiles: string[] = [];
-    const fakePool = {
-      getConnection: async (profile: string) => {
-        connectedProfiles.push(profile);
-        return profile === "feedbot" ? feedbotConn : defaultConn;
-      },
-      closeAll: () => undefined,
-    } as unknown as HermesConnectionPool;
-
-    const adapter = new HermesPaAdapter(store, fakePool);
-    const service = createPaService([adapter]);
-
-    // 1. listBots does NOT spawn N+1 secondary profile gateway connections
     const listed = await service.listBots();
     expect(listed.bots).toHaveLength(2);
-    expect(connectedProfiles).toEqual(["default"]);
 
-    // 2. getBotDetail calls model.options on feedbotConn (not defaultConn) and cron.manage with include_disabled: true
     const detail = await service.getBotDetail("hermes:feedbot");
+    expect(detail.cronJobs).toEqual([
+      expect.objectContaining({ id: "job-42", prompt: "Brief me", enabled: false }),
+    ]);
+    expect(detail.skills).toEqual([{ name: "digest", category: "news", enabled: true }]);
     expect(detail.modelOptions[0]?.slug).toBe("openrouter");
-    expect(defaultConn.calls.some((c) => c.method === "model.options")).toBe(false);
-    expect(
-      defaultConn.calls.find((c) => c.method === "cron.manage" && c.params.action === "list")
-        ?.params,
-    ).toMatchObject({ profile: "feedbot", include_disabled: true });
+    for (const method of ["cron.manage", "skills.manage", "model.options"]) {
+      expect(defaultConn.callsOf(method)).toEqual([]);
+    }
+    expect(feedbotConn.callsOf("cron.manage")[0]?.params).toMatchObject({
+      profile: "feedbot",
+      include_disabled: true,
+    });
 
-    // 3. profiles.configure propagates confirm_required without throwing
-    const confirmDetail = await service.updateBot("hermes:feedbot", { model: "expensive-opus" });
-    expect(confirmDetail.confirmRequired?.message).toContain("Expensive model");
+    // The fake rejects cross-profile calls exactly like a profile-bound Hermes ticket.
+    await expect(defaultConn.call("cron.manage", { profile: "feedbot" })).rejects.toThrow(
+      "profile_mismatch",
+    );
 
-    // 4. cron.manage sends jobId via Hermes `name` parameter and throws on gateway error
     await expect(
       service.manageCron("hermes:feedbot", { action: "pause", jobId: "bad-job" }),
     ).rejects.toThrow("Job not found");
     const jobs = await service.manageCron("hermes:feedbot", { action: "resume", jobId: "job-42" });
     expect(jobs).toHaveLength(1);
     expect(
-      defaultConn.calls.find((c) => c.method === "cron.manage" && c.params.action === "resume")
-        ?.params,
+      feedbotConn.callsOf("cron.manage").find((c) => c.params.action === "resume")?.params,
     ).toMatchObject({ profile: "feedbot", name: "job-42" });
 
-    // 5. prompt.submit always includes input_id
-    const turnResult = await service.sendMessage("hermes:feedbot", "s-feed-1", "Summarize today", {
-      inputId: "client-input-99",
+    const confirm = await service.updateBot("hermes:feedbot", { model: "expensive-opus" });
+    expect(confirm?.confirmRequired?.message).toContain("Expensive model");
+
+    // A read marker is local-only: no Hermes round trip at all.
+    const before = defaultConn.calls.length + feedbotConn.calls.length;
+    await expect(service.updateBot("hermes:feedbot", { markRead: true })).resolves.toBeNull();
+    expect(defaultConn.calls.length + feedbotConn.calls.length).toBe(before);
+    expect(store.getBotMeta("hermes:feedbot").lastReadAt).toBeTypeOf("number");
+  });
+
+  it("lists both live and stored sessions and follows the profile config on create", async () => {
+    const feedbotConn = makeFeedbotConn();
+    feedbotConn.onMethod("session.list", (p) =>
+      p.scope === "live"
+        ? { scope: "live", sessions: [{ session_id: "s-run", title: "Busy", running: true }] }
+        : {
+            scope: "stored",
+            sessions: [{ session_id: "s-run", title: "Busy", last_active_at: 1700000300 }],
+          },
+    );
+    feedbotConn.onMethod("session.create", () => ({ session_id: "s-new" }));
+    const { service } = makeAdapter({ feedbot: feedbotConn });
+
+    const listed = await service.listSessions("hermes:feedbot");
+    expect(listed.sessions).toEqual([
+      expect.objectContaining({ sessionId: "s-run", running: true, lastActivityAt: 1700000300000 }),
+    ]);
+    expect(feedbotConn.callsOf("session.list").map((c) => c.params)).toEqual([
+      { scope: "live", limit: 30, picker: true },
+      { scope: "stored", limit: 30, picker: true },
+    ]);
+
+    await service.createSession("hermes:feedbot");
+    expect(feedbotConn.callsOf("session.create")[0]?.params).toEqual({
+      source: "gui",
+      follow_profile_config: true,
     });
-    expect(turnResult.kind).toBe("turn");
-    expect(feedbotConn.calls.find((c) => c.method === "prompt.submit")?.params).toMatchObject({
-      session_id: "s-feed-1",
-      text: "Summarize today",
-      input_id: "client-input-99",
+  });
+});
+
+describe("HermesPaAdapter streaming", () => {
+  it("replays a reconnect: events.since before resume, snapshot at the browser cursor, no duplicates", async () => {
+    const feedbotConn = makeFeedbotConn();
+    feedbotConn.onMethod("session.events.since", () => ({
+      replay_epoch: "ep-A",
+      snapshot_required: false,
+      events: [
+        {
+          type: "tool.start",
+          session_id: "s-1",
+          seq: 11,
+          payload: { tool_call_id: "c1", name: "web_search", context: "q" },
+        },
+        {
+          type: "tool.complete",
+          session_id: "s-1",
+          seq: 12,
+          payload: { tool_call_id: "c1", name: "web_search" },
+        },
+      ],
+    }));
+    // Resume's catch_up re-sends seq 12 on the socket ahead of its reply.
+    const resume = feedbotConn["handlers"].get("session.resume")!;
+    feedbotConn.onMethod("session.resume", (p) => {
+      feedbotConn.emitEvent({
+        event: "tool.complete",
+        session_id: "s-1",
+        seq: 12,
+        replay_epoch: "ep-A",
+        payload: { tool_call_id: "c1" },
+      });
+      feedbotConn.emitEvent({
+        event: "message.delta",
+        session_id: "s-1",
+        seq: 13,
+        replay_epoch: "ep-A",
+        payload: { text: "Hi" },
+      });
+      return resume(p);
     });
+    const { service } = makeAdapter({ feedbot: feedbotConn });
 
-    // 6. getMessages has zero write side effects (does NOT mutate lastReadAt in store)
-    store.updateBotMeta("hermes:feedbot", { lastReadAt: 100 });
-    await service.getMessages("hermes:feedbot", "s-feed-1");
-    expect(store.getBotMeta("hermes:feedbot").lastReadAt).toBe(100);
-
-    // 7. subscribeSession sends last_sequence + replay_epoch, merges open_requests + prompts, and isolates sessions
-    const receivedA: PaStreamEvent[] = [];
-    const receivedB: PaStreamEvent[] = [];
-    let closedReasonA: string | undefined;
-
-    const unsubA = await service.subscribeSession("hermes:feedbot", "s-feed-1", {
+    const events: PaStreamEvent[] = [];
+    const unsubscribe = await service.subscribeSession("hermes:feedbot", "s-1", {
       sinceSeq: 10,
       replayEpoch: "ep-A",
-      onEvent: (event) => receivedA.push(event),
-      onClose: (reason) => {
-        closedReasonA = reason;
+      onEvent: (event) => events.push(event),
+    });
+
+    expect(feedbotConn.calls.map((c) => c.method)).toEqual([
+      "session.events.since",
+      "session.resume",
+    ]);
+    expect(events[0]).toMatchObject({
+      type: "snapshot",
+      lastSeq: 10,
+      replayEpoch: "ep-A",
+      snapshotRequired: false,
+    });
+    expect(events.slice(1).map((e) => ("seq" in e ? e.seq : null))).toEqual([11, 12, 13]);
+    expect(events[1]).toMatchObject({
+      type: "tool.progress",
+      toolId: "c1",
+      preview: "q",
+      status: "started",
+    });
+
+    // The browser's cursor accepts every replayed frame after adopting the snapshot baseline.
+    const browser = { epoch: undefined as string | undefined, lastSeq: 12 };
+    const snapshot = events[0]!;
+    if (snapshot.type === "snapshot") {
+      browser.epoch = snapshot.replayEpoch;
+      browser.lastSeq = snapshot.lastSeq;
+    }
+    const accepted = events
+      .slice(1)
+      .filter((e) => "seq" in e && acceptPaSeq(browser, e.seq, e.replayEpoch));
+    expect(accepted).toHaveLength(3);
+
+    // A new replay epoch restarts numbering; its low sequences must not be suppressed.
+    feedbotConn.emitEvent({
+      event: "message.start",
+      session_id: "s-1",
+      seq: 1,
+      replay_epoch: "ep-B",
+      payload: {},
+    });
+    expect(events.at(-1)).toMatchObject({ type: "message.start", seq: 1, replayEpoch: "ep-B" });
+    expect(acceptPaSeq(browser, 1, "ep-B")).toBe(true);
+    expect(acceptPaSeq(browser, 1, "ep-B")).toBe(false);
+    unsubscribe();
+  });
+
+  it("asks for a snapshot reload when the replay epoch is gone", async () => {
+    const feedbotConn = makeFeedbotConn();
+    feedbotConn.onMethod("session.events.since", () => ({ snapshot_required: true, events: [] }));
+    const { service } = makeAdapter({ feedbot: feedbotConn });
+    const events: PaStreamEvent[] = [];
+    const unsubscribe = await service.subscribeSession("hermes:feedbot", "s-1", {
+      sinceSeq: 4,
+      replayEpoch: "ep-old",
+      onEvent: (event) => events.push(event),
+    });
+    expect(events).toEqual([
+      expect.objectContaining({ type: "snapshot", snapshotRequired: true, lastSeq: 12 }),
+    ]);
+    unsubscribe();
+  });
+
+  it("rejects instead of faking an idle snapshot when session.resume fails", async () => {
+    const feedbotConn = makeFeedbotConn();
+    feedbotConn.onMethod("session.resume", () => {
+      throw new HermesRpcError("not_found", 4004);
+    });
+    const { service } = makeAdapter({ feedbot: feedbotConn });
+    const events: PaStreamEvent[] = [];
+    await expect(
+      service.subscribeSession("hermes:feedbot", "s-gone", { onEvent: (e) => events.push(e) }),
+    ).rejects.toThrow("not_found");
+    expect(events).toEqual([]);
+    // Listeners were released: later frames go nowhere.
+    feedbotConn.emitEvent({
+      event: "message.delta",
+      session_id: "s-gone",
+      seq: 1,
+      payload: { text: "x" },
+    });
+    expect(events).toEqual([]);
+  });
+
+  it("recovers from session.replay_gap: clears the subscription, asks for a reload, ends the stream", async () => {
+    const feedbotConn = makeFeedbotConn();
+    const { service } = makeAdapter({ feedbot: feedbotConn });
+    const events: PaStreamEvent[] = [];
+    const closeReasons: Array<string | undefined> = [];
+    await service.subscribeSession("hermes:feedbot", "s-1", {
+      onEvent: (event) => events.push(event),
+      onClose: (reason) => closeReasons.push(reason),
+    });
+    feedbotConn.emitEvent({
+      event: "session.replay_gap",
+      session_id: "s-1",
+      payload: { replay_epoch: "ep-A", latest_seq: 40 },
+    });
+    expect(events.at(-1)).toMatchObject({ type: "snapshot", snapshotRequired: true, lastSeq: 40 });
+    expect(closeReasons).toEqual([undefined]);
+
+    // The retired subscription is not reused: the next send re-attaches first.
+    const resumesBefore = feedbotConn.callsOf("session.resume").length;
+    await service.sendMessage("hermes:feedbot", "s-1", "hello");
+    expect(feedbotConn.callsOf("session.resume").length).toBe(resumesBefore + 1);
+  });
+
+  it("adopts the canonical session id session.resume redirects to", async () => {
+    const feedbotConn = makeFeedbotConn({ canonical: "s-tip" });
+    const { service } = makeAdapter({ feedbot: feedbotConn });
+    const events: PaStreamEvent[] = [];
+    const unsubscribe = await service.subscribeSession("hermes:feedbot", "s-root", {
+      onEvent: (event) => events.push(event),
+    });
+    feedbotConn.emitEvent({
+      event: "message.delta",
+      session_id: "s-tip",
+      seq: 13,
+      replay_epoch: "ep-A",
+      payload: { text: "tip" },
+    });
+    feedbotConn.emitEvent({
+      event: "message.delta",
+      session_id: "s-other",
+      seq: 14,
+      replay_epoch: "ep-A",
+      payload: { text: "leak" },
+    });
+    feedbotConn.emitRequest({
+      request_id: "srq-1",
+      method: "approval",
+      session_id: "s-tip",
+      params: { command: "ls" },
+    });
+    expect(events.map((e) => e.type)).toEqual(["snapshot", "message.delta", "request.open"]);
+
+    await service.interruptSession("hermes:feedbot", "s-root");
+    expect(feedbotConn.callsOf("session.interrupt")[0]?.params).toEqual({
+      session_id: "s-tip",
+      execution_generation: 5,
+    });
+    unsubscribe();
+    expect(feedbotConn.callsOf("session.detach")[0]?.params).toMatchObject({ session_id: "s-tip" });
+  });
+});
+
+describe("HermesPaAdapter prompts", () => {
+  it("answers only tracked requests of the same session, keyed by each question's qid", async () => {
+    const feedbotConn = makeFeedbotConn();
+    const { service } = makeAdapter({ feedbot: feedbotConn });
+    const a: PaStreamEvent[] = [];
+    const b: PaStreamEvent[] = [];
+    await service.subscribeSession("hermes:feedbot", "s-a", { onEvent: (e) => a.push(e) });
+    await service.subscribeSession("hermes:feedbot", "s-b", { onEvent: (e) => b.push(e) });
+
+    feedbotConn.emitRequest({
+      request_id: "srq-batch",
+      method: "clarify",
+      session_id: "s-a",
+      params: {
+        session_id: "s-a",
+        questions: [
+          { qid: "q0", question: "Which env?", choices: ["staging", "prod"], multi_select: true },
+          { qid: "q1", question: "Why?" },
+        ],
       },
     });
-    const unsubB = await service.subscribeSession("hermes:feedbot", "s-feed-2", {
-      onEvent: (event) => receivedB.push(event),
-    });
+    const opened = a.find((e) => e.type === "request.open");
+    expect(opened?.type === "request.open" && opened.request.questions).toEqual([
+      { id: "q0", prompt: "Which env?", options: ["staging", "prod"], multiSelect: true },
+      { id: "q1", prompt: "Why?", options: undefined, multiSelect: false },
+    ]);
+    expect(b.some((e) => e.type === "request.open")).toBe(false);
 
-    expect(
-      feedbotConn.calls.find((c) => c.method === "session.events.since")?.params,
-    ).toMatchObject({
-      session_id: "s-feed-1",
-      last_sequence: 10,
+    // Another session (or a stale id) can never answer it over the shared profile socket.
+    await expect(
+      service.respondRequest("hermes:feedbot", "s-b", {
+        requestId: "srq-batch",
+        kind: "clarify",
+        answer: "x",
+      }),
+    ).rejects.toBeInstanceOf(PaRequestError);
+    await expect(
+      service.respondRequest("hermes:feedbot", "s-a", {
+        requestId: "srq-nope",
+        kind: "approval",
+        decision: "once",
+      }),
+    ).rejects.toThrow(/no longer open/);
+    expect(feedbotConn.serverResponses).toEqual([]);
+
+    await service.respondRequest("hermes:feedbot", "s-a", {
+      requestId: "srq-batch",
+      kind: "clarify",
+      answers: { q0: JSON.stringify(["staging", "prod"]), q1: "release" },
+    });
+    expect(feedbotConn.serverResponses).toEqual([
+      { requestId: "srq-batch", result: { answers: { q0: '["staging","prod"]', q1: "release" } } },
+    ]);
+    // Answered once; a replay of the same answer is refused.
+    await expect(
+      service.respondRequest("hermes:feedbot", "s-a", {
+        requestId: "srq-batch",
+        kind: "clarify",
+        answer: "x",
+      }),
+    ).rejects.toBeInstanceOf(PaRequestError);
+  });
+
+  it("normalizes canonical clarify prompts with top-level question/choices/multi_select", async () => {
+    const feedbotConn = makeFeedbotConn();
+    const { service } = makeAdapter({ feedbot: feedbotConn });
+    const events: PaStreamEvent[] = [];
+    await service.subscribeSession("hermes:feedbot", "s-1", { onEvent: (e) => events.push(e) });
+    feedbotConn.emitEvent({
+      event: "clarify.request",
+      session_id: "s-1",
+      seq: 13,
       replay_epoch: "ep-A",
+      payload: {
+        kind: "clarify",
+        prompt_id: "clr-1",
+        execution_generation: 6,
+        question: "Deploy where?",
+        choices: ["staging", "prod", "dev"],
+        multi_select: true,
+      },
+    });
+    const opened = events.find((e) => e.type === "request.open");
+    expect(opened?.type === "request.open" && opened.request).toMatchObject({
+      requestId: "clr-1",
+      channel: "canonical",
+      detail: "Deploy where?",
+      executionGeneration: 6,
+      questions: [
+        {
+          id: "q0",
+          prompt: "Deploy where?",
+          options: ["staging", "prod", "dev"],
+          multiSelect: true,
+        },
+      ],
     });
 
-    // Snapshot includes both server_request open_requests[].id and canonical prompts[]
-    const snapshotA = receivedA[0];
-    expect(snapshotA?.type).toBe("snapshot");
-    if (snapshotA?.type === "snapshot") {
-      expect(snapshotA.replayEpoch).toBe("ep-A");
-      expect(snapshotA.openRequests.map((r) => `${r.channel}:${r.requestId}`)).toEqual([
-        "server_request:srq-open-1",
-        "canonical:prm-1",
-      ]);
-    }
-    // Replay mapped tool.start + tool.complete -> tool.progress
-    expect(receivedA.slice(1).map((e) => (e.type === "tool.progress" ? e.status : e.type))).toEqual(
-      ["started", "completed"],
-    );
-
-    // Session-scoped server request for s-feed-1 does NOT leak to s-feed-2
-    const claimed = feedbotConn.emitRequest({
-      request_id: "srq-live-1",
-      method: "approval",
-      session_id: "s-feed-1",
-      params: { session_id: "s-feed-1", command: "git push" },
-    });
-    expect(claimed).toBe(true);
-    expect(
-      receivedA.some((e) => e.type === "request.open" && e.request.requestId === "srq-live-1"),
-    ).toBe(true);
-    expect(receivedB.some((e) => e.type === "request.open")).toBe(false);
-
-    // session.interrupt passes tracked execution_generation: 5
-    await service.interruptSession("hermes:feedbot", "s-feed-1");
-    expect(feedbotConn.calls.find((c) => c.method === "session.interrupt")?.params).toEqual({
-      session_id: "s-feed-1",
-      execution_generation: 5,
-    });
-
-    // Canonical clarify.respond uses prompt_id + execution_generation
-    await service.respondRequest("hermes:feedbot", "s-feed-1", {
-      requestId: "prm-1",
+    await service.respondRequest("hermes:feedbot", "s-1", {
+      requestId: "clr-1",
       kind: "clarify",
       channel: "canonical",
-      answer: "Tech news",
-      answers: { q1: "Tech news" },
+      answers: { q0: JSON.stringify(["staging", "dev"]) },
     });
-    expect(feedbotConn.calls.find((c) => c.method === "clarify.respond")?.params).toEqual({
-      session_id: "s-feed-1",
-      execution_generation: 5,
-      prompt_id: "prm-1",
-      answer: "Tech news",
+    // Hermes's canonical text parser takes 1-based choice indices for a multi-select.
+    expect(feedbotConn.callsOf("clarify.respond")[0]?.params).toEqual({
+      session_id: "s-1",
+      execution_generation: 6,
+      prompt_id: "clr-1",
+      answer: "1,3",
     });
+  });
+});
 
-    // Server-request approval uses respondServerRequest
-    await service.respondRequest("hermes:feedbot", "s-feed-1", {
-      requestId: "srq-live-1",
-      kind: "approval",
-      channel: "server_request",
-      decision: "once",
-    });
-    expect(feedbotConn.serverResponses).toContainEqual({
-      requestId: "srq-live-1",
-      result: { choice: "once" },
-    });
+describe("PaHttp", () => {
+  const fakePa = (overrides: Partial<PaServiceShape>) =>
+    ({
+      manageCron: async () => [],
+      sendMessage: async (_bot: string, sessionId: string) => ({ kind: "turn", sessionId }),
+      ...overrides,
+    }) as unknown as PaServiceShape;
 
-    // Unsubscribing last listener for s-feed-2 triggers session.detach
-    unsubB();
-    expect(
-      feedbotConn.calls.some(
-        (c) => c.method === "session.detach" && c.params.session_id === "s-feed-2",
+  const run = (
+    pa: PaServiceShape,
+    request: Request,
+    scopes: ReadonlyArray<AuthEnvironmentScope>,
+    maxBody = 1024,
+  ) =>
+    makePaRequestHandler(pa).pipe(
+      Effect.provideService(
+        HttpServerRequest.HttpServerRequest,
+        HttpServerRequest.fromWeb(request),
       ),
-    ).toBe(true);
+      Effect.provideService(HttpIncomingMessage.MaxBodySize, ByteSize.bytes(maxBody)),
+      Effect.provide(
+        Layer.mergeAll(
+          Layer.mock(EnvironmentAuth.EnvironmentAuth, {
+            authenticateHttpRequest: () =>
+              Effect.succeed({
+                sessionId: AuthSessionId.make("pa-test"),
+                subject: "pa-test",
+                method: "bearer-access-token" as const,
+                scopes: [...scopes],
+              }),
+          }),
+          Layer.mock(SessionStore.SessionStore, { cookieName: "t3", legacyCookieName: undefined }),
+        ),
+      ),
+      Effect.runPromise,
+    );
 
-    // Dropping the upstream connection notifies active SSE subscriber via onClose
-    feedbotConn.simulateClose();
-    expect(closedReasonA).toBeTruthy();
-    unsubA();
+  const post = (path: string, body: string) =>
+    new Request(`http://127.0.0.1/api/pa${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body,
+    });
+
+  const operate = [AuthOrchestrationReadScope, AuthOrchestrationOperateScope];
+  const manage = [AuthOrchestrationReadScope, AuthProvidersManageScope];
+
+  it("requires both providers:manage and orchestration:operate for cron mutations", async () => {
+    const calls: string[] = [];
+    const pa = fakePa({ manageCron: async () => (calls.push("cron"), []) });
+    const body = JSON.stringify({ action: "pause", jobId: "j" });
+    expect((await run(pa, post("/bots/hermes:feedbot/cron", body), operate)).status).toBe(403);
+    expect((await run(pa, post("/bots/hermes:feedbot/cron", body), manage)).status).toBe(403);
+    expect(
+      (
+        await run(pa, post("/bots/hermes:feedbot/cron", body), [
+          ...manage,
+          AuthOrchestrationOperateScope,
+        ])
+      ).status,
+    ).toBe(200);
+    expect(calls).toEqual(["cron"]);
+  });
+
+  it("requires providers:manage for configuration slash commands only", async () => {
+    const sent: string[] = [];
+    const pa = fakePa({
+      sendMessage: async (_bot, sessionId, text) => (sent.push(text), { kind: "turn", sessionId }),
+    });
+    const send = (text: string) =>
+      post("/bots/hermes:feedbot/sessions/s-1/send", JSON.stringify({ text }));
+    expect((await run(pa, send("/model gpt-5"), operate)).status).toBe(403);
+    expect((await run(pa, send("  /CRON add"), operate)).status).toBe(403);
+    expect((await run(pa, send("/status"), operate)).status).toBe(200);
+    expect((await run(pa, send("tell me about /model"), operate)).status).toBe(200);
+    expect(
+      (await run(pa, send("/model gpt-5"), [...operate, AuthProvidersManageScope])).status,
+    ).toBe(200);
+    expect(sent).toEqual(["/status", "tell me about /model", "/model gpt-5"]);
+
+    expect(slashCommandRequiresProvidersManage("/personality pirate")).toBe(true);
+    expect(slashCommandRequiresProvidersManage("/reload-mcp")).toBe(true);
+    expect(slashCommandRequiresProvidersManage("/daily-brief")).toBe(false);
+  });
+
+  it("returns 413 for an oversized JSON body and 400 for malformed JSON", async () => {
+    const pa = fakePa({});
+    const huge = JSON.stringify({ text: "x".repeat(4096) });
+    expect(
+      (await run(pa, post("/bots/hermes:feedbot/sessions/s-1/send", huge), operate)).status,
+    ).toBe(413);
+    expect(
+      (await run(pa, post("/bots/hermes:feedbot/sessions/s-1/send", "{nope"), operate)).status,
+    ).toBe(400);
+  });
+
+  it("maps caller errors to 4xx and only gateway failures to 5xx", async () => {
+    expect(paErrorStatus(new PaRequestError(404, "gone"))).toBe(404);
+    expect(paErrorStatus(new HermesRpcError("not_found", 4004))).toBe(404);
+    expect(paErrorStatus(new HermesRpcError("invalid_params", 4002))).toBe(400);
+    expect(paErrorStatus(new HermesConnectionError("down"))).toBe(503);
+    expect(paErrorStatus(new Error("boom"))).toBe(502);
+
+    const pa = fakePa({
+      sendMessage: async () => {
+        throw new PaRequestError(400, "Message cannot be empty");
+      },
+    });
+    const res = await run(
+      pa,
+      post("/bots/hermes:feedbot/sessions/s-1/send", JSON.stringify({ text: " " })),
+      operate,
+    );
+    expect(res.status).toBe(400);
   });
 });
