@@ -391,6 +391,18 @@
       "types": "./src/state/shell.ts",
       "default": "./src/state/shell.ts"
     },
+    "./pa/environment": {
+      "types": "./src/pa/environment.ts",
+      "default": "./src/pa/environment.ts"
+    },
+    "./pa/slash": {
+      "types": "./src/pa/slash.ts",
+      "default": "./src/pa/slash.ts"
+    },
+    "./pa/timeline": {
+      "types": "./src/pa/timeline.ts",
+      "default": "./src/pa/timeline.ts"
+    },
     "./state/issue-trackers": {
       "types": "./src/state/issueTrackers.ts",
       "default": "./src/state/issueTrackers.ts"
