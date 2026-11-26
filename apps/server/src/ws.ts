@@ -267,6 +267,7 @@ import * as TraceDiagnostics from "./diagnostics/TraceDiagnostics.ts";
 import * as TriageService from "./triage/TriageService.ts";
 import * as PullRequestService from "./pullRequest/PullRequestService.ts";
 import * as IssueService from "./issue/IssueService.ts";
+import * as PaService from "./pa/PaService.ts";
 import * as ThreadIssueService from "./orchestration-v2/ThreadIssueService.ts";
 import * as IssueTrackerConnections from "./issue/IssueTrackerConnections.ts";
 import * as PullRequestReviewGuideService from "./pullRequest/PullRequestReviewGuideService.ts";
@@ -1515,6 +1516,7 @@ export const layerWsRpc = (
       const pullRequests = yield* PullRequestService.PullRequestService;
       const issues = yield* IssueService.IssueService;
       const threadIssues = yield* ThreadIssueService.ThreadIssueService;
+      const pa = yield* PaService.PaService;
       const issueTrackers = yield* IssueTrackerConnections.IssueTrackerConnections;
       const reviewGuides = yield* PullRequestReviewGuideService.PullRequestReviewGuideService;
       const pullRequestSync = yield* PullRequestSyncReactor.PullRequestSyncReactor;
@@ -2790,6 +2792,34 @@ export const layerWsRpc = (
         [WS_METHODS.serverGetStorageCleanupReport]: () => storageCleanup.reports,
         [WS_METHODS.serverGetDatabaseStorage]: () => databaseStorage.status,
         [WS_METHODS.serverReclaimDatabaseSpace]: () => databaseStorage.requestReclaim,
+        [WS_METHODS.paListBots]: () => pa.listBots(),
+        [WS_METHODS.paGetBotModels]: (input) => pa.getBotModels(input),
+        [WS_METHODS.paSelectBotModel]: (input) => pa.selectBotModel(input),
+        [WS_METHODS.paGetBotConfig]: ({ botId }) => pa.getBotConfig(botId),
+        [WS_METHODS.paPatchBotConfig]: (input) => pa.patchBotConfig(input),
+        [WS_METHODS.paUpdateBotMeta]: (input) => pa.updateBotMeta(input),
+        [WS_METHODS.paListSchedules]: ({ botId }) =>
+          pa.listSchedules(botId).pipe(Effect.map((schedules) => ({ schedules }))),
+        [WS_METHODS.paMutateSchedule]: (input) =>
+          pa.mutateSchedule(input).pipe(Effect.map((schedules) => ({ schedules }))),
+        [WS_METHODS.paCreateBot]: (input) => pa.createBot(input),
+        [WS_METHODS.paListCommands]: ({ botId }) =>
+          pa.listCommands(botId).pipe(Effect.map((commands) => ({ commands }))),
+        [WS_METHODS.paListSessions]: ({ botId }) => pa.listSessions(botId),
+        [WS_METHODS.paCreateSession]: (input) => pa.createSession(input),
+        [WS_METHODS.paGetMessages]: (input) =>
+          pa.getMessages(input).pipe(Effect.map((messages) => ({ messages }))),
+        [WS_METHODS.paSendMessage]: Effect.fnUntraced(function* (input) {
+          // The engine decides which of its commands change the agent; those need manage scope.
+          const scope = yield* pa.requiredScopeForMessage(input.botId, input.text);
+          if (scope === "manage" && !currentSession.scopes.includes(AuthProvidersManageScope)) {
+            return yield* rpcAuthorizationError(AuthProvidersManageScope);
+          }
+          return yield* pa.sendMessage(input);
+        }),
+        [WS_METHODS.paInterruptSession]: (input) => pa.interruptSession(input),
+        [WS_METHODS.paRespondRequest]: (input) => pa.respondRequest(input),
+        [WS_METHODS.paSubscribeSession]: (input) => pa.subscribeSession(input),
         [WS_METHODS.peerLinksList]: (_input) =>
           peerLinks.list.pipe(Effect.map((links) => ({ links }))),
         [WS_METHODS.peerLinksNames]: (_input) =>
@@ -3766,6 +3796,7 @@ export const layer = Layer.unwrap(
     const pullRequests = yield* PullRequestService.PullRequestService;
     const issues = yield* IssueService.IssueService;
     const threadIssues = yield* ThreadIssueService.ThreadIssueService;
+    const pa = yield* PaService.PaService;
     const issueTrackers = yield* IssueTrackerConnections.IssueTrackerConnections;
     const reviewGuides = yield* PullRequestReviewGuideService.PullRequestReviewGuideService;
     const peerLinks = yield* PeerLinks.PeerLinks;
@@ -3865,6 +3896,7 @@ export const layer = Layer.unwrap(
               // Share server-lifetime PR caches so WS mutations invalidate every client's HTTP diffs.
               Layer.provide(Layer.succeed(PullRequestService.PullRequestService, pullRequests)),
               Layer.provide(Layer.succeed(IssueService.IssueService, issues)),
+              Layer.provide(Layer.succeed(PaService.PaService, pa)),
               Layer.provide(Layer.succeed(ThreadIssueService.ThreadIssueService, threadIssues)),
               Layer.provide(
                 Layer.succeed(IssueTrackerConnections.IssueTrackerConnections, issueTrackers),

@@ -45,7 +45,7 @@ import {
 import { resolveLauncherPath } from "./cloud/pinnedRuntime.ts";
 import { fixPath } from "./os-jank.ts";
 import * as Ws from "./ws.ts";
-import * as PaHttp from "./pa/PaHttp.ts";
+import * as PaService from "./pa/PaService.ts";
 import * as AgentScopeLive from "./process/agentScope.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
 import * as ProcessLauncher from "./process/ProcessLauncher.ts";
@@ -915,7 +915,6 @@ const layerMakeRoutes = Layer.mergeAll(
     ServerBrowserStream.routeLayer,
     PreviewTunnel.routeLayer,
     ServerHttp.layerStaticAndDevRoute,
-    PaHttp.layer,
     Ws.layer,
     speechStreamRouteLayer,
   ),
@@ -936,6 +935,7 @@ const layerMakeRoutes = Layer.mergeAll(
   Layer.provide(RemoteDelegation.layer.pipe(Layer.provide(ProjectionStoreV2.layer))),
   // Links agents ask for: shown in a thread from /mcp, answered over WebSocket.
   Layer.provide(PeerLinkRequests.layer),
+  Layer.provide(PaService.layer),
   // Share the service so HTTP/WS clients single-flight reads and invalidate each other's cached patches.
   Layer.provide(layerPullRequestService),
   Layer.provide(layerThreadIssueService),

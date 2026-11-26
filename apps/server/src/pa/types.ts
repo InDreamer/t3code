@@ -1,385 +1,142 @@
-export type PaAdapterKind = "hermes" | "openclaw";
+import type {
+  PaBotConfig,
+  PaCapabilities,
+  PaConfigSectionValue,
+  PaCreateBotInput,
+  PaEngineDriverKind,
+  PaInstanceId,
+  PaMessage,
+  PaModelCatalog,
+  PaMutateScheduleInput,
+  PaRespondRequestInput,
+  PaSchedule,
+  PaSelectBotModelResult,
+  PaSendResult,
+  PaSessionSummary,
+  PaSlashCommand,
+  PaStreamEvent,
+} from "@t3tools/contracts";
 
-export type PaAvatarShape = "blob" | "pumpkin" | "cloud" | "drop" | "pill" | "circle";
-
-export interface PaAdapterCapabilities {
-  readonly create: boolean;
-  readonly cron: boolean;
-  readonly slash: boolean;
-  readonly skills: boolean;
-  readonly toolsets: boolean;
-}
-
-export interface PaAdapterStatus {
-  readonly kind: PaAdapterKind;
-  readonly label: string;
-  readonly available: boolean;
-  readonly online: boolean;
-  readonly version: string | null;
-  readonly botCount: number;
-  readonly error: string | null;
-  readonly capabilities: PaAdapterCapabilities;
-}
-
-export interface PaBotSummary {
-  readonly id: string;
-  readonly adapter: PaAdapterKind;
-  readonly profile: string;
-  readonly name: string;
+/** What an engine reports about one of its agents; `PaService` adds the T3-local metadata. */
+export interface PaAgentRow {
+  readonly agentRef: string;
+  readonly name: string | null;
   readonly description: string;
-  readonly avatarColor: string;
-  readonly avatarShape: PaAvatarShape;
-  readonly pinned: boolean;
   readonly isDefault: boolean;
   readonly model: string | null;
   readonly provider: string | null;
-  readonly skillCount: number;
-  readonly online: boolean;
   readonly running: boolean;
-  readonly unread: boolean;
+  readonly lastActivityAt: number | null;
   readonly lastMessagePreview: string | null;
-  readonly lastActivityAt: number | null;
-  readonly primarySessionId: string | null;
 }
 
-export interface PaSkillEntry {
-  readonly name: string;
-  readonly category?: string | undefined;
-  readonly enabled: boolean;
+export type PaAdapterSession = Omit<PaSessionSummary, "isPrimary">;
+
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
+
+/** A stream event before `PaService` stamps it with its resume token. */
+export type PaAdapterEvent = DistributiveOmit<PaStreamEvent, "resumeToken">;
+
+export interface PaSessionSubscriber {
+  readonly onEvent: (event: PaAdapterEvent) => void;
+  /** The upstream subscription ended; `reason` is set when it failed. */
+  readonly onClose: (reason?: string) => void;
 }
 
-export interface PaToolsetEntry {
-  readonly name: string;
-  readonly label?: string | undefined;
-  readonly description?: string | undefined;
-  readonly enabled: boolean;
+export interface PaSendOptions {
+  readonly inputId?: string | undefined;
 }
 
-export interface PaMcpServerEntry {
-  readonly name: string;
-  readonly enabled: boolean;
-}
+export type PaCommandScope = PaSlashCommand["requiredScope"];
 
-export interface PaCronJob {
-  readonly id: string;
-  readonly name: string;
-  readonly schedule: string;
-  readonly prompt: string;
-  readonly enabled: boolean;
-  readonly deliver?: string | undefined;
-  readonly nextRunAt?: string | undefined;
-  readonly lastRunAt?: string | undefined;
-  readonly lastStatus?: string | undefined;
-}
-
-export interface PaModelProviderOption {
-  readonly slug: string;
-  readonly name: string;
-  readonly isCurrent: boolean;
-  readonly models: ReadonlyArray<string>;
-}
-
-export interface PaBotDetail extends PaBotSummary {
-  readonly soul: string;
-  readonly skills: ReadonlyArray<PaSkillEntry>;
-  readonly toolsets: ReadonlyArray<PaToolsetEntry>;
-  readonly mcpServers: ReadonlyArray<PaMcpServerEntry>;
-  readonly cronJobs: ReadonlyArray<PaCronJob>;
-  readonly modelOptions: ReadonlyArray<PaModelProviderOption>;
-  readonly confirmRequired?: { readonly message: string } | undefined;
-}
-
-export interface PaSessionSummary {
-  readonly sessionId: string;
-  readonly title: string;
-  readonly source: string;
-  readonly model: string | null;
-  readonly messageCount: number;
-  readonly running: boolean;
-  readonly startedAt: number | null;
-  readonly lastActivityAt: number | null;
-  readonly isPrimaryWeb: boolean;
-}
-
-export interface PaMessage {
-  readonly id: string;
-  readonly role: "user" | "assistant" | "system" | "tool";
-  readonly text: string;
-  readonly reasoning?: string | undefined;
-  readonly toolName?: string | undefined;
-  readonly toolArgs?: Record<string, unknown> | undefined;
-  readonly timestamp: number | null;
-  readonly rowKind: "message" | "compaction";
-}
-
-export interface PaSlashCommand {
-  readonly name: string;
-  readonly description: string;
-  readonly category: string;
-}
-
-export interface PaPendingRequest {
-  readonly requestId: string;
-  readonly kind: "approval" | "clarify";
-  readonly channel: "canonical" | "server_request";
-  readonly executionGeneration?: number | undefined;
-  readonly title: string;
-  readonly detail: string;
-  readonly command?: string | undefined;
-  readonly options?: ReadonlyArray<{ readonly id: string; readonly label: string }> | undefined;
-  readonly questions?:
-    | ReadonlyArray<{
-        readonly id: string;
-        readonly prompt: string;
-        readonly options?: ReadonlyArray<string> | undefined;
-        readonly multiSelect?: boolean | undefined;
-      }>
-    | undefined;
-}
-
-export interface PaCreateBotInput {
-  readonly adapter: PaAdapterKind;
-  readonly profile: string;
-  readonly name?: string | undefined;
-  readonly description?: string | undefined;
-  readonly avatarColor?: string | undefined;
-  readonly avatarShape?: PaAvatarShape | undefined;
-  readonly pinned?: boolean | undefined;
-  readonly soul?: string | undefined;
-  readonly model?: string | undefined;
-  readonly provider?: string | undefined;
-}
-
-export interface PaUpdateBotInput {
-  readonly name?: string | undefined;
-  readonly description?: string | undefined;
-  readonly avatarColor?: string | undefined;
-  readonly avatarShape?: PaAvatarShape | undefined;
-  readonly pinned?: boolean | undefined;
-  readonly soul?: string | undefined;
-  readonly model?: string | undefined;
-  readonly provider?: string | undefined;
-  readonly confirmExpensiveModel?: boolean | undefined;
-  readonly disabledSkills?: ReadonlyArray<string> | undefined;
-  readonly enabledToolsets?: ReadonlyArray<string> | undefined;
-  readonly enabledMcpServers?: ReadonlyArray<string> | undefined;
-  readonly markRead?: boolean | undefined;
-}
-
-export interface PaCronMutationInput {
-  readonly action: "add" | "remove" | "pause" | "resume";
-  readonly jobId?: string | undefined;
-  readonly name?: string | undefined;
-  readonly schedule?: string | undefined;
-  readonly prompt?: string | undefined;
-  readonly deliver?: string | undefined;
-}
-
-export interface PaSendResult {
-  readonly kind: "turn" | "slash";
-  readonly sessionId: string;
-  readonly submissionId?: string | undefined;
-  readonly output?: string | undefined;
-  readonly notice?: string | undefined;
-  readonly directiveType?: string | undefined;
-}
-
-export interface PaRespondRequestInput {
-  readonly requestId: string;
-  readonly kind: "approval" | "clarify";
-  readonly channel?: "canonical" | "server_request" | undefined;
-  readonly executionGeneration?: number | undefined;
-  readonly decision?: "once" | "always" | "deny" | "session" | undefined;
-  readonly answer?: string | undefined;
-  readonly answers?: Record<string, string> | undefined;
-}
-
-export type PaStreamEvent =
-  | {
-      readonly type: "snapshot";
-      readonly sessionId: string;
-      readonly running: boolean;
-      readonly lastSeq: number;
-      readonly replayEpoch?: string | undefined;
-      readonly snapshotRequired?: boolean | undefined;
-      readonly openRequests: ReadonlyArray<PaPendingRequest>;
-    }
-  | {
-      readonly type: "message.start";
-      readonly sessionId: string;
-      readonly turnId?: string | undefined;
-      readonly seq?: number | undefined;
-      readonly replayEpoch?: string | undefined;
-    }
-  | {
-      readonly type: "message.delta";
-      readonly sessionId: string;
-      readonly text: string;
-      readonly turnId?: string | undefined;
-      readonly segment?: number | undefined;
-      readonly offset?: number | undefined;
-      readonly seq?: number | undefined;
-      readonly replayEpoch?: string | undefined;
-    }
-  | {
-      readonly type: "message.interim";
-      readonly sessionId: string;
-      readonly text: string;
-      readonly alreadyStreamed?: boolean | undefined;
-      readonly seq?: number | undefined;
-      readonly replayEpoch?: string | undefined;
-    }
-  | {
-      readonly type: "reasoning.delta";
-      readonly sessionId: string;
-      readonly text: string;
-      readonly seq?: number | undefined;
-      readonly replayEpoch?: string | undefined;
-    }
-  | {
-      readonly type: "tool.progress";
-      readonly sessionId: string;
-      readonly toolName: string;
-      readonly toolId?: string | undefined;
-      readonly status: "started" | "completed" | "failed" | "progress";
-      readonly preview?: string | undefined;
-      readonly seq?: number | undefined;
-      readonly replayEpoch?: string | undefined;
-    }
-  | {
-      readonly type: "message.complete";
-      readonly sessionId: string;
-      readonly text: string;
-      readonly reasoning?: string | undefined;
-      readonly status: "complete" | "error" | "interrupted";
-      readonly error?: string | undefined;
-      readonly seq?: number | undefined;
-      readonly replayEpoch?: string | undefined;
-    }
-  | {
-      readonly type: "request.open";
-      readonly sessionId: string;
-      readonly request: PaPendingRequest;
-    }
-  | {
-      readonly type: "request.cancel";
-      readonly sessionId: string;
-      readonly requestId: string;
-    }
-  | {
-      readonly type: "notice";
-      readonly sessionId: string;
-      readonly message: string;
-    }
-  | {
-      readonly type: "error";
-      readonly sessionId: string;
-      readonly message: string;
-    };
-
-export interface PaAdapter {
-  readonly kind: PaAdapterKind;
+/**
+ * One engine endpoint. The core every engine implements, plus optional facets that match the
+ * capabilities it declares; `PaService` reports `Unsupported` for a facet that is absent.
+ * Methods reject with `PaError` for caller mistakes and engine refusals.
+ */
+export interface PaEngineInstance {
+  readonly instanceId: PaInstanceId;
+  readonly driver: PaEngineDriverKind;
   readonly label: string;
-  readonly capabilities: PaAdapterCapabilities;
-  getStatus(): Promise<PaAdapterStatus>;
-  listBots(): Promise<ReadonlyArray<PaBotSummary>>;
-  getBotDetail(profile: string): Promise<PaBotDetail>;
-  createBot(input: PaCreateBotInput): Promise<PaBotSummary>;
-  /** Resolves null for a read-marker-only patch, which needs no Hermes round trip. */
-  updateBot(profile: string, patch: PaUpdateBotInput): Promise<PaBotDetail | null>;
-  manageCron(profile: string, input: PaCronMutationInput): Promise<ReadonlyArray<PaCronJob>>;
-  listSlashCommands(profile: string): Promise<ReadonlyArray<PaSlashCommand>>;
-  listSessions(profile: string): Promise<{
-    readonly primarySessionId: string | null;
-    readonly sessions: ReadonlyArray<PaSessionSummary>;
-  }>;
-  createSession(
-    profile: string,
-    options?: { readonly setPrimary?: boolean },
-  ): Promise<PaSessionSummary>;
-  getMessages(
-    profile: string,
+  readonly capabilities: PaCapabilities;
+  /** A cached engine version; never blocks on a probe. */
+  readonly version?: () => string | null;
+  readonly isValidAgentRef: (agentRef: string) => boolean;
+  readonly listAgents: () => Promise<ReadonlyArray<PaAgentRow>>;
+  readonly listSessions: (agentRef: string) => Promise<ReadonlyArray<PaAdapterSession>>;
+  readonly createSession: (
+    agentRef: string,
+    options: { readonly title?: string | undefined },
+  ) => Promise<PaAdapterSession>;
+  readonly getMessages: (
+    agentRef: string,
     sessionId: string,
-    limit?: number,
-  ): Promise<ReadonlyArray<PaMessage>>;
-  sendMessage(
-    profile: string,
+    limit: number,
+  ) => Promise<ReadonlyArray<PaMessage>>;
+  readonly sendMessage: (
+    agentRef: string,
     sessionId: string,
     text: string,
-    options?: { readonly inputId?: string | undefined },
-  ): Promise<PaSendResult>;
-  interruptSession(profile: string, sessionId: string): Promise<void>;
-  respondRequest(profile: string, sessionId: string, input: PaRespondRequestInput): Promise<void>;
-  subscribeSession(
-    profile: string,
+    options: PaSendOptions,
+  ) => Promise<PaSendResult>;
+  readonly interruptSession?: (agentRef: string, sessionId: string) => Promise<void>;
+  /**
+   * Opens the engine's live feed for a session and emits a `snapshot` first. `resume` asks the
+   * adapter to replay what it missed since its previous feed for this session ended.
+   */
+  readonly subscribeSession: (
+    agentRef: string,
     sessionId: string,
-    options: {
-      readonly sinceSeq?: number | undefined;
-      readonly replayEpoch?: string | undefined;
-      readonly onEvent: (event: PaStreamEvent) => void;
-      readonly onClose?: ((reason?: string) => void) | undefined;
-    },
-  ): Promise<() => void>;
-  dispose?: (() => void) | undefined;
-}
-
-/** A caller-side failure the HTTP layer reports with `status` instead of a gateway 502. */
-// @effect-diagnostics-next-line extendsNativeError:off -- thrown from the Promise-based adapters, mapped in PaHttp.
-export class PaRequestError extends Error {
-  readonly status: 400 | 403 | 404 | 409;
-  constructor(status: 400 | 403 | 404 | 409, message: string) {
-    super(message);
-    this.name = "PaRequestError";
-    this.status = status;
-  }
-}
-
-export interface PaSeqCursor {
-  epoch: string | undefined;
-  lastSeq: number;
-}
-
-/** Mutates `cursor`; false when `seq` was already delivered within the current replay epoch. */
-export function acceptPaSeq(
-  cursor: PaSeqCursor,
-  seq: number | undefined,
-  epoch: string | undefined,
-): boolean {
-  if (epoch !== undefined && epoch !== cursor.epoch) {
-    // Hermes restarts sequence numbering whenever it mints a new replay epoch.
-    cursor.epoch = epoch;
-    cursor.lastSeq = seq ?? 0;
-    return true;
-  }
-  if (seq === undefined || seq <= 0) return true;
-  if (seq <= cursor.lastSeq) return false;
-  cursor.lastSeq = seq;
-  return true;
-}
-
-const VALID_PROFILE_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
-const VALID_SESSION_ID_PATTERN = /^[^\s\p{Cc}]{1,200}$/u;
-
-export function isValidPaProfile(profile: string): boolean {
-  return VALID_PROFILE_PATTERN.test(profile);
-}
-
-export function isValidPaSessionId(sessionId: string): boolean {
-  return VALID_SESSION_ID_PATTERN.test(sessionId) && !sessionId.includes("..");
-}
-
-export function makePaBotId(adapter: PaAdapterKind, profile: string): string {
-  return `${adapter}:${profile}`;
-}
-
-export function parsePaBotId(
-  botId: string,
-): { readonly adapter: PaAdapterKind; readonly profile: string } | null {
-  const idx = botId.indexOf(":");
-  if (idx <= 0 || idx === botId.length - 1) return null;
-  const adapter = botId.slice(0, idx);
-  const profile = botId.slice(idx + 1);
-  if (adapter !== "hermes" && adapter !== "openclaw") return null;
-  if (!isValidPaProfile(profile)) return null;
-  return { adapter, profile };
+    subscriber: PaSessionSubscriber,
+    options: { readonly resume: boolean },
+  ) => Promise<() => void>;
+  readonly models?: {
+    readonly getCatalog: (agentRef: string, sessionId?: string) => Promise<PaModelCatalog>;
+    readonly select: (
+      agentRef: string,
+      input: {
+        readonly sessionId?: string | undefined;
+        readonly provider: string;
+        readonly model: string;
+        readonly confirm: boolean;
+      },
+    ) => Promise<PaSelectBotModelResult>;
+  };
+  readonly commands?: {
+    readonly list: (agentRef: string) => Promise<ReadonlyArray<PaSlashCommand>>;
+    /** Plain text is `operate`; an unknown command must be `manage`. */
+    readonly requiredScope: (text: string) => PaCommandScope;
+  };
+  readonly requests?: {
+    readonly respond: (
+      agentRef: string,
+      sessionId: string,
+      input: Omit<PaRespondRequestInput, "botId" | "sessionId">,
+    ) => Promise<void>;
+  };
+  readonly config?: {
+    readonly get: (agentRef: string) => Promise<PaBotConfig>;
+    readonly patch: (
+      agentRef: string,
+      sectionId: string,
+      value: PaConfigSectionValue,
+    ) => Promise<PaBotConfig>;
+  };
+  readonly schedules?: {
+    readonly list: (agentRef: string) => Promise<ReadonlyArray<PaSchedule>>;
+    readonly mutate: (
+      agentRef: string,
+      input: Omit<PaMutateScheduleInput, "botId">,
+    ) => Promise<ReadonlyArray<PaSchedule>>;
+  };
+  readonly lifecycle?: {
+    /** Creates the agent and resolves with the ref the engine gave it. */
+    readonly create: (
+      input: Omit<
+        PaCreateBotInput,
+        "instanceId" | "name" | "avatarColor" | "avatarShape" | "pinned"
+      >,
+    ) => Promise<{ readonly agentRef: string }>;
+  };
+  readonly dispose?: () => void;
 }

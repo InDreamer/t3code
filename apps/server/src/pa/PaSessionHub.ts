@@ -1,0 +1,247 @@
+// @effect-diagnostics nodeBuiltinImport:off
+import * as NodeCrypto from "node:crypto";
+
+import { PaError, type PaPendingRequest, type PaStreamEvent } from "@t3tools/contracts";
+
+import type { PaAdapterEvent, PaSessionSubscriber } from "./types.ts";
+
+export interface PaHubListener {
+  readonly onEvent: (event: PaStreamEvent) => void;
+  readonly onFail: (error: PaError) => void;
+}
+
+/** Opens the engine feed the hub fans out; `resume` after an upstream drop. */
+export type PaHubFeed = (
+  subscriber: PaSessionSubscriber,
+  options: { readonly resume: boolean },
+) => Promise<() => void>;
+
+export interface PaHubTimers {
+  readonly set: (run: () => void, ms: number) => unknown;
+  readonly clear: (handle: unknown) => void;
+}
+
+export interface PaHubOptions {
+  /** Events kept for clients that reconnect with a resume token. */
+  readonly capacity: number;
+  /** How long a hub with no listeners keeps its feed and buffer for a reconnecting client. */
+  readonly lingerMs: number;
+  /** Delays between attempts to reopen a dropped upstream feed before giving up. */
+  readonly reconnectDelaysMs: ReadonlyArray<number>;
+  readonly timers: PaHubTimers;
+}
+
+export const DEFAULT_PA_HUB_OPTIONS: PaHubOptions = {
+  capacity: 2_000,
+  lingerMs: 60_000,
+  reconnectDelaysMs: [500, 2_000, 5_000],
+  timers: {
+    // @effect-diagnostics globalTimers:off
+    set: (run, ms) => setTimeout(run, ms),
+    clear: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+  },
+};
+
+interface BufferedEvent {
+  readonly seq: number;
+  readonly event: PaStreamEvent;
+}
+
+/**
+ * One engine feed per active session, shared by every client watching it. Each event gets a
+ * monotonic resume token `<epoch>:<seq>`; a client that reconnects with a token still inside
+ * the buffer gets exactly what it missed, any other token gets `snapshotRequired`.
+ */
+export class PaSessionHub {
+  private readonly sessionId: string;
+  private readonly feed: PaHubFeed;
+  private readonly options: PaHubOptions;
+  private readonly onDispose: () => void;
+  private readonly epoch = NodeCrypto.randomUUID().slice(0, 8);
+  private seq = 0;
+  private readonly buffer: BufferedEvent[] = [];
+  private readonly listeners = new Set<PaHubListener>();
+  private running = false;
+  private openRequests: ReadonlyArray<PaPendingRequest> = [];
+  private release: (() => void) | null = null;
+  private lingerTimer: unknown = null;
+  private disposed = false;
+  private readonly ready: Promise<void>;
+
+  constructor(sessionId: string, feed: PaHubFeed, options: PaHubOptions, onDispose: () => void) {
+    this.sessionId = sessionId;
+    this.feed = feed;
+    this.options = options;
+    this.onDispose = onDispose;
+    this.ready = this.open(false).then(
+      () => undefined,
+      (cause: unknown) => {
+        this.dispose();
+        throw cause;
+      },
+    );
+  }
+
+  private token(seq: number): string {
+    return `${this.epoch}:${seq}`;
+  }
+
+  private async open(resume: boolean): Promise<void> {
+    let initial = !resume;
+    let current: (() => void) | null = null;
+    let closedEarly = false;
+    const release = await this.feed(
+      {
+        onEvent: (event) => {
+          if (this.disposed) return;
+          if (initial && event.type === "snapshot") {
+            initial = false;
+            this.running = event.running;
+            this.openRequests = event.openRequests;
+            return;
+          }
+          this.publish(event);
+        },
+        onClose: (reason) => {
+          // A feed may end while it is still bootstrapping, before it has handed back `release`.
+          if (current === null) closedEarly = true;
+          else if (this.release === current) this.release = null;
+          if (!this.disposed) void this.reconnect(reason);
+        },
+      },
+      { resume },
+    );
+    current = release;
+    if (this.disposed) {
+      release();
+      return;
+    }
+    if (!closedEarly) this.release = release;
+  }
+
+  private async reconnect(reason: string | undefined): Promise<void> {
+    for (const delay of this.options.reconnectDelaysMs) {
+      if (this.disposed) return;
+      await new Promise<void>((resolve) => this.options.timers.set(resolve, delay));
+      if (this.disposed) return;
+      try {
+        await this.open(true);
+        return;
+      } catch {
+        // Retried below; the last failure ends every listener.
+      }
+    }
+    this.failAll(
+      new PaError({
+        reason: "Unavailable",
+        message: reason ?? "The agent's session feed closed",
+      }),
+    );
+  }
+
+  private publish(event: PaAdapterEvent): void {
+    this.seq += 1;
+    const stamped = { ...event, resumeToken: this.token(this.seq) } as PaStreamEvent;
+    this.buffer.push({ seq: this.seq, event: stamped });
+    if (this.buffer.length > this.options.capacity) this.buffer.shift();
+    switch (stamped.type) {
+      case "snapshot":
+        this.running = stamped.running;
+        this.openRequests = stamped.openRequests;
+        break;
+      case "turn.started":
+        this.running = true;
+        break;
+      case "turn.completed":
+      case "error":
+        this.running = false;
+        break;
+      case "request.opened":
+        this.openRequests = [
+          ...this.openRequests.filter((r) => r.requestId !== stamped.request.requestId),
+          stamped.request,
+        ];
+        break;
+      case "request.resolved":
+        this.openRequests = this.openRequests.filter((r) => r.requestId !== stamped.requestId);
+        break;
+      default:
+        break;
+    }
+    for (const listener of this.listeners) listener.onEvent(stamped);
+  }
+
+  /** For output the engine never streams or stores, such as a command's immediate result. */
+  publishNotice(message: string, inputId: string | undefined): void {
+    if (this.disposed) return;
+    this.publish({
+      type: "notice",
+      sessionId: this.sessionId,
+      message,
+      persistent: true,
+      ...(inputId ? { inputId } : {}),
+    });
+  }
+
+  private replayAfter(resumeToken: string | undefined): ReadonlyArray<PaStreamEvent> | null {
+    if (resumeToken === undefined) return null;
+    const separator = resumeToken.lastIndexOf(":");
+    if (separator <= 0 || resumeToken.slice(0, separator) !== this.epoch) return null;
+    const seq = Number(resumeToken.slice(separator + 1));
+    const oldest = this.buffer[0]?.seq ?? this.seq + 1;
+    if (!Number.isInteger(seq) || seq > this.seq || seq < oldest - 1) return null;
+    return this.buffer.filter((entry) => entry.seq > seq).map((entry) => entry.event);
+  }
+
+  async attach(listener: PaHubListener, resumeToken?: string): Promise<() => void> {
+    await this.ready;
+    if (this.disposed) {
+      throw new PaError({ reason: "Unavailable", message: "The session feed closed" });
+    }
+    if (this.lingerTimer !== null) {
+      this.options.timers.clear(this.lingerTimer);
+      this.lingerTimer = null;
+    }
+    const replay = this.replayAfter(resumeToken);
+    listener.onEvent({
+      type: "snapshot",
+      sessionId: this.sessionId,
+      resumeToken:
+        replay !== null && resumeToken !== undefined ? resumeToken : this.token(this.seq),
+      running: this.running,
+      openRequests: this.openRequests,
+      snapshotRequired: resumeToken !== undefined && replay === null,
+    });
+    for (const event of replay ?? []) listener.onEvent(event);
+    this.listeners.add(listener);
+    let detached = false;
+    return () => {
+      if (detached) return;
+      detached = true;
+      this.listeners.delete(listener);
+      if (this.listeners.size === 0 && !this.disposed) {
+        this.lingerTimer = this.options.timers.set(() => this.dispose(), this.options.lingerMs);
+      }
+    };
+  }
+
+  get listenerCount(): number {
+    return this.listeners.size;
+  }
+
+  private failAll(error: PaError): void {
+    const listeners = Array.from(this.listeners);
+    this.dispose();
+    for (const listener of listeners) listener.onFail(error);
+  }
+
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    if (this.lingerTimer !== null) this.options.timers.clear(this.lingerTimer);
+    this.listeners.clear();
+    this.release?.();
+    this.release = null;
+    this.onDispose();
+  }
+}

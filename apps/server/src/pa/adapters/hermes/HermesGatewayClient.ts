@@ -2,9 +2,13 @@
 import * as NodeChildProcess from "node:child_process";
 import * as NodeUtil from "node:util";
 
-import { isValidPaProfile } from "./types.ts";
-
 const execFileAsync = NodeUtil.promisify(NodeChildProcess.execFile);
+const HERMES_PROFILE_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
+
+/** Hermes profile names are CLI arguments too, so nothing flag-like or path-like gets through. */
+export function isValidHermesProfile(profile: string): boolean {
+  return HERMES_PROFILE_PATTERN.test(profile);
+}
 const textDecoder = new TextDecoder();
 
 export interface HermesAttachResult {
@@ -38,18 +42,21 @@ export interface HermesServerRequestFrame {
 }
 
 /** A JSON-RPC error answered by the Hermes gateway (as opposed to a transport failure). */
-// @effect-diagnostics-next-line extendsNativeError:off -- rejected from plain Promises, mapped to HTTP status in PaHttp.
+// @effect-diagnostics-next-line extendsNativeError:off -- rejected from plain Promises, mapped to PaError in HermesErrors.
 export class HermesRpcError extends Error {
   readonly code: number | string | undefined;
-  constructor(message: string, code: number | string | undefined) {
+  /** Hermes refusals carry a human hint in `error.data.detail` (e.g. `REFUSAL_HINTS`). */
+  readonly detail: string | undefined;
+  constructor(message: string, code: number | string | undefined, detail?: string | undefined) {
     super(message);
     this.name = "HermesRpcError";
     this.code = code;
+    this.detail = detail;
   }
 }
 
 /** The gateway could not be reached or the socket dropped. */
-// @effect-diagnostics-next-line extendsNativeError:off -- rejected from plain Promises, mapped to HTTP 503 in PaHttp.
+// @effect-diagnostics-next-line extendsNativeError:off -- rejected from plain Promises, mapped to PaError in HermesErrors.
 export class HermesConnectionError extends Error {
   constructor(message: string) {
     super(message);
@@ -97,7 +104,7 @@ export type ParsedHermesWireFrame =
       readonly kind: "response";
       readonly id: string;
       readonly result: unknown;
-      readonly error?: { code?: unknown; message?: unknown } | undefined;
+      readonly error?: { code?: unknown; message?: unknown; data?: unknown } | undefined;
     }
   | { readonly kind: "event"; readonly frame: HermesRpcEventFrame }
   | { readonly kind: "server_request"; readonly frame: HermesServerRequestFrame }
@@ -173,7 +180,7 @@ export function parseHermesGatewayFrame(frame: Record<string, unknown>): ParsedH
       result: frame.result,
       error:
         frame.error && typeof frame.error === "object"
-          ? (frame.error as { code?: unknown; message?: unknown })
+          ? (frame.error as { code?: unknown; message?: unknown; data?: unknown })
           : undefined,
     };
   }
@@ -227,7 +234,7 @@ export function hermesAttachArgs(profile: string): ReadonlyArray<string> {
 }
 
 async function defaultHermesAttach(profile: string): Promise<HermesAttachResult> {
-  if (!isValidPaProfile(profile)) {
+  if (!isValidHermesProfile(profile)) {
     throw new Error(`Invalid Hermes profile name "${profile}"`);
   }
   const args = [...hermesAttachArgs(profile)];
@@ -348,10 +355,18 @@ export class LiveHermesRpcConnection implements HermesRpcConnection {
             ? decoded.error.message
             : `Hermes RPC error (${String(decoded.error.code ?? "unknown")})`;
         const code = decoded.error.code;
+        const data = decoded.error.data;
+        const detail =
+          data &&
+          typeof data === "object" &&
+          typeof (data as { detail?: unknown }).detail === "string"
+            ? (data as { detail: string }).detail
+            : undefined;
         entry.reject(
           new HermesRpcError(
             message,
             typeof code === "number" || typeof code === "string" ? code : undefined,
+            detail,
           ),
         );
       } else {

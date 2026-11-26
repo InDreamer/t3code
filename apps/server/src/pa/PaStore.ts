@@ -5,7 +5,7 @@ import * as NodeFS from "node:fs";
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodePath from "node:path";
 
-import type { PaAvatarShape } from "./types.ts";
+import type { PaAvatarShape } from "@t3tools/contracts";
 
 export interface PaBotLocalMeta {
   readonly displayName?: string | undefined;

@@ -5,6 +5,7 @@ import {
   AuthProvidersManageScope,
   AuthSettingsWriteScope,
   AuthAccessWriteScope,
+  clientRpcRequiredScopes,
   DEFAULT_SERVER_SETTINGS,
   EnvironmentId,
   ProviderDriverKind,
@@ -99,6 +100,37 @@ describe("RPC authorization scopes", () => {
 
   it("still lets readers load settings the way installed Swift clients ask", () => {
     expect(requiredScopeForRpcMethod("server.getSettings")).toBe(AuthOrchestrationReadScope);
+  });
+
+  it("lets readers watch personal agents and keeps their configuration behind providers manage", () => {
+    for (const method of [
+      WS_METHODS.paListBots,
+      WS_METHODS.paGetMessages,
+      WS_METHODS.paListCommands,
+      WS_METHODS.paSubscribeSession,
+    ]) {
+      expect(requiredScopeForRpcMethod(method)).toBe(AuthOrchestrationReadScope);
+    }
+    for (const method of [
+      WS_METHODS.paSendMessage,
+      WS_METHODS.paRespondRequest,
+      WS_METHODS.paInterruptSession,
+    ]) {
+      expect(requiredScopeForRpcMethod(method)).toBe(AuthOrchestrationOperateScope);
+    }
+    for (const method of [
+      WS_METHODS.paCreateBot,
+      WS_METHODS.paSelectBotModel,
+      WS_METHODS.paPatchBotConfig,
+    ]) {
+      expect(requiredScopeForRpcMethod(method)).toBe(AuthProvidersManageScope);
+    }
+    expect(
+      clientRpcRequiredScopes(WS_METHODS.paMutateSchedule, {
+        botId: "hermes:default",
+        action: "pause",
+      }),
+    ).toEqual([AuthProvidersManageScope, AuthOrchestrationOperateScope]);
   });
 
   it("rejects unknown RPC method names", () => {
