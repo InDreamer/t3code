@@ -891,13 +891,112 @@ describe("HermesPaAdapter prompts", () => {
       channel: "canonical",
       answers: { q0: JSON.stringify(["staging", "dev"]) },
     });
-    // Hermes's canonical text parser takes 1-based choice indices for a multi-select.
+    // Hermes `clarify_tool.py._clean_answer` parses multi-select JSON arrays verbatim.
     expect(feedbotConn.callsOf("clarify.respond")[0]?.params).toEqual({
       session_id: "s-1",
       execution_generation: 6,
       prompt_id: "clr-1",
-      answer: "1,3",
+      answer: JSON.stringify(["staging", "dev"]),
     });
+  });
+
+  it("preserves locked answers on resumed batch clarify and prunes stale requests on snapshot", async () => {
+    const feedbotConn = makeFeedbotConn();
+    feedbotConn.onMethod("session.resume", () => ({
+      session_id: "s-1",
+      running: true,
+      last_sequence: 5,
+      replay_epoch: "ep-A",
+      execution_generation: 2,
+      subscription_id: "sub-locked",
+      open_requests: [
+        {
+          id: "srq-batch",
+          method: "clarify",
+          params: {
+            questions: [
+              { qid: "q0", question: "Env?", choices: ["prod", "staging"] },
+              { qid: "q1", question: "Speed?", choices: ["fast", "safe"] },
+            ],
+            answers: { q0: "prod" },
+          },
+        },
+      ],
+    }));
+    const { service } = makeAdapter({ feedbot: feedbotConn });
+    const unsub1 = await service.subscribeSession("hermes:feedbot", "s-1", { onEvent: () => {} });
+
+    // Only answer q1: q0 is omitted so Hermes keeps the locked "prod" answer.
+    await service.respondRequest("hermes:feedbot", "s-1", {
+      requestId: "srq-batch",
+      kind: "clarify",
+      channel: "server_request",
+      answers: { q0: "", q1: "fast" },
+    });
+    expect(feedbotConn.serverResponses).toContainEqual({
+      requestId: "srq-batch",
+      result: { answers: { q1: "fast" } },
+    });
+
+    // A fresh snapshot with no open_requests prunes any previously tracked request.
+    feedbotConn.emitRequest({
+      request_id: "srq-stale",
+      method: "approval",
+      session_id: "s-1",
+      params: { command: "ls" },
+    });
+    feedbotConn.onMethod("session.resume", () => ({
+      session_id: "s-1",
+      running: false,
+      last_sequence: 6,
+      replay_epoch: "ep-A",
+      execution_generation: 2,
+      subscription_id: "sub-locked",
+      open_requests: [],
+    }));
+    const unsub2 = await service.subscribeSession("hermes:feedbot", "s-1", { onEvent: () => {} });
+    await expect(
+      service.respondRequest("hermes:feedbot", "s-1", {
+        requestId: "srq-stale",
+        kind: "approval",
+        channel: "server_request",
+        decision: "once",
+      }),
+    ).rejects.toBeInstanceOf(PaRequestError);
+    unsub1();
+    unsub2();
+  });
+
+  it("keeps a shared subscription attached until the last redirected/canonical tab closes", async () => {
+    const feedbotConn = makeFeedbotConn();
+    feedbotConn.onMethod("session.resume", () => ({
+      session_id: "canon-root",
+      running: false,
+      last_sequence: 10,
+      replay_epoch: "ep-A",
+      execution_generation: 3,
+      subscription_id: "sub-shared",
+    }));
+    const { service } = makeAdapter({ feedbot: feedbotConn });
+    const unsubOld = await service.subscribeSession("hermes:feedbot", "legacy-id", {
+      onEvent: () => {},
+    });
+    const unsubCanon = await service.subscribeSession("hermes:feedbot", "canon-root", {
+      onEvent: () => {},
+    });
+
+    // Closing the redirected tab must NOT detach while the canonical tab shares sub-shared.
+    unsubOld();
+    expect(feedbotConn.callsOf("session.detach")).toHaveLength(0);
+
+    // Closing the final tab detaches once.
+    unsubCanon();
+    expect(feedbotConn.callsOf("session.detach")).toEqual([
+      {
+        method: "session.detach",
+        params: { session_id: "canon-root", subscription_id: "sub-shared" },
+      },
+    ]);
   });
 });
 
@@ -965,7 +1064,7 @@ describe("PaHttp", () => {
     expect(calls).toEqual(["cron"]);
   });
 
-  it("requires providers:manage for configuration slash commands only", async () => {
+  it("requires providers:manage for non-allowlisted slash commands including multi-slash and aliases", async () => {
     const sent: string[] = [];
     const pa = fakePa({
       sendMessage: async (_bot, sessionId, text) => (sent.push(text), { kind: "turn", sessionId }),
@@ -974,16 +1073,36 @@ describe("PaHttp", () => {
       post("/bots/hermes:feedbot/sessions/s-1/send", JSON.stringify({ text }));
     expect((await run(pa, send("/model gpt-5"), operate)).status).toBe(403);
     expect((await run(pa, send("  /CRON add"), operate)).status).toBe(403);
+    expect((await run(pa, send("//config set model.default x"), operate)).status).toBe(403);
+    expect((await run(pa, send("//yolo"), operate)).status).toBe(403);
+    expect((await run(pa, send("/config\x1fset x"), operate)).status).toBe(403);
+    expect((await run(pa, send("/my-profile-alias"), operate)).status).toBe(403);
+    expect((await run(pa, send("/heartbeat every 5m check"), operate)).status).toBe(403);
     expect((await run(pa, send("/status"), operate)).status).toBe(200);
+    expect((await run(pa, send("//status"), operate)).status).toBe(200);
     expect((await run(pa, send("tell me about /model"), operate)).status).toBe(200);
     expect(
       (await run(pa, send("/model gpt-5"), [...operate, AuthProvidersManageScope])).status,
     ).toBe(200);
-    expect(sent).toEqual(["/status", "tell me about /model", "/model gpt-5"]);
+    expect(sent).toEqual(["/status", "//status", "tell me about /model", "/model gpt-5"]);
 
     expect(slashCommandRequiresProvidersManage("/personality pirate")).toBe(true);
     expect(slashCommandRequiresProvidersManage("/reload-mcp")).toBe(true);
-    expect(slashCommandRequiresProvidersManage("/daily-brief")).toBe(false);
+    expect(slashCommandRequiresProvidersManage("///")).toBe(true);
+    expect(slashCommandRequiresProvidersManage("/compact")).toBe(false);
+  });
+
+  it("returns real HTTP 404 when SSE subscribeSession fails with not_found", async () => {
+    const pa = fakePa({
+      subscribeSession: async () => {
+        throw new HermesRpcError("session not_found", 4004);
+      },
+    });
+    const req = new Request("http://127.0.0.1/api/pa/bots/hermes:feedbot/sessions/s-gone/events", {
+      method: "GET",
+    });
+    const res = await run(pa, req, operate);
+    expect(res.status).toBe(404);
   });
 
   it("returns 413 for an oversized JSON body and 400 for malformed JSON", async () => {
@@ -1000,6 +1119,8 @@ describe("PaHttp", () => {
   it("maps caller errors to 4xx and only gateway failures to 5xx", async () => {
     expect(paErrorStatus(new PaRequestError(404, "gone"))).toBe(404);
     expect(paErrorStatus(new HermesRpcError("not_found", 4004))).toBe(404);
+    expect(paErrorStatus(new HermesRpcError("profile 'ghost' not found", 5063))).toBe(404);
+    expect(paErrorStatus(new HermesRpcError("Profile already exists", 4062))).toBe(409);
     expect(paErrorStatus(new HermesRpcError("invalid_params", 4002))).toBe(400);
     expect(paErrorStatus(new HermesConnectionError("down"))).toBe(503);
     expect(paErrorStatus(new Error("boom"))).toBe(502);

@@ -173,6 +173,10 @@ function BotSettingsBody({
       setSavedNotice(gt("没有需要保存的修改"));
       return;
     }
+    if (modelChanged && !nextModel) {
+      setError(gt("请先选择或输入模型名称"));
+      return;
+    }
     if (modelChanged && nextModel && !nextProvider) {
       setError(gt("请先选择模型服务商"));
       return;
@@ -258,7 +262,7 @@ function BotSettingsBody({
 
   return (
     <>
-      <div className="border-b border-border/60">
+      <div className="border-b border-border/60" style={{ paddingTop: "env(safe-area-inset-top)" }}>
         <SheetHeader>
           <div className="flex items-center gap-3 pr-8">
             <BotAvatar color={avatarColor} shape={avatarShape} size="sm" starred={pinned} />
@@ -744,7 +748,10 @@ function BotSettingsBody({
       </ScrollArea>
 
       {tab !== "cron" ? (
-        <div className="flex items-center justify-end gap-2 border-t border-border/60 px-5 py-3">
+        <div
+          className="flex items-center justify-end gap-2 border-t border-border/60 px-5 py-3"
+          style={{ paddingBottom: "max(0.75rem, env(safe-area-inset-bottom))" }}
+        >
           <Button type="button" variant="outline" size="sm" onClick={onClose}>
             <T>关闭</T>
           </Button>

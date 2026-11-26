@@ -109,7 +109,8 @@ export function paErrorStatus(cause: unknown): number {
   if (cause instanceof PaRequestError) return cause.status;
   if (cause instanceof HermesConnectionError) return 503;
   if (cause instanceof HermesRpcError) {
-    if (/\bnot_found\b/i.test(cause.message)) return 404;
+    if (cause.code === 4062) return 409;
+    if (/\bnot[\s_]found\b/i.test(cause.message)) return 404;
     if (/\b(invalid_params|invalid_selection)\b/i.test(cause.message)) return 400;
     if (/\bpermission_denied\b/i.test(cause.message)) return 403;
   }
@@ -126,82 +127,65 @@ const tryPa = <A>(thunk: () => Promise<A>) =>
       }),
   });
 
-// Hermes slash commands (and aliases, hermes_cli/commands.py) that persist profile configuration,
-// credentials, schedules, skills, or tools. Hermes resolves names exactly, case-insensitively.
-const CONFIG_SLASH_COMMANDS: ReadonlySet<string> = new Set([
-  "export",
-  "import",
-  "config",
-  "model",
-  "codex-runtime",
-  "codex_runtime",
-  "personality",
-  "statusbar",
-  "sb",
-  "battery",
-  "timestamps",
-  "ts",
-  "verbose",
-  "focus",
-  "footer",
-  "yolo",
-  "approvals",
-  "reasoning",
-  "fast",
-  "skin",
-  "indicator",
-  "voice",
-  "wake",
-  "busy",
-  "autoprune",
-  "tools",
-  "toolsets",
-  "skills",
-  "memory",
-  "bundles",
-  "pet",
-  "hatch",
-  "generate-pet",
-  "learn",
-  "init",
-  "cron",
-  "suggestions",
-  "suggest",
-  "blueprint",
-  "bp",
-  "curator",
-  "kanban",
-  "reload",
-  "reload-mcp",
-  "reload_mcp",
-  "reload-skills",
-  "reload_skills",
-  "browser",
-  "plugins",
+// Built-in Hermes commands that are read-only or session-local: Hermes never expands profile
+// `quick_commands` aliases/execs for built-ins (`resolve_command(name) is not None`).
+// Every other slash command requires `providers:manage`.
+const SAFE_OPERATE_SLASH_COMMANDS: ReadonlySet<string> = new Set([
+  "help",
+  "commands",
+  "status",
+  "context",
+  "ctx",
+  "whoami",
   "profile",
-  "sethome",
-  "set-home",
-  "login",
-  "subscription",
-  "upgrade",
-  "topup",
-  "platforms",
-  "gateway",
-  "platform",
-  "update",
-  "restart",
-  "worktree",
-  "rollback",
-  "debug",
-  "mcp",
-  "provider",
+  "version",
+  "v",
+  "insights",
+  "diff",
+  "egress",
+  "agents",
+  "tasks",
+  "history",
+  "sessions",
+  "resume",
+  "new",
+  "reset",
+  "clear",
+  "title",
+  "compress",
+  "compact",
+  "retry",
+  "undo",
+  "branch",
+  "fork",
+  "stop",
+  "discard",
+  "queue",
+  "q",
+  "steer",
+  "s",
+  "btw",
+  "bg",
+  "plan",
+  "review",
+  "goal",
+  "subgoal",
+  "moa",
+  "approve",
+  "deny",
 ]);
 
+// Match Python's `str.strip()` / `str.split(None, 1)` whitespace (adds ASCII FS..US and NEL).
+const PYTHON_EDGE_WS = /^[\s\x1c-\x1f\x85]+|[\s\x1c-\x1f\x85]+$/g;
+const PYTHON_WS = /[\s\x1c-\x1f\x85]+/;
+
 export function slashCommandRequiresProvidersManage(text: string): boolean {
-  const trimmed = text.trim();
+  const trimmed = text.replace(PYTHON_EDGE_WS, "");
   if (!trimmed.startsWith("/")) return false;
-  const name = trimmed.slice(1).split(/\s/, 1)[0]!.toLowerCase();
-  return CONFIG_SLASH_COMMANDS.has(name);
+  const stripped = trimmed.replace(/^\/+/, "");
+  if (!stripped) return true;
+  const name = stripped.split(PYTHON_WS, 1)[0]!.toLowerCase();
+  return !SAFE_OPERATE_SLASH_COMMANDS.has(name);
 }
 
 const authenticatePaRoute = Effect.fnUntraced(function* (
@@ -412,7 +396,7 @@ export const makePaRequestHandler = Effect.fn("makePaRequestHandler")(
 
         if (method === "GET" && action === "messages") {
           yield* authenticatePaRoute(AuthOrchestrationReadScope);
-          const limitParam = Number(url.searchParams.get("limit") ?? "120");
+          const limitParam = Math.trunc(Number(url.searchParams.get("limit") ?? "120"));
           const limit =
             Number.isFinite(limitParam) && limitParam > 0 ? Math.min(limitParam, 500) : 120;
           return yield* respondPaJson(
@@ -476,58 +460,95 @@ export const makePaRequestHandler = Effect.fn("makePaRequestHandler")(
               : undefined;
           const replayEpoch = url.searchParams.get("replayEpoch") ?? undefined;
 
-          const rawStream = Stream.callback<PaStreamEvent>(
-            (queue) =>
-              Effect.acquireRelease(
-                tryPa(() =>
-                  pa.subscribeSession(botId, sessionId, {
-                    sinceSeq,
-                    replayEpoch,
-                    onEvent: (event) => {
-                      // A slow reader must not silently lose frames: end the stream instead, and
-                      // the browser's reconnect replays from its last delivered seq.
-                      if (!Queue.offerUnsafe(queue, event)) {
+          type EventQueue = Parameters<Parameters<typeof Stream.callback<PaStreamEvent>>[0]>[0];
+          let liveQueue: EventQueue | null = null;
+          let endedEarly = false;
+          let closeReason: string | undefined;
+          const buffered: PaStreamEvent[] = [];
+
+          const offerOrEnd = (queue: EventQueue, event: PaStreamEvent) => {
+            // A slow reader must not silently lose frames: end the stream instead, and the
+            // browser's reconnect replays from its last delivered seq.
+            if (!Queue.offerUnsafe(queue, event)) {
+              Queue.endUnsafe(queue);
+            }
+          };
+
+          // Subscribe before sending HTTP 200 so terminal errors (e.g. 404 on a deleted session)
+          // return their real HTTP status and stop browser reconnect loops.
+          return yield* tryPa(() =>
+            pa.subscribeSession(botId, sessionId, {
+              sinceSeq,
+              replayEpoch,
+              onEvent: (event) => {
+                if (liveQueue) {
+                  offerOrEnd(liveQueue, event);
+                } else if (!endedEarly) {
+                  buffered.push(event);
+                }
+              },
+              onClose: (reason) => {
+                if (liveQueue) {
+                  if (reason !== undefined) {
+                    Queue.offerUnsafe(liveQueue, { type: "error", sessionId, message: reason });
+                  }
+                  Queue.endUnsafe(liveQueue);
+                } else {
+                  endedEarly = true;
+                  closeReason = reason;
+                }
+              },
+            }),
+          ).pipe(
+            Effect.map((unsubscribe) => {
+              const rawStream = Stream.callback<PaStreamEvent>(
+                (queue) =>
+                  Effect.acquireRelease(
+                    Effect.sync(() => {
+                      liveQueue = queue;
+                      for (const event of buffered.splice(0)) {
+                        offerOrEnd(queue, event);
+                      }
+                      if (endedEarly) {
+                        if (closeReason !== undefined) {
+                          Queue.offerUnsafe(queue, {
+                            type: "error",
+                            sessionId,
+                            message: closeReason,
+                          });
+                        }
                         Queue.endUnsafe(queue);
                       }
-                    },
-                    onClose: (reason) => {
-                      if (reason !== undefined) {
-                        Queue.offerUnsafe(queue, { type: "error", sessionId, message: reason });
-                      }
-                      Queue.endUnsafe(queue);
-                    },
-                  }),
-                ).pipe(
-                  Effect.catchTags({
-                    PaRouteError: (err) => {
-                      Queue.offerUnsafe(queue, {
-                        type: "error",
-                        sessionId,
-                        message: err.message,
-                      });
-                      Queue.endUnsafe(queue);
-                      return Effect.succeed(() => undefined);
-                    },
-                  }),
-                ),
-                (unsubscribe) => Effect.sync(() => unsubscribe()),
-              ),
-            { bufferSize: 1024, strategy: "dropping" },
-          );
-
-          // Close SSE immediately if the authenticated T3 session/device is revoked.
-          const eventStream =
-            authSession.sessionId !== undefined
-              ? rawStream.pipe(
-                  Stream.interruptWhen(
-                    sessionStore
-                      .awaitInvalidation(authSession.sessionId, authSession.proofKeyThumbprint)
-                      .pipe(Effect.orElseSucceed(() => undefined)),
+                    }),
+                    () =>
+                      Effect.sync(() => {
+                        liveQueue = null;
+                        unsubscribe();
+                      }),
                   ),
-                )
-              : rawStream;
+                { bufferSize: 1024, strategy: "dropping" },
+              );
 
-          return eventStreamResponse(eventStream, (event) => Effect.succeed(JSON.stringify(event)));
+              // Close SSE immediately if the authenticated T3 session/device is revoked.
+              const eventStream =
+                authSession.sessionId !== undefined
+                  ? rawStream.pipe(
+                      Stream.interruptWhen(
+                        sessionStore
+                          .awaitInvalidation(authSession.sessionId, authSession.proofKeyThumbprint)
+                          .pipe(Effect.orElseSucceed(() => undefined)),
+                      ),
+                    )
+                  : rawStream;
+
+              return eventStreamResponse(eventStream, (event) =>
+                Effect.succeed(JSON.stringify(event)),
+              );
+            }),
+            Effect.catchTags({
+              PaRouteError: (err) => Effect.succeed(errorResponse(err)),
+            }),
+          );
         }
       }
     }

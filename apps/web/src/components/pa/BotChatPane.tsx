@@ -47,7 +47,7 @@ interface MarkdownBlock {
 
 function splitMarkdownBlocks(text: string): ReadonlyArray<MarkdownBlock> {
   const parts: MarkdownBlock[] = [];
-  const fence = /```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g;
+  const fence = /```([a-zA-Z0-9_-]*)\r?\n([\s\S]*?)```/g;
   let lastIndex = 0;
   let match: RegExpExecArray | null;
   while ((match = fence.exec(text)) !== null) {
@@ -68,7 +68,7 @@ function splitMarkdownBlocks(text: string): ReadonlyArray<MarkdownBlock> {
   if (lastIndex < text.length) {
     const tail = text.slice(lastIndex);
     // Support unclosed trailing code fences cleanly while streaming tokens.
-    const openFence = /```([a-zA-Z0-9_-]*)\n([\s\S]*)$/.exec(tail);
+    const openFence = /```([a-zA-Z0-9_-]*)\r?\n([\s\S]*)$/.exec(tail);
     if (openFence) {
       if (openFence.index > 0) {
         parts.push({
@@ -93,7 +93,7 @@ function splitMarkdownBlocks(text: string): ReadonlyArray<MarkdownBlock> {
   return parts;
 }
 
-const TRAILING_URL_PUNCTUATION = ".,;:!?)。，；：！？、》】";
+const TRAILING_URL_PUNCTUATION = ".,;:!?)>\"'。，；：！？、》】";
 // One level of balanced parentheses inside a link target, e.g. wiki/Function_(mathematics).
 const LINK_TARGET = String.raw`https?:\/\/(?:[^\s()]|\([^\s()]*\))+`;
 const INLINE_TOKEN_RE = new RegExp(
@@ -565,6 +565,7 @@ export function BotChatPane({
     let unsubscribeCurrent: (() => void) | null = null;
     let closed = false;
     let reconnectAttempts = 0;
+    let hasConnectedOnce = false;
 
     const appendLocalMessage = (msg: PaMessage) => {
       setLocalBySession((prev) => ({
@@ -577,11 +578,17 @@ export function BotChatPane({
       if (closed || activeSessionIdRef.current !== sessionId) return;
 
       if (event.type === "snapshot") {
+        const prevLastSeq = seqCursorRef.current.lastSeq;
+        const wasReconnect = hasConnectedOnce;
+        hasConnectedOnce = true;
         reconnectAttempts = 0;
         // The server reports the baseline its replay starts from (our own cursor on a replay), so
         // adopt it as-is: advancing past it would drop every replayed frame.
         seqCursorRef.current = { epoch: event.replayEpoch, lastSeq: event.lastSeq };
-        if (event.snapshotRequired) {
+        // If we dropped from an empty session (seq 0) and a turn completed offline, no `sinceSeq`
+        // was sent and the snapshot advances straight to `lastSeq > 0` without replaying events.
+        const missedInitialTurn = wasReconnect && prevLastSeq === 0 && event.lastSeq > 0;
+        if (event.snapshotRequired || missedInitialTurn) {
           deltaCursorRef.current = { turnId: null, segment: 0, offset: 0 };
           patchStream(sessionId, () => ({
             running: event.running,

@@ -418,7 +418,13 @@ export class LiveHermesRpcConnection implements HermesRpcConnection {
     if (!this.isOpen()) {
       throw new HermesConnectionError(`Hermes gateway socket for "${this.profile}" is closed`);
     }
-    this.ws.send(`${JSON.stringify({ jsonrpc: "2.0", id: requestId, result })}\n`);
+    try {
+      this.ws.send(`${JSON.stringify({ jsonrpc: "2.0", id: requestId, result })}\n`);
+    } catch (err) {
+      throw new HermesConnectionError(
+        `Failed to respond to Hermes request "${requestId}": ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   rejectServerRequest(requestId: string, code: number, message: string): void {

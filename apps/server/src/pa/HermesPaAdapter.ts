@@ -147,6 +147,8 @@ interface TrackedSessionState {
   subscribers: number;
   /** Open prompts this adapter has shown; `respondRequest` only answers these. */
   readonly requests: Map<string, PaPendingRequest>;
+  /** Answers already locked by another viewer on resumed batch clarify requests (`params.answers`). */
+  readonly lockedAnswers: Map<string, Readonly<Record<string, string>>>;
 }
 
 export function normalizeHermesTimestamp(value: number | string | null | undefined): number | null {
@@ -452,29 +454,15 @@ function withoutNullish<T extends object>(row: T): Partial<T> {
   ) as Partial<T>;
 }
 
-/**
- * Encodes a clarify answer the way the answering channel expects. Multi-select answers arrive from
- * the browser as a JSON array of labels: server requests take that JSON verbatim, while the
- * canonical `clarify.respond` text parser wants 1-based choice indices ("1,3").
- */
-function encodeClarifyAnswer(
-  question: NonNullable<PaPendingRequest["questions"]>[number] | undefined,
-  raw: string,
-  channel: PaPendingRequest["channel"],
-): string {
-  if (!question?.multiSelect || channel === "server_request") return raw;
-  let picked: unknown;
-  try {
-    picked = JSON.parse(raw);
-  } catch {
-    return raw;
-  }
-  if (!Array.isArray(picked)) return raw;
-  const options = question.options ?? [];
-  const indices = picked
-    .map((label) => options.indexOf(String(label)) + 1)
-    .filter((index) => index > 0);
-  return indices.length > 0 ? indices.join(",") : raw;
+function extractLockedAnswers(
+  params: Record<string, unknown> | undefined,
+): Readonly<Record<string, string>> | undefined {
+  const raw = params?.answers;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const entries = Object.entries(raw).filter(
+    (entry): entry is [string, string] => typeof entry[1] === "string",
+  );
+  return entries.length > 0 ? Object.fromEntries(entries) : undefined;
 }
 
 const HERMES_CAPABILITIES: PaAdapterCapabilities = {
@@ -521,6 +509,7 @@ export class HermesPaAdapter implements PaAdapter {
         canonicalSessionId: null,
         subscribers: 0,
         requests: new Map(),
+        lockedAnswers: new Map(),
       };
       this.sessionStates.set(key, state);
     }
@@ -1227,12 +1216,7 @@ export class HermesPaAdapter implements PaAdapter {
     const conn = await this.pool.getConnection(profile);
     const hermesSessionId = state.canonicalSessionId ?? sessionId;
     const questions = tracked.questions ?? [];
-
-    const answerFor = (questionId: string | undefined, fallback: string): string => {
-      const question = questions.find((q) => q.id === questionId);
-      const raw = (questionId !== undefined ? input.answers?.[questionId] : undefined) ?? fallback;
-      return encodeClarifyAnswer(question, raw, tracked.channel);
-    };
+    const locked = state.lockedAnswers.get(input.requestId) ?? {};
 
     if (tracked.channel === "server_request") {
       if (input.kind === "approval") {
@@ -1243,15 +1227,25 @@ export class HermesPaAdapter implements PaAdapter {
           answers.q0 = input.answer ?? "";
         }
         for (const [index, question] of questions.entries()) {
-          answers[question.id] = answerFor(question.id, index === 0 ? (input.answer ?? "") : "");
+          const provided = input.answers?.[question.id] ?? (index === 0 ? input.answer : undefined);
+          if (provided !== undefined && provided !== "") {
+            answers[question.id] = provided;
+          } else if (!(question.id in locked)) {
+            // Omit untouched questions that another viewer already locked (`clarify_batch.py`
+            // overlays our submitted map onto `locked`, so sending "" would wipe their lock).
+            answers[question.id] = "";
+          }
         }
         conn.respondServerRequest(input.requestId, { answers });
       }
       state.requests.delete(input.requestId);
+      state.lockedAnswers.delete(input.requestId);
       return;
     }
 
     // Canonical prompts require exact `{ session_id, execution_generation, prompt_id, choice|answer }`.
+    // Multi-select answers pass the JSON label array string verbatim (`clarify_tool.py._clean_answer`
+    // parses `json.loads(raw)` directly, matching Hermes Desktop/TUI).
     const executionGeneration = tracked.executionGeneration ?? state.executionGeneration;
     if (input.kind === "approval") {
       await conn.call("approval.respond", {
@@ -1261,14 +1255,20 @@ export class HermesPaAdapter implements PaAdapter {
         choice: input.decision ?? "deny",
       });
     } else {
+      const firstQuestionId = questions[0]?.id;
+      const answer =
+        (firstQuestionId !== undefined ? input.answers?.[firstQuestionId] : undefined) ??
+        input.answer ??
+        "";
       await conn.call("clarify.respond", {
         session_id: hermesSessionId,
         execution_generation: executionGeneration,
         prompt_id: input.requestId,
-        answer: answerFor(questions[0]?.id, input.answer ?? ""),
+        answer,
       });
     }
     state.requests.delete(input.requestId);
+    state.lockedAnswers.delete(input.requestId);
   }
 
   async subscribeSession(
@@ -1290,8 +1290,17 @@ export class HermesPaAdapter implements PaAdapter {
 
     const ownsSession = (id: string | undefined) =>
       id === undefined || id === sessionId || id === state.canonicalSessionId;
-    const trackRequest = (request: PaPendingRequest) => {
+    const trackRequest = (request: PaPendingRequest, locked?: Readonly<Record<string, string>>) => {
       state.requests.set(request.requestId, request);
+      if (locked) {
+        state.lockedAnswers.set(request.requestId, locked);
+      } else {
+        state.lockedAnswers.delete(request.requestId);
+      }
+    };
+    const untrackRequest = (requestId: string) => {
+      state.requests.delete(requestId);
+      state.lockedAnswers.delete(requestId);
     };
     const cursor: PaSeqCursor = { epoch: undefined, lastSeq: 0 };
 
@@ -1408,13 +1417,13 @@ export class HermesPaAdapter implements PaAdapter {
         case "clarify.settled": {
           const promptId = String(p.prompt_id ?? p.id ?? "");
           if (!promptId) return null;
-          state.requests.delete(promptId);
+          untrackRequest(promptId);
           return { type: "request.cancel", sessionId, requestId: promptId };
         }
         case "request.cancel": {
           const cancelId = String(p.id ?? p.request_id ?? "");
           if (!cancelId) return null;
-          state.requests.delete(cancelId);
+          untrackRequest(cancelId);
           return { type: "request.cancel", sessionId, requestId: cancelId };
         }
         case "approval.cancelled": {
@@ -1422,7 +1431,7 @@ export class HermesPaAdapter implements PaAdapter {
             ? p.request_ids.map((v) => String(v)).filter(Boolean)
             : [String(p.id ?? p.request_id ?? "")].filter(Boolean);
           for (const id of ids) {
-            state.requests.delete(id);
+            untrackRequest(id);
             options.onEvent({ type: "request.cancel", sessionId, requestId: id });
           }
           return null;
@@ -1491,13 +1500,15 @@ export class HermesPaAdapter implements PaAdapter {
         state.executionGeneration,
       );
       if (!mapped) return;
-      trackRequest(mapped);
+      trackRequest(mapped, extractLockedAnswers(req.params));
       options.onEvent({ type: "request.open", sessionId, request: mapped });
     });
 
     const unsubClose = conn.onClose(() => {
       state.subscriptionId = null;
       state.attachedConn = null;
+      state.requests.clear();
+      state.lockedAnswers.clear();
       closeStream("Hermes gateway connection closed");
     });
 
@@ -1508,17 +1519,31 @@ export class HermesPaAdapter implements PaAdapter {
       unsubReq();
       unsubClose();
       state.subscribers = Math.max(0, state.subscribers - 1);
-      if (state.subscribers === 0 && state.subscriptionId && conn.isOpen()) {
-        const subId = state.subscriptionId;
-        state.subscriptionId = null;
-        state.attachedConn = null;
-        void conn
-          .call(
-            "session.detach",
-            { session_id: state.canonicalSessionId ?? sessionId, subscription_id: subId },
-            4_000,
-          )
-          .catch(() => undefined);
+      if (state.subscribers === 0) {
+        state.requests.clear();
+        state.lockedAnswers.clear();
+        if (state.subscriptionId) {
+          const subId = state.subscriptionId;
+          state.subscriptionId = null;
+          state.attachedConn = null;
+          // A redirected session and its canonical id share one Hermes subscription_id on this
+          // socket: detach only once no active subscriber holds that subscription_id.
+          const stillShared = Array.from(this.sessionStates.values()).some(
+            (other) =>
+              other.attachedConn === conn &&
+              other.subscriptionId === subId &&
+              other.subscribers > 0,
+          );
+          if (!stillShared && conn.isOpen()) {
+            void conn
+              .call(
+                "session.detach",
+                { session_id: state.canonicalSessionId ?? sessionId, subscription_id: subId },
+                4_000,
+              )
+              .catch(() => undefined);
+          }
+        }
       }
     };
 
@@ -1578,6 +1603,10 @@ export class HermesPaAdapter implements PaAdapter {
       replayFrames = [];
     }
 
+    // Replace tracked prompts with the authoritative snapshot so prompts settled while detached
+    // cannot linger and be answered or re-emitted on a later replay_gap.
+    state.requests.clear();
+    state.lockedAnswers.clear();
     const openRequests: PaPendingRequest[] = [];
     for (const entry of snapshot.open_requests ?? []) {
       const mapped = normalizePendingRequest(
@@ -1588,7 +1617,7 @@ export class HermesPaAdapter implements PaAdapter {
         state.executionGeneration,
       );
       if (mapped) {
-        trackRequest(mapped);
+        trackRequest(mapped, extractLockedAnswers(entry.params));
         openRequests.push(mapped);
       }
     }
