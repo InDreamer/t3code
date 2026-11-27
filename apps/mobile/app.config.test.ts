@@ -68,4 +68,10 @@ it("strips paid-team signing settings and OTA updates for Personal Team iOS buil
   expect(config.ios?.associatedDomains).toBeUndefined();
   expect(config.ios?.entitlements).toBeUndefined();
   expect(config.updates?.enabled).toBe(false);
+  expect(config.plugins?.[0]).toBe("./plugins/withoutIosPersonalTeamCapabilities.cjs");
+  const notificationsPlugin = config.plugins?.find(
+    (entry): entry is [string, Record<string, unknown>] =>
+      Array.isArray(entry) && entry[0] === "expo-notifications",
+  );
+  expect(notificationsPlugin?.[1]?.enableRemoteNotifications).toBe(false);
 });
