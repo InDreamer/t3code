@@ -5,23 +5,23 @@ import { StarIcon } from "lucide-react";
 import { cn } from "../../lib/utils";
 
 export const PA_AVATAR_COLORS = [
-  { label: msg("橙色"), value: "#f97316" },
-  { label: msg("青绿"), value: "#14b8a6" },
-  { label: msg("海蓝"), value: "#3b82f6" },
-  { label: msg("翠绿"), value: "#10b981" },
-  { label: msg("紫罗兰"), value: "#8b5cf6" },
-  { label: msg("绯红"), value: "#ef4444" },
-  { label: msg("琥珀"), value: "#f59e0b" },
-  { label: msg("岩灰"), value: "#64748b" },
+  { label: msg("Orange"), value: "#f97316" },
+  { label: msg("Teal"), value: "#14b8a6" },
+  { label: msg("Ocean blue"), value: "#3b82f6" },
+  { label: msg("Emerald"), value: "#10b981" },
+  { label: msg("Violet"), value: "#8b5cf6" },
+  { label: msg("Crimson"), value: "#ef4444" },
+  { label: msg("Amber"), value: "#f59e0b" },
+  { label: msg("Slate"), value: "#64748b" },
 ] as const;
 
 export const PA_AVATAR_SHAPES = [
-  { label: msg("南瓜"), value: "pumpkin" },
-  { label: msg("圆球"), value: "circle" },
-  { label: msg("团子"), value: "blob" },
-  { label: msg("云朵"), value: "cloud" },
-  { label: msg("胶囊"), value: "pill" },
-  { label: msg("水滴"), value: "drop" },
+  { label: msg("Pumpkin"), value: "pumpkin" },
+  { label: msg("Sphere"), value: "circle" },
+  { label: msg("Blob"), value: "blob" },
+  { label: msg("Cloud"), value: "cloud" },
+  { label: msg("Pill"), value: "pill" },
+  { label: msg("Drop"), value: "drop" },
 ] as const satisfies ReadonlyArray<{
   readonly label: ReturnType<typeof msg>;
   readonly value: PaAvatarShape;

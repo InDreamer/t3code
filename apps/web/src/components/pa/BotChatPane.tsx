@@ -1,23 +1,29 @@
 import { T, useGT } from "gt-react";
-import {
-  ChevronDownIcon,
-  HistoryIcon,
-  Loader2Icon,
-  MessageSquarePlusIcon,
-  Settings2Icon,
-} from "lucide-react";
+import { Loader2Icon, Settings2Icon } from "lucide-react";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import { isElectron } from "~/env";
+import { useSoftwareKeyboardOpen } from "~/hooks/useSoftwareKeyboardOpen";
 import { useStableCallback } from "~/hooks/useStableCallback";
 import { observeResize } from "~/lib/observeResize";
 import { cn } from "../../lib/utils";
+import { usePrimaryEnvironmentId } from "../../state/environments";
+import { useAtomValue } from "@effect/atom-react";
+import * as Schema from "effect/Schema";
+import { toastManager } from "../ui/toast";
+import { EnvironmentAuthorizationError, type PaAttachment } from "@t3tools/contracts";
 import { ScrollToEndButton } from "../chat/TimelineOverlays";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
-import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
 import { WorkspacePageHeader } from "../WorkspacePageHeader";
-import { paErrorReason } from "@t3tools/client-runtime/pa/environment";
+import { isPermanentPaFailure, paErrorReason } from "@t3tools/client-runtime/pa/environment";
+import {
+  appendPaSessionPage,
+  mergePaLatestPage,
+  paUserMessageContentKey,
+  prependPaOlderPage,
+  type PaTranscriptWindow,
+} from "@t3tools/client-runtime/pa/history";
 import { parsePaClientSlashAction } from "@t3tools/client-runtime/pa/slash";
 import {
   buildPaTimelineItems,
@@ -28,22 +34,28 @@ import {
   nextPaLocalTimestamp,
   paNoticeMessage,
   reducePaStreamEvent,
+  startPaLiveTurnLocally,
   type PaLiveTurnState,
 } from "@t3tools/client-runtime/pa/timeline";
 import type {
   PaBotSummary,
   PaCapabilities,
   PaClarifyAnswer,
+  PaManageQueuedItemInput,
   PaMessage,
   PaPendingRequest,
+  PaQueuedItem,
   PaSessionSummary,
   PaSlashCommand,
   PaStreamEvent,
 } from "@t3tools/contracts";
 import { sendPaChatMessage, trackAdmittedPaRow } from "./BotChatPane.logic";
 import { BotAvatar } from "./BotAvatar";
-import { paApi, paErrorMessage } from "./paApi";
+import { makePaRequestKey, paApi, paErrorMessage, paSendPermissionAtom } from "./paApi";
 import { PaComposer, type PaClarifyAnswers } from "./PaComposer";
+import type { PaSecretAnswer } from "./PaSecretRequestForm";
+import { PaSessionPicker } from "./PaSessionPicker";
+import { PaContextUsageButton, PaQueueBar, PaTodoProgressBar } from "./PaSessionStatus";
 import {
   formatPaToolVerb,
   PaAssistantMessageRow,
@@ -54,9 +66,13 @@ import {
   PaWorkGroupRow,
 } from "./PaTimelineRows";
 
+const pendingSessionCreates = new Map<string, { title: string; id: string }>();
+
+const isAuthorizationError = Schema.is(EnvironmentAuthorizationError);
 const QUICK_COMMAND_COUNT = 3;
 const NO_SLASH_COMMANDS: ReadonlyArray<PaSlashCommand> = [];
 const SCROLL_NEAR_BOTTOM_PX = 96;
+const EMPTY_TRANSCRIPT: PaTranscriptWindow = { messages: [], olderCursor: null };
 
 let localMessageSeq = 0;
 
@@ -118,13 +134,30 @@ export function BotChatPane({
   const [sessions, setSessions] = useState<ReadonlyArray<PaSessionSummary>>([]);
   const [fallbackSessionId, setFallbackSessionId] = useState<string | null>(null);
   const activeSessionId = selectedSessionId ?? fallbackSessionId;
+  const environmentId = usePrimaryEnvironmentId();
+  const canOperate = useAtomValue(paSendPermissionAtom(environmentId));
   const [sessionsOpen, setSessionsOpen] = useState(false);
   const [loadingSessions, setLoadingSessions] = useState(true);
+  const [sessionsCursor, setSessionsCursor] = useState<string | null>(null);
+  const [loadingMoreSessions, setLoadingMoreSessions] = useState(false);
 
   const [messagesState, setMessagesState] = useState<{
     readonly sessionId: string | null;
-    readonly items: ReadonlyArray<PaMessage>;
-  }>({ sessionId: null, items: [] });
+    readonly window: PaTranscriptWindow;
+  }>({ sessionId: null, window: EMPTY_TRANSCRIPT });
+  const [olderLoad, setOlderLoad] = useState<{
+    readonly sessionId: string;
+    readonly loading: boolean;
+    readonly error: string | null;
+  } | null>(null);
+  /** Where the reader was before older rows went in above them, restored before paint. */
+  const pendingPrependRef = useRef<{
+    readonly sessionId: string;
+    /** The first row shown before the older page went in above it. */
+    readonly anchorId: string;
+    readonly scrollHeight: number;
+    readonly scrollTop: number;
+  } | null>(null);
   const [localBySession, setLocalBySession] = useState<Record<string, ReadonlyArray<PaMessage>>>(
     {},
   );
@@ -136,7 +169,10 @@ export function BotChatPane({
 
   const activeSessionIdRef = useRef<string | null>(activeSessionId);
 
-  const messages = messagesState.sessionId === activeSessionId ? messagesState.items : [];
+  const transcript =
+    messagesState.sessionId === activeSessionId ? messagesState.window : EMPTY_TRANSCRIPT;
+  const messages = transcript.messages;
+  const olderForSession = olderLoad?.sessionId === activeSessionId ? olderLoad : null;
   // A session's transcript is read once its feed attaches; until then nothing for it is shown.
   const loadingMessages =
     activeSessionId !== null &&
@@ -145,25 +181,13 @@ export function BotChatPane({
     liveTurnState.sessionId === activeSessionId
       ? liveTurnState
       : createInitialPaLiveTurn(activeSessionId);
+  const getTranscript = useStableCallback(() => messagesState);
+  const runningRef = useRef(false);
   const running = liveTurn.phase === "running";
   const openRequests = liveTurn.openRequests;
   const streamError = liveTurn.error;
   const localMessages = activeSessionId ? (localBySession[activeSessionId] ?? []) : [];
   const mergedMessages = mergePaMessagesByTime(messages, localMessages);
-
-  const setSessionMessages = (
-    sessionId: string,
-    updater:
-      | ReadonlyArray<PaMessage>
-      | ((prev: ReadonlyArray<PaMessage>) => ReadonlyArray<PaMessage>),
-  ) => {
-    if (activeSessionIdRef.current !== sessionId) return;
-    setMessagesState((prev) => {
-      const current = prev.sessionId === sessionId ? prev.items : [];
-      const nextItems = typeof updater === "function" ? updater(current) : updater;
-      return { sessionId, items: nextItems };
-    });
-  };
 
   const updateLiveTurn = useStableCallback(
     (sessionId: string | null, updater: (prev: PaLiveTurnState) => PaLiveTurnState) => {
@@ -177,20 +201,33 @@ export function BotChatPane({
 
   const [clarifyAnswers, setClarifyAnswers] = useState<Record<string, PaClarifyAnswers>>({});
   const [respondingIds, setRespondingIds] = useState<ReadonlySet<string>>(() => new Set());
+  const [queueBusyIds, setQueueBusyIds] = useState<ReadonlySet<string>>(() => new Set());
 
   const settleTokensRef = useRef(new Map<string, number>());
   const transcriptRequestRef = useRef(0);
-  const failedSendRef = useRef(new Map<string, { text: string; inputId: string }>());
+  const failedSendRef = useRef(
+    new Map<string, { text: string; inputId: string; attachmentKey?: string }>(),
+  );
   /** An admitted row can be reconciled by text, or by turn completion for rewritten prompts. */
   const pendingUserRowsRef = useRef(new Map<string, Map<string, boolean>>());
   const recoveredSessionsRef = useRef(new Set<string>());
   const mountedRef = useRef(false);
   const commandsSupported = capabilities?.commands.supported !== false;
-  const canCreateSession = capabilities?.sessions.create !== false;
+  const canCreateSession = canOperate && capabilities?.sessions.create !== false;
+  const canRenameSession = canOperate && capabilities?.sessions.renameExisting === true;
   const canInterrupt = capabilities?.execution.interrupt !== false;
+  const canSteer = capabilities?.execution.steer === true;
   const slashCommands = commandsSupported ? loadedSlashCommands : NO_SLASH_COMMANDS;
 
-  const [draft, setDraft] = useState("");
+  const [drafts, setDrafts] = useState<Readonly<Record<string, string>>>({});
+  const draft = activeSessionId ? (drafts[activeSessionId] ?? "") : "";
+  const setDraft = (value: string | ((previous: string) => string)) => {
+    if (!activeSessionId) return;
+    setDrafts((previous) => {
+      const next = typeof value === "function" ? value(previous[activeSessionId] ?? "") : value;
+      return { ...previous, [activeSessionId]: next };
+    });
+  };
   const [sending, setSending] = useState(false);
   const [modelPicker, setModelPicker] = useState({ open: false, query: "" });
   const [sessionReasoning, setSessionReasoning] = useState<{
@@ -202,6 +239,7 @@ export function BotChatPane({
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const composerOverlayRef = useRef<HTMLDivElement | null>(null);
   const [composerHeight, setComposerHeight] = useState(116);
+  const keyboardOpen = useSoftwareKeyboardOpen();
   const isNearBottomRef = useRef<boolean>(true);
   const [scrolledUpForSession, setScrolledUpForSession] = useState<string | null>(null);
   const showScrollToBottom = activeSessionId !== null && scrolledUpForSession === activeSessionId;
@@ -239,12 +277,19 @@ export function BotChatPane({
 
       return paApi
         .getMessages(bot.botId, sessionId)
-        .then((loaded) => {
+        .then((page) => {
           if (!current()) return;
-          setSessionMessages(sessionId, loaded);
+          const loaded = page.messages;
+          // The newest page again: older pages the reader already scrolled up to stay.
+          setMessagesState((prev) => ({
+            sessionId,
+            window: mergePaLatestPage(prev.sessionId === sessionId ? prev.window : null, page),
+          }));
           if (candidates.size > 0) {
-            const storedUserTexts = new Set(
-              loaded.flatMap((item) => (item.role === "user" ? [item.text.trim()] : [])),
+            const storedUsers = new Set(
+              loaded.flatMap((item) =>
+                item.role === "user" ? [paUserMessageContentKey(item)] : [],
+              ),
             );
             setLocalBySession((prev) => {
               const existing = prev[sessionId] ?? [];
@@ -254,7 +299,7 @@ export function BotChatPane({
                   .filter(
                     (item) =>
                       candidates.has(item.id) &&
-                      (candidates.get(item.id) || storedUserTexts.has(item.text.trim())),
+                      (candidates.get(item.id) || storedUsers.has(paUserMessageContentKey(item))),
                   )
                   .map((item) => item.id),
               );
@@ -273,11 +318,11 @@ export function BotChatPane({
           if (current()) {
             // A first read that fails still ends the spinner; a failed reload keeps what is shown.
             setMessagesState((prev) =>
-              prev.sessionId === sessionId ? prev : { sessionId, items: [] },
+              prev.sessionId === sessionId ? prev : { sessionId, window: EMPTY_TRANSCRIPT },
             );
             updateLiveTurn(sessionId, (prev) => ({
               ...prev,
-              error: paErrorMessage(err, gt("加载消息失败")),
+              error: paErrorMessage(err, gt("Could not load messages")),
             }));
           }
         })
@@ -294,16 +339,16 @@ export function BotChatPane({
       case "gui":
         return gt("T3 Web");
       case "feishu":
-        return gt("飞书");
+        return gt("Feishu");
       case "telegram":
         return gt("Telegram");
       case "cron":
-        return gt("定时任务");
+        return gt("Scheduled task");
       case "cli":
       case "tui":
-        return gt("终端");
+        return gt("Terminal");
       case "local":
-        return gt("本地");
+        return gt("Local");
       default:
         return source;
     }
@@ -340,12 +385,10 @@ export function BotChatPane({
       .then(async (sessionRes) => {
         if (controller.signal.aborted) return;
         setSessions(sessionRes.sessions);
+        setSessionsCursor(sessionRes.nextCursor ?? null);
 
         const initialProp = getSelectedSessionProp();
-        let targetId =
-          initialProp && sessionRes.sessions.some((s) => s.sessionId === initialProp)
-            ? initialProp
-            : sessionRes.primarySessionId;
+        let targetId = initialProp ?? sessionRes.primarySessionId;
 
         if (!targetId && canCreateSession) {
           const created = await paApi.ensurePrimarySession(bot.botId);
@@ -374,7 +417,7 @@ export function BotChatPane({
         if (!controller.signal.aborted) {
           updateLiveTurn(activeSessionIdRef.current, (prev) => ({
             ...prev,
-            error: paErrorMessage(err, gt("连接 Bot 会话失败")),
+            error: paErrorMessage(err, gt("Could not connect to the bot session")),
           }));
         }
       })
@@ -415,11 +458,12 @@ export function BotChatPane({
         nextId = remaining[0]?.sessionId ?? null;
       }
       setSessions(nextSessions);
+      setSessionsCursor(res.nextCursor ?? null);
       if (!nextId) {
         // Nowhere to move and no way to start a conversation: say so instead of going blank.
         updateLiveTurn(missingId, (prev) => ({
           ...prev,
-          error: paErrorMessage(cause, gt("这个对话已不存在")),
+          error: paErrorMessage(cause, gt("This conversation no longer exists")),
         }));
         return;
       }
@@ -429,10 +473,18 @@ export function BotChatPane({
     } catch (err) {
       updateLiveTurn(missingId, (prev) => ({
         ...prev,
-        error: paErrorMessage(err, gt("连接 Bot 会话失败")),
+        error: paErrorMessage(err, gt("Could not connect to the bot session")),
       }));
     }
   });
+
+  const patchSession = useStableCallback(
+    (sessionId: string, patch: Partial<Pick<PaSessionSummary, "title" | "model">>) => {
+      setSessions((prev) =>
+        prev.map((item) => (item.sessionId === sessionId ? { ...item, ...patch } : item)),
+      );
+    },
+  );
 
   const appendLocalMessage = useStableCallback((sessionId: string, message: PaMessage) => {
     setLocalBySession((prev) => {
@@ -476,10 +528,12 @@ export function BotChatPane({
     };
     isNearBottomRef.current = true;
 
+    runningRef.current = false;
     const handleEvent = (event: PaStreamEvent) => {
       if (closed || activeSessionIdRef.current !== sessionId) return;
       switch (event.type) {
         case "snapshot":
+          runningRef.current = event.running;
           updateLiveTurn(sessionId, (prev) => reducePaStreamEvent(prev, event, Date.now()));
           if (!transcriptRead || event.snapshotRequired) readTranscript();
           return;
@@ -491,17 +545,10 @@ export function BotChatPane({
           break;
         case "session.updated":
           if (event.title || event.model) {
-            setSessions((prev) =>
-              prev.map((item) =>
-                item.sessionId === sessionId
-                  ? {
-                      ...item,
-                      ...(event.title ? { title: event.title } : {}),
-                      ...(event.model ? { model: event.model } : {}),
-                    }
-                  : item,
-              ),
-            );
+            patchSession(sessionId, {
+              ...(event.title ? { title: event.title } : {}),
+              ...(event.model ? { model: event.model } : {}),
+            });
           }
           if (event.reasoningEffort) {
             setSessionReasoning({
@@ -511,8 +558,12 @@ export function BotChatPane({
             });
           }
           return;
+        case "turn.started":
+          runningRef.current = true;
+          break;
         case "turn.completed":
         case "error": {
+          runningRef.current = false;
           // An error ends the turn too: a send that resolves after it must not re-mark it running.
           const token = (settleTokensRef.current.get(sessionId) ?? 0) + 1;
           settleTokensRef.current.set(sessionId, token);
@@ -554,7 +605,9 @@ export function BotChatPane({
           ...prev,
           error: paErrorMessage(
             error,
-            retrying ? gt("会话连接中断，正在重连") : gt("连接 Bot 会话失败"),
+            retrying
+              ? gt("Connection lost. Reconnecting…")
+              : gt("Could not connect to the bot session"),
           ),
         }));
       },
@@ -573,6 +626,7 @@ export function BotChatPane({
     gt,
     loadTranscript,
     localTimestampNow,
+    patchSession,
     recoverMissingSession,
     updateLiveTurn,
     stableOnActivity,
@@ -592,6 +646,104 @@ export function BotChatPane({
     }
   }, [scrollTargetScore, running]);
 
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- restores the DOM scroll offset before paint so rows inserted above the viewport do not move what the reader is looking at
+  useLayoutEffect(() => {
+    const pending = pendingPrependRef.current;
+    const el = scrollContainerRef.current;
+    if (!pending || !el) return;
+    pendingPrependRef.current = null;
+    if (messages[0]?.id === pending.anchorId) return;
+    // Another session, or a reset that replaced the rows, has nothing to hold in place.
+    if (
+      pending.sessionId !== activeSessionId ||
+      !messages.some((message) => message.id === pending.anchorId)
+    ) {
+      return;
+    }
+    el.scrollTop = pending.scrollTop + (el.scrollHeight - pending.scrollHeight);
+  }, [messages, activeSessionId]);
+
+  const loadOlderMessages = async () => {
+    const sessionId = activeSessionId;
+    const cursor = getTranscript().window.olderCursor;
+    if (!sessionId || !cursor || olderForSession?.loading) return;
+    setOlderLoad({ sessionId, loading: true, error: null });
+    try {
+      const page = await paApi.getMessages(bot.botId, sessionId, { cursor });
+      const latest = getTranscript();
+      pendingPrependRef.current = null;
+      if (
+        activeSessionIdRef.current !== sessionId ||
+        latest.sessionId !== sessionId ||
+        latest.window.olderCursor !== cursor
+      ) {
+        setOlderLoad((prev) => (prev?.sessionId === sessionId ? null : prev));
+        return;
+      }
+      const el = scrollContainerRef.current;
+      const anchorId = latest.window.messages[0]?.id;
+      const next = prependPaOlderPage(latest.window, page);
+      if (
+        el &&
+        anchorId !== undefined &&
+        page.reset !== true &&
+        next.messages.length > latest.window.messages.length &&
+        buildPaTimelineItems(next.messages).length >
+          buildPaTimelineItems(latest.window.messages).length
+      ) {
+        pendingPrependRef.current = {
+          sessionId,
+          anchorId,
+          scrollHeight: el.scrollHeight,
+          scrollTop: el.scrollTop,
+        };
+        // Rows going in above must not read as new rows to follow at the bottom.
+        isNearBottomRef.current = false;
+      }
+      setMessagesState((prev) =>
+        // A reload that replaced the window meanwhile owns a different cursor.
+        prev.sessionId !== sessionId || prev.window.olderCursor !== cursor
+          ? prev
+          : {
+              sessionId,
+              window: prev.window === latest.window ? next : prependPaOlderPage(prev.window, page),
+            },
+      );
+      setOlderLoad((prev) => (prev?.sessionId === sessionId ? null : prev));
+    } catch (err) {
+      setOlderLoad((prev) =>
+        prev?.sessionId === sessionId
+          ? {
+              sessionId,
+              loading: false,
+              error: paErrorMessage(err, gt("Could not load earlier messages")),
+            }
+          : prev,
+      );
+    }
+  };
+
+  const loadMoreSessions = async () => {
+    const cursor = sessionsCursor;
+    if (!cursor || loadingMoreSessions) return;
+    setLoadingMoreSessions(true);
+    try {
+      const res = await paApi.listSessions(bot.botId, { cursor });
+      if (!mountedRef.current) {
+        setLoadingMoreSessions(false);
+        return;
+      }
+      setSessions((prev) => appendPaSessionPage(prev, res.sessions));
+      setSessionsCursor(res.nextCursor ?? null);
+    } catch (err) {
+      updateLiveTurn(activeSessionIdRef.current, (prev) => ({
+        ...prev,
+        error: paErrorMessage(err, gt("Could not load more conversations")),
+      }));
+    }
+    setLoadingMoreSessions(false);
+  };
+
   const handleViewportScroll = () => {
     const el = scrollContainerRef.current;
     if (!el) return;
@@ -600,6 +752,32 @@ export function BotChatPane({
     isNearBottomRef.current = nearBottom;
     const nextScrolledUp = nearBottom ? null : activeSessionId;
     setScrolledUpForSession((prev) => (prev === nextScrolledUp ? prev : nextScrolledUp));
+  };
+
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- the software keyboard shrinks the timeline viewport, so a reader following the end would lose the latest message under it
+  useEffect(() => {
+    const el = scrollContainerRef.current;
+    if (keyboardOpen && el && isNearBottomRef.current) el.scrollTop = el.scrollHeight;
+  }, [keyboardOpen]);
+
+  // Dragging or tapping the open timeline closes the keyboard, as chat apps do.
+  const dismissSoftwareKeyboard = () => {
+    const active = document.activeElement;
+    if (
+      keyboardOpen &&
+      active instanceof HTMLElement &&
+      composerOverlayRef.current?.contains(active)
+    )
+      active.blur();
+  };
+  const handleTimelineClick = (event: React.MouseEvent<HTMLDivElement>) => {
+    const target = event.target;
+    if (
+      target === event.currentTarget ||
+      target === event.currentTarget.firstElementChild ||
+      target === bottomRef.current
+    )
+      dismissSoftwareKeyboard();
   };
 
   const scrollToBottom = () => {
@@ -629,6 +807,7 @@ export function BotChatPane({
   const switchSession = (nextSessionId: string) => {
     setSessionsOpen(false);
     if (nextSessionId === activeSessionId) return;
+    pendingSessionCreates.delete(JSON.stringify([environmentId, bot.botId]));
     activeSessionIdRef.current = nextSessionId;
     setFallbackSessionId(nextSessionId);
     onSelectSession(nextSessionId);
@@ -637,31 +816,58 @@ export function BotChatPane({
   const handleCreateNewSession = async (title = "") => {
     setSessionsOpen(false);
     const fromSessionId = activeSessionId;
+    if (!canCreateSession || !environmentId) return;
+    const key = JSON.stringify([environmentId, bot.botId]);
+    const pending = pendingSessionCreates.get(key);
+    const attempt =
+      pending?.title === title ? pending : { title, id: makePaRequestKey("pa-session") };
+    pendingSessionCreates.set(key, attempt);
     let created: PaSessionSummary;
     try {
-      created = await paApi.createSession(bot.botId, title || undefined);
+      created = await paApi.createSession(bot.botId, attempt.id, title || undefined);
+      if (pendingSessionCreates.get(key) !== attempt) return;
+      pendingSessionCreates.delete(key);
     } catch (err) {
+      if (isPermanentPaFailure(err) && pendingSessionCreates.get(key) === attempt)
+        pendingSessionCreates.delete(key);
       updateLiveTurn(fromSessionId, (prev) => ({
         ...prev,
-        error: paErrorMessage(err, gt("新建对话失败")),
+        error: paErrorMessage(err, gt("Could not create the conversation")),
       }));
       return;
     }
     // This pane belongs to one Bot: a create that lands after leaving it must not navigate back.
     if (!mountedRef.current) return;
-    setSessions((prev) => [created, ...prev.map((s) => ({ ...s, isPrimary: false }))]);
+    setSessions((prev) => [
+      created,
+      ...prev
+        .filter((s) => s.sessionId !== created.sessionId)
+        .map((s) => ({ ...s, isPrimary: false })),
+    ]);
     activeSessionIdRef.current = created.sessionId;
     setFallbackSessionId(created.sessionId);
     onSelectSession(created.sessionId);
   };
 
-  const handleSend = async (rawOverride?: string) => {
+  const handleSend = async (
+    rawOverride?: string,
+    options?: {
+      /** Sent behind the running turn: it waits in the engine's queue. */
+      readonly queued?: boolean;
+      readonly attachments?: ReadonlyArray<PaAttachment>;
+      /** A failed send puts the text back in the composer even though it came from elsewhere. */
+      readonly restoreDraft?: boolean;
+    },
+  ) => {
     const text = (rawOverride ?? draft).trim();
     const sessionId = activeSessionId;
-    if (!text || !sessionId || sending) return;
+    const attachments = options?.attachments ?? [];
+    if ((!text && !attachments.length) || !sessionId || sending || !canOperate) return false;
+    const queued = options?.queued === true;
+    const restoreDraft = rawOverride === undefined || options?.restoreDraft === true;
 
     // The engine's catalog marks the commands a client runs itself (new session, stop, model).
-    const clientAction = parsePaClientSlashAction(text, slashCommands);
+    const clientAction = attachments.length ? null : parsePaClientSlashAction(text, slashCommands);
     if (clientAction) {
       if (rawOverride === undefined) setDraft("");
       updateLiveTurn(sessionId, (prev) => ({ ...prev, error: null }));
@@ -670,7 +876,7 @@ export function BotChatPane({
           if (!canCreateSession) {
             updateLiveTurn(sessionId, (prev) => ({
               ...prev,
-              error: gt("这个 Bot 不支持新建对话"),
+              error: gt("This bot cannot create conversations"),
             }));
             return;
           }
@@ -680,7 +886,7 @@ export function BotChatPane({
           if (!canInterrupt) {
             updateLiveTurn(sessionId, (prev) => ({
               ...prev,
-              error: gt("这个 Bot 不支持停止回复"),
+              error: gt("This bot cannot stop a reply"),
             }));
             return;
           }
@@ -693,13 +899,14 @@ export function BotChatPane({
     }
     setSending(true);
     updateLiveTurn(sessionId, (prev) => ({ ...prev, error: null }));
-    if (rawOverride === undefined) setDraft("");
+    if (rawOverride === undefined && !attachments.length) setDraft("");
     isNearBottomRef.current = true;
     setScrolledUpForSession(null);
 
-    // A local row until a reload shows it stored; only an admitted turn is ever stored.
+    // A local row until a reload shows it stored; only an admitted turn is ever stored. A queued
+    // send gets none: the queue bar shows it once the engine lists it.
     const optimisticMsg = createLocalMessage("user", text, localTimestampNow());
-    appendLocalMessage(sessionId, optimisticMsg);
+    if (!queued && !attachments.length) appendLocalMessage(sessionId, optimisticMsg);
     const completedBeforeSend = settleTokensRef.current.get(sessionId);
     try {
       const { result: res, inputId } = await sendPaChatMessage(
@@ -707,8 +914,22 @@ export function BotChatPane({
         sessionId,
         text,
         makeInputId,
-        (id) => paApi.sendMessage(bot.botId, sessionId, text, id),
+        (id) => paApi.sendMessage(bot.botId, sessionId, text, id, queued, attachments),
+        attachments.map((item) => item.id),
       );
+      if (attachments.length && res.kind === "turn" && activeSessionIdRef.current === sessionId) {
+        setDraft((current) => (current.trim() === text ? "" : current));
+      }
+      if (res.kind === "turn" && res.queued === true) {
+        // Waiting behind the running turn, which keeps streaming untouched.
+        setSending(false);
+        return true;
+      }
+      if (attachments.length ? res.kind === "turn" : queued)
+        appendLocalMessage(sessionId, {
+          ...optimisticMsg,
+          ...(res.attachments ? { attachments: res.attachments } : {}),
+        });
       const settleToken = settleTokensRef.current.get(sessionId);
       const turnEnded = trackAdmittedPaRow(
         pendingUserRowsRef.current,
@@ -723,44 +944,119 @@ export function BotChatPane({
         appendLocalMessage(
           sessionId,
           paNoticeMessage(
-            { message: res.output || res.notice || gt("命令已执行"), inputId },
+            { message: res.output || res.notice || gt("Command executed"), inputId },
             localTimestampNow(),
           ),
         );
         onActivity();
+        // A consumed voice stop can return output without admitting the selected images.
+        if (attachments.length) {
+          setSending(false);
+          return false;
+        }
       } else if (turnEnded) {
         if (activeSessionIdRef.current === sessionId) {
           void loadTranscript(sessionId, false, settleToken);
         }
         if (res.settled) onActivity();
       } else {
-        updateLiveTurn(sessionId, (prev) =>
-          prev.phase === "running"
-            ? prev
-            : {
-                ...createInitialPaLiveTurn(sessionId),
-                phase: "running",
-                startedAt: Date.now(),
-                openRequests: prev.openRequests,
-                settleToken: prev.settleToken,
-              },
-        );
+        if (activeSessionIdRef.current === sessionId) runningRef.current = true;
+        updateLiveTurn(sessionId, (prev) => startPaLiveTurnLocally(prev, Date.now()));
       }
     } catch (err) {
       removeLocalMessage(sessionId, optimisticMsg.id);
-      if (rawOverride === undefined && activeSessionIdRef.current === sessionId) {
+      if (!attachments.length && restoreDraft && activeSessionIdRef.current === sessionId) {
         setDraft((current) => (current ? current : text));
       }
       updateLiveTurn(sessionId, (prev) => ({
         ...prev,
-        error: paErrorMessage(err, gt("发送失败")),
+        error: paErrorMessage(err, gt("Could not send message")),
+      }));
+      setSending(false);
+      return false;
+    }
+    setSending(false);
+    return true;
+  };
+
+  /** Hands the draft to the running turn; one the turn ended too early to take is sent normally. */
+  const handleSteer = async () => {
+    const text = draft.trim();
+    const sessionId = activeSessionId;
+    if (!text || !sessionId || sending || !canOperate) return;
+    setSending(true);
+    setDraft("");
+    updateLiveTurn(sessionId, (prev) => ({ ...prev, error: null }));
+    const settleToken = settleTokensRef.current.get(sessionId);
+    let sendInstead = false;
+    try {
+      const res = await paApi.steerSession(bot.botId, sessionId, text);
+      if (mountedRef.current && activeSessionIdRef.current === sessionId) {
+        if (res.status === "voiceStopped") {
+          toastManager.add({ type: "info", title: gt("Voice chat stopped.") });
+        } else if (
+          res.status === "delivered" &&
+          settleTokensRef.current.get(sessionId) !== settleToken
+        ) {
+          void loadTranscript(sessionId, false, settleTokensRef.current.get(sessionId));
+        } else if (res.status === "delivered") {
+          // Stored with the running turn: a local row until that turn's reload shows it.
+          const row = createLocalMessage("user", text, localTimestampNow());
+          appendLocalMessage(sessionId, row);
+          const pending = pendingUserRowsRef.current.get(sessionId) ?? new Map<string, boolean>();
+          pending.set(row.id, false);
+          pendingUserRowsRef.current.set(sessionId, pending);
+        } else {
+          sendInstead = true;
+        }
+      } else if (res.status === "notDelivered") {
+        setDraft((current) => (current ? text + "\n" + current : text));
+      }
+    } catch (err) {
+      // Never re-sent: the engine may already have handed it to the agent.
+      setDraft((current) => (current ? text + "\n" + current : text));
+      updateLiveTurn(sessionId, (prev) => ({
+        ...prev,
+        error: paErrorMessage(err, gt("Could not steer the turn")),
       }));
     }
     setSending(false);
+    if (sendInstead && mountedRef.current && activeSessionIdRef.current === sessionId)
+      await handleSend(text, { queued: runningRef.current, restoreDraft: true });
+  };
+
+  const handleQueueAction = async (
+    item: PaQueuedItem,
+    action: PaManageQueuedItemInput["action"],
+  ) => {
+    if (!canOperate || !activeSessionId || queueBusyIds.has(item.id)) return;
+    const sessionId = activeSessionId;
+    setQueueBusyIds((prev) => new Set(prev).add(item.id));
+    try {
+      // The engine's next queue report moves or removes the item for every viewer.
+      await paApi.manageQueuedItem(bot.botId, sessionId, item.id, action);
+    } catch (err) {
+      updateLiveTurn(sessionId, (prev) => ({
+        ...prev,
+        error: paErrorMessage(
+          err,
+          action === "cancel"
+            ? gt("Could not cancel the queued message")
+            : action === "steer"
+              ? gt("Could not steer the turn")
+              : gt("Could not resume the queue"),
+        ),
+      }));
+    }
+    setQueueBusyIds((prev) => {
+      const next = new Set(prev);
+      next.delete(item.id);
+      return next;
+    });
   };
 
   const handleInterrupt = async () => {
-    if (!activeSessionId) return;
+    if (!canOperate || !activeSessionId) return;
     const sessionId = activeSessionId;
     try {
       // The turn's own completion settles it: trailing frames may still be on their way.
@@ -769,13 +1065,13 @@ export function BotChatPane({
     } catch (err) {
       updateLiveTurn(sessionId, (prev) => ({
         ...prev,
-        error: paErrorMessage(err, gt("停止失败")),
+        error: paErrorMessage(err, gt("Could not stop the turn")),
       }));
     }
   };
 
   const handleRespondRequest = async (req: PaPendingRequest, decision?: string) => {
-    if (!activeSessionId || respondingIds.has(req.requestId)) return;
+    if (!canOperate || !activeSessionId || respondingIds.has(req.requestId)) return;
     const sessionId = activeSessionId;
     const answers = clarifyAnswers[req.requestId];
     setRespondingIds((prev) => new Set(prev).add(req.requestId));
@@ -794,7 +1090,7 @@ export function BotChatPane({
     } catch (err) {
       updateLiveTurn(sessionId, (prev) => ({
         ...prev,
-        error: paErrorMessage(err, gt("响应请求失败")),
+        error: paErrorMessage(err, gt("Could not answer the request")),
       }));
     }
     setRespondingIds((prev) => {
@@ -804,31 +1100,65 @@ export function BotChatPane({
     });
   };
 
+  /** The values go straight to the engine: nothing here keeps or reports them. */
+  const handleRespondSecret = async (
+    req: PaPendingRequest,
+    answer: PaSecretAnswer,
+  ): Promise<boolean> => {
+    if (!canOperate || !activeSessionId || respondingIds.has(req.requestId)) return false;
+    const sessionId = activeSessionId;
+    setRespondingIds((prev) => new Set(prev).add(req.requestId));
+    let ok = false;
+    try {
+      await paApi.respondRequest({
+        botId: bot.botId,
+        sessionId,
+        requestId: req.requestId,
+        ...(answer.type === "skip" ? { skip: true } : { values: answer.values }),
+      });
+      updateLiveTurn(sessionId, (prev) => ({
+        ...prev,
+        openRequests: prev.openRequests.filter((item) => item.requestId !== req.requestId),
+      }));
+      ok = true;
+    } catch (err) {
+      // Only the engine's own refusal is shown: a transport error could quote the request.
+      updateLiveTurn(sessionId, (prev) => ({
+        ...prev,
+        error: isAuthorizationError(err)
+          ? gt("You need permission to manage providers to answer this request.")
+          : paErrorReason(err) !== null
+            ? paErrorMessage(err, gt("Could not submit credentials"))
+            : gt("Could not submit credentials"),
+      }));
+    }
+    setRespondingIds((prev) => {
+      const next = new Set(prev);
+      next.delete(req.requestId);
+      return next;
+    });
+    return ok;
+  };
+
   let scrollToEndSummary: string | null = null;
   if (openRequests.length > 0) {
-    scrollToEndSummary = gt("等待你的确认");
+    scrollToEndSummary = gt("Waiting for your approval");
   } else if (running) {
     const lastBlock = liveTurn.blocks[liveTurn.blocks.length - 1];
     if (lastBlock?.kind === "text" && lastBlock.text.length > 0) {
-      scrollToEndSummary = gt("正在输出");
+      scrollToEndSummary = gt("Streaming");
     } else if (lastBlock?.kind === "work-group") {
       const activeTool = findActivePaToolAction(liveTurn);
       scrollToEndSummary = activeTool
         ? formatPaToolVerb(gt, activeTool)
-        : liveTurn.statusText || gt("思考中");
+        : liveTurn.statusText || gt("Thinking");
     } else {
-      scrollToEndSummary = liveTurn.statusText || gt("思考中");
+      scrollToEndSummary = liveTurn.statusText || gt("Thinking");
     }
   }
 
   return (
-    <div
-      className="relative flex min-h-0 w-full min-w-0 flex-1 flex-col overflow-x-hidden bg-background"
-      style={{
-        paddingLeft: "env(safe-area-inset-left)",
-        paddingRight: "env(safe-area-inset-right)",
-      }}
-    >
+    <div className="relative flex min-h-0 w-full min-w-0 flex-1 flex-col overflow-x-hidden bg-background">
       <WorkspacePageHeader
         electron={isElectron}
         className="justify-between gap-2 border-b border-border/60"
@@ -854,85 +1184,50 @@ export function BotChatPane({
                 )}
               />
               <span className="truncate">
-                {running ? liveTurn.statusText || gt("处理中...") : bot.model || bot.agentRef}
+                {running ? liveTurn.statusText || gt("Working…") : bot.model || bot.agentRef}
               </span>
             </div>
           </div>
         </div>
 
         <div className="flex shrink-0 items-center gap-1">
-          <Popover open={sessionsOpen} onOpenChange={setSessionsOpen}>
-            <PopoverTrigger
-              render={
-                <Button type="button" size="xs" variant="ghost-muted">
-                  <HistoryIcon className="size-3.5" />
-                  <span className="hidden max-w-28 truncate sm:inline">
-                    {activeSession
-                      ? activeSession.isPrimary
-                        ? gt("主对话")
-                        : formatSourceLabel(activeSession.source)
-                      : gt("会话")}
-                  </span>
-                  <ChevronDownIcon className="size-3" />
-                </Button>
-              }
-            />
-            <PopoverPopup align="end" className="w-72">
-              <div className="mb-1.5 flex items-center justify-between px-1 py-1">
-                <span className="text-xs font-medium text-muted-foreground">
-                  <T>切换对话记录</T>
-                </span>
-                {canCreateSession ? (
-                  <Button
-                    type="button"
-                    size="xs"
-                    variant="ghost"
-                    onClick={() => void handleCreateNewSession()}
-                  >
-                    <MessageSquarePlusIcon className="size-3" />
-                    <T>新对话</T>
-                  </Button>
-                ) : null}
-              </div>
-              <div className="max-h-72 space-y-1 overflow-y-auto">
-                {sessions.map((item) => (
-                  <button
-                    key={item.sessionId}
-                    type="button"
-                    onClick={() => switchSession(item.sessionId)}
-                    className={cn(
-                      "flex w-full flex-col gap-0.5 rounded-lg px-2.5 py-2 text-left transition-colors",
-                      item.sessionId === activeSessionId
-                        ? "bg-primary/10 text-foreground"
-                        : "text-foreground/85 hover:bg-muted/60",
-                    )}
-                  >
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="truncate text-xs font-medium">{item.title}</span>
-                      <Badge variant="outline" size="sm" className="shrink-0">
-                        {item.isPrimary ? gt("主对话") : formatSourceLabel(item.source)}
-                      </Badge>
-                    </div>
-                    <div className="text-3xs text-muted-foreground">
-                      {item.model
-                        ? gt("{count} 条消息 · {model}", {
-                            count: item.messageCount,
-                            model: item.model,
-                          })
-                        : gt("{count} 条消息", { count: item.messageCount })}
-                    </div>
-                  </button>
-                ))}
-              </div>
-            </PopoverPopup>
-          </Popover>
+          <PaContextUsageButton usage={liveTurn.usage} />
+          <PaSessionPicker
+            botId={bot.botId}
+            open={sessionsOpen}
+            onOpenChange={setSessionsOpen}
+            triggerLabel={
+              activeSession
+                ? activeSession.isPrimary
+                  ? gt("Primary conversation")
+                  : formatSourceLabel(activeSession.source)
+                : gt("Session")
+            }
+            sessions={sessions}
+            hasMoreSessions={sessionsCursor !== null}
+            loadingMoreSessions={loadingMoreSessions}
+            activeSessionId={activeSessionId}
+            canCreateSession={canCreateSession}
+            canRenameSession={canRenameSession}
+            formatSourceLabel={formatSourceLabel}
+            onSelectSession={(session) => {
+              setSessions((prev) => appendPaSessionPage(prev, [session]));
+              switchSession(session.sessionId);
+            }}
+            onCreateSession={() => void handleCreateNewSession()}
+            onLoadMoreSessions={() => void loadMoreSessions()}
+            onSessionRenamed={(sessionId, title) => patchSession(sessionId, { title })}
+            onError={(message) =>
+              updateLiveTurn(activeSessionIdRef.current, (prev) => ({ ...prev, error: message }))
+            }
+          />
 
           <Button
             type="button"
             size="icon"
             variant="ghost"
             className="size-8"
-            aria-label={gt("Bot 设置")}
+            aria-label={gt("Bot settings")}
             onClick={onOpenSettings}
           >
             <Settings2Icon className="size-4" />
@@ -940,26 +1235,35 @@ export function BotChatPane({
         </div>
       </WorkspacePageHeader>
 
-      <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
+      {/* The safe-area padding clears a landscape notch; the absolute composer lane adds its own. */}
+      <div className="relative flex min-h-0 min-w-0 flex-1 flex-col pl-safe pr-safe">
         <div
           ref={scrollContainerRef}
           onScroll={handleViewportScroll}
+          onTouchMove={dismissSoftwareKeyboard}
+          onClick={handleTimelineClick}
           className="scrollbar-gutter-both min-h-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-y-contain px-3 pt-4 sm:px-8"
         >
           <div className="chat-content-lane flex flex-col">
             {loadingSessions || loadingMessages ? (
               <div className="flex items-center justify-center py-12 text-sm text-muted-foreground">
                 <Loader2Icon className="mr-2 size-4 animate-spin" />
-                <T>正在加载对话...</T>
+                <T>Loading conversation…</T>
               </div>
             ) : null}
 
             {!loadingSessions && !loadingMessages && timelineItems.length === 0 && !hasLiveTurn ? (
-              <div className="flex flex-col items-center justify-center gap-3 py-16 text-center">
+              <div
+                className={cn(
+                  "flex flex-col items-center justify-center text-center",
+                  // Keeps the Bot in view above an open keyboard.
+                  keyboardOpen ? "gap-2 py-4" : "gap-3 py-16",
+                )}
+              >
                 <BotAvatar
                   color={bot.avatarColor}
                   shape={bot.avatarShape}
-                  size="lg"
+                  size={keyboardOpen ? "md" : "lg"}
                   starred={bot.isDefault}
                 />
                 <div className="space-y-1">
@@ -967,10 +1271,10 @@ export function BotChatPane({
                   <p className="max-w-xs text-xs text-muted-foreground">
                     {bot.description ||
                       (slashCommands.length > 0
-                        ? gt("直接开始聊天，或输入 / 使用 {engine} 的命令。", {
+                        ? gt("Start chatting or type / to use {engine} commands.", {
                             engine: bot.engineLabel,
                           })
-                        : gt("直接开始聊天。"))}
+                        : gt("Start chatting."))}
                   </p>
                 </div>
                 <div className="flex flex-wrap justify-center gap-1.5 pt-1">
@@ -978,8 +1282,9 @@ export function BotChatPane({
                     <button
                       key={cmd}
                       type="button"
+                      disabled={!canOperate}
                       onClick={() => void handleSend(cmd)}
-                      className="rounded-full border border-border/70 bg-muted/40 px-3 py-1 font-mono text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                      className="rounded-full border border-border/70 bg-muted/40 px-3 py-1 font-mono text-xs text-muted-foreground transition-colors enabled:hover:bg-muted enabled:hover:text-foreground disabled:opacity-50"
                     >
                       {cmd}
                     </button>
@@ -988,10 +1293,42 @@ export function BotChatPane({
               </div>
             ) : null}
 
+            {!loadingMessages && (transcript.olderCursor !== null || olderForSession?.error) ? (
+              <div className="flex flex-col gap-1.5 pb-2">
+                {transcript.olderCursor !== null ? (
+                  <button
+                    type="button"
+                    disabled={olderForSession?.loading === true}
+                    onClick={() => void loadOlderMessages()}
+                    className="flex w-full cursor-pointer items-center gap-3 py-1.5 text-muted-foreground text-xs hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring disabled:cursor-default"
+                  >
+                    <span aria-hidden="true" className="h-px flex-1 bg-border/70" />
+                    <span className="shrink-0">
+                      {olderForSession?.loading
+                        ? gt("Loading earlier messages…")
+                        : gt("Load earlier messages")}
+                    </span>
+                    <span aria-hidden="true" className="h-px flex-1 bg-border/70" />
+                  </button>
+                ) : null}
+                {olderForSession?.error ? (
+                  <p role="status" className="text-center text-muted-foreground text-xs">
+                    {olderForSession.error}
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
+
             {timelineItems.map((item) => {
               switch (item.kind) {
                 case "user":
-                  return <PaUserMessageRow key={item.id} message={item.message} />;
+                  return (
+                    <PaUserMessageRow
+                      key={item.id}
+                      message={item.message}
+                      environmentId={environmentId}
+                    />
+                  );
                 case "work-group":
                   return (
                     <PaWorkGroupRow key={item.id} steps={item.steps} timestamp={item.timestamp} />
@@ -1029,10 +1366,11 @@ export function BotChatPane({
 
         <div
           ref={composerOverlayRef}
-          className="pointer-events-none absolute inset-x-0 bottom-0 z-20 min-w-0 bg-gradient-to-t from-background via-background/85 to-transparent px-3 pt-4 sm:px-8"
-          style={{ paddingBottom: "max(0.75rem, env(safe-area-inset-bottom))" }}
+          className="chat-composer-lane pointer-events-none absolute inset-x-0 bottom-0 z-20 min-w-0 bg-gradient-to-t from-background via-background/85 to-transparent pt-4"
         >
           <PaComposer
+            key={JSON.stringify([environmentId, activeSessionId])}
+            environmentId={environmentId}
             bot={bot}
             capabilities={capabilities}
             sessionId={activeSessionId}
@@ -1040,7 +1378,7 @@ export function BotChatPane({
             onDraftChange={setDraft}
             running={running}
             sending={sending}
-            disabled={!activeSessionId}
+            disabled={!activeSessionId || !canOperate}
             slashCommands={slashCommands}
             openRequests={openRequests}
             respondingIds={respondingIds}
@@ -1052,8 +1390,24 @@ export function BotChatPane({
               }))
             }
             onRespondRequest={(req, decision) => void handleRespondRequest(req, decision)}
-            onSend={() => void handleSend()}
+            onRespondSecret={handleRespondSecret}
+            onSend={(options) => handleSend(undefined, options)}
+            onSteer={() => void handleSteer()}
             onInterrupt={() => void handleInterrupt()}
+            statusSlot={
+              <>
+                <PaTodoProgressBar todos={liveTurn.todos} />
+                <PaQueueBar
+                  items={liveTurn.queuedItems}
+                  canOperate={canOperate}
+                  canSteer={running && canSteer && canOperate}
+                  busyIds={queueBusyIds}
+                  onSteer={(item) => void handleQueueAction(item, "steer")}
+                  onCancel={(item) => void handleQueueAction(item, "cancel")}
+                  onResolveUnknown={(item) => void handleQueueAction(item, "resolveUnknown")}
+                />
+              </>
+            }
             error={streamError}
             onDismissError={() =>
               updateLiveTurn(activeSessionId, (prev) => ({ ...prev, error: null }))
@@ -1076,6 +1430,11 @@ export function BotChatPane({
               setSessionReasoning({ sessionId: activeSessionId, effort, settingsVersion });
             }}
             onModelChanged={onActivity}
+          />
+          <div
+            aria-hidden
+            // The open keyboard already covers the home indicator.
+            className={keyboardOpen ? "h-2" : "h-[max(0.75rem,env(safe-area-inset-bottom))]"}
           />
         </div>
       </div>

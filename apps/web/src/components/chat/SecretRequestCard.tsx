@@ -26,16 +26,8 @@ import {
 } from "@t3tools/contracts";
 import { useAtomValue } from "@effect/atom-react";
 import { hasFeatureFlag } from "@t3tools/client-runtime/state/server";
-import { T, useGT, useMessages, Var } from "gt-react";
-import {
-  CheckIcon,
-  ExternalLinkIcon,
-  EyeIcon,
-  EyeOffIcon,
-  LockIcon,
-  MinusIcon,
-  ShieldCheckIcon,
-} from "lucide-react";
+import { T, useMessages, Var } from "gt-react";
+import { CheckIcon, ExternalLinkIcon, LockIcon, MinusIcon, ShieldCheckIcon } from "lucide-react";
 import { useId, useRef, useState, type FormEvent } from "react";
 
 import { serverEnvironment } from "../../state/server";
@@ -43,8 +35,8 @@ import { useEnvironmentScope } from "../../state/session";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
-import { InputGroup, InputGroupAddon, InputGroupInput } from "../ui/input-group";
 import { SecretSourceSelect } from "../settings/SecretSourceInput";
+import { SecretRequestField } from "./SecretRequestField";
 import { WorkLogRow } from "./WorkLog";
 
 export function SecretRequestCard(props: {
@@ -300,69 +292,5 @@ function PendingSecretRequestForm(props: {
         </div>
       </div>
     </form>
-  );
-}
-
-function SecretRequestField(props: {
-  readonly id: string;
-  readonly input: SecretRequestInput;
-  readonly label: string | undefined;
-  readonly value: string;
-  readonly disabled: boolean;
-  readonly invalid: boolean;
-  readonly describedBy: string;
-  readonly onChange: (value: string) => void;
-}) {
-  const { input } = props;
-  const gt = useGT();
-  const [revealed, setRevealed] = useState(false);
-  const masked = input.secret && !revealed;
-  const control = (
-    <InputGroup>
-      <InputGroupInput
-        id={props.id}
-        // A CSS-masked text field still exposes its value to screen readers.
-        type={masked ? "password" : "text"}
-        autoComplete="off"
-        autoCorrect="off"
-        autoCapitalize="off"
-        spellCheck={false}
-        data-1p-ignore
-        data-lpignore="true"
-        data-bwignore
-        placeholder={input.placeholder}
-        value={props.value}
-        disabled={props.disabled}
-        aria-invalid={props.invalid || undefined}
-        aria-describedby={props.describedBy}
-        onChange={(event) => props.onChange(event.currentTarget.value)}
-      />
-      {input.secret ? (
-        <InputGroupAddon align="inline-end">
-          <Button
-            type="button"
-            size="icon-xs"
-            variant="ghost"
-            aria-label={gt("Show {label}", { label: input.label })}
-            aria-pressed={revealed}
-            disabled={props.disabled}
-            // Keep focus, and the caret, in the input.
-            onMouseDown={(event) => event.preventDefault()}
-            onClick={() => setRevealed((current) => !current)}
-          >
-            {revealed ? <EyeOffIcon aria-hidden /> : <EyeIcon aria-hidden />}
-          </Button>
-        </InputGroupAddon>
-      ) : null}
-    </InputGroup>
-  );
-  if (props.label === undefined) return control;
-  return (
-    <div className="flex min-w-0 flex-col gap-1">
-      <label htmlFor={props.id} className="text-xs font-medium text-muted-foreground">
-        {props.label}
-      </label>
-      {control}
-    </div>
   );
 }

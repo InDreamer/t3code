@@ -58,7 +58,15 @@ import {
   type PaWorkGroupSummary,
   type PaWorkStep,
 } from "@t3tools/client-runtime/pa/timeline";
-import type { PaMessage, PaToolCategory } from "@t3tools/contracts";
+import type { EnvironmentId, PaAttachment, PaMessage, PaToolCategory } from "@t3tools/contracts";
+import { formatAttachmentSize } from "@t3tools/client-runtime/state/attachments";
+import { useAssetUrls } from "../../assets/assetUrls";
+import { useRenderedAppearance } from "../../hooks/useTheme";
+import { AttachmentImage } from "../media/AttachmentImage";
+import { AttachmentFilePreview } from "../files/AttachmentFilePreview";
+import { ExpandedImageDialog } from "../chat/ExpandedImageDialog";
+import { PierreEntryIcon } from "../chat/PierreEntryIcon";
+import { Dialog, DialogPopup, DialogTitle } from "../ui/dialog";
 
 const USER_MESSAGE_MARKDOWN: MarkdownExtensions = { userMessage: true, leadingWhitespace: true };
 const COLLAPSED_USER_MESSAGE_FADE_MASK =
@@ -105,36 +113,40 @@ export function formatPaToolVerb(gt: Translate, action: PaToolAction): string {
     action.phase === "failed" ? failed : action.phase === "active" ? active : done;
   switch (action.category) {
     case "terminal":
-      return pick(gt("命令失败"), gt("正在运行"), gt("已运行"));
+      return pick(gt("Command failed"), gt("Running command"), gt("Ran command"));
     case "file-read":
-      return pick(gt("读取失败"), gt("正在读取"), gt("已读取"));
+      return pick(gt("Read failed"), gt("Reading file"), gt("Read file"));
     case "file-edit":
-      return pick(gt("编辑失败"), gt("正在编辑"), gt("已编辑"));
+      return pick(gt("Edit failed"), gt("Editing file"), gt("Edited file"));
     case "web-search":
-      return pick(gt("搜索失败"), gt("正在搜索"), gt("已搜索"));
+      return pick(gt("Search failed"), gt("Searching"), gt("Searched"));
     case "web-fetch":
-      return pick(gt("抓取失败"), gt("正在读取网页"), gt("已读取网页"));
+      return pick(gt("Fetch failed"), gt("Reading web page"), gt("Read web page"));
     case "search":
-      return pick(gt("查找失败"), gt("正在查找"), gt("已查找"));
+      return pick(gt("Lookup failed"), gt("Looking up"), gt("Looked up"));
     case "memory":
-      return pick(gt("检索失败"), gt("正在检索记忆"), gt("已检索记忆"));
+      return pick(gt("Memory search failed"), gt("Searching memory"), gt("Searched memory"));
     case "agent":
-      return pick(gt("委派失败"), gt("正在委派子任务"), gt("已委派子任务"));
+      return pick(gt("Delegation failed"), gt("Delegating subtask"), gt("Delegated subtask"));
     case "todo":
-      return pick(gt("更新任务失败"), gt("正在更新任务"), gt("已更新任务"));
+      return pick(gt("Task update failed"), gt("Updating tasks"), gt("Updated tasks"));
     case "schedule":
-      return pick(gt("定时任务操作失败"), gt("正在操作定时任务"), gt("已更新定时任务"));
+      return pick(
+        gt("Schedule operation failed"),
+        gt("Managing scheduled tasks"),
+        gt("Updated scheduled tasks"),
+      );
     case "skill":
-      return pick(gt("技能处理失败"), gt("正在处理技能"), gt("已处理技能"));
+      return pick(gt("Skill failed"), gt("Using skill"), gt("Used skill"));
     case "code":
-      return pick(gt("代码执行失败"), gt("正在执行代码"), gt("已执行代码"));
+      return pick(gt("Code execution failed"), gt("Running code"), gt("Ran code"));
     case "vision":
-      return pick(gt("图片分析失败"), gt("正在分析图片"), gt("已分析图片"));
+      return pick(gt("Image analysis failed"), gt("Analyzing image"), gt("Analyzed image"));
     case "message":
-      return pick(gt("发送失败"), gt("正在发送消息"), gt("已发送消息"));
+      return pick(gt("Could not send message"), gt("Sending message"), gt("Sent message"));
     case "other":
       return action.phase === "failed"
-        ? gt("{tool} 失败", { tool: action.toolName })
+        ? gt("{tool} failed", { tool: action.toolName })
         : action.toolName;
   }
 }
@@ -142,16 +154,16 @@ export function formatPaToolVerb(gt: Translate, action: PaToolAction): string {
 function formatPaWorkGroupLabel(gt: Translate, summary: PaWorkGroupSummary): string {
   switch (summary.kind) {
     case "reasoning":
-      return gt("思考过程");
+      return gt("Reasoning details");
     case "tool": {
       const verb = formatPaToolVerb(gt, summary.action);
       const detail = summary.action.target ? `${verb} ${summary.action.target}` : verb;
-      return summary.afterReasoning ? gt("已思考 · {detail}", { detail }) : detail;
+      return summary.afterReasoning ? gt("Reasoned · {detail}", { detail }) : detail;
     }
     case "tools":
       return summary.afterReasoning
-        ? gt("已思考并调用 {count} 个工具", { count: summary.count })
-        : gt("已调用 {count} 个工具", { count: summary.count });
+        ? gt("Reasoned and used {count} tools", { count: summary.count })
+        : gt("Used {count} tools", { count: summary.count });
   }
 }
 
@@ -206,10 +218,147 @@ function PaElapsedTimer({ startedAt }: { readonly startedAt: number }) {
   return <span className="tabular-nums">{formatPaElapsedSeconds(startedAt, nowMs)}</span>;
 }
 
+function PaMessageAttachments({
+  attachments,
+  environmentId,
+}: {
+  readonly attachments: ReadonlyArray<PaAttachment>;
+  readonly environmentId: EnvironmentId;
+}) {
+  const gt = useGT();
+  const messages = useMessages();
+  const theme = useRenderedAppearance();
+  const available = attachments.filter((item) => item.type === "image" && !item.unavailable);
+  const urls = useAssetUrls(
+    environmentId,
+    available.map((item) => ({
+      _tag: "attachment",
+      attachmentId: item.id,
+      fileName: item.name,
+      mimeType: item.mimeType,
+    })),
+  );
+  const [selected, setSelected] = useState<string | null>(null);
+  const images = available.map((item, i) => ({
+    id: item.id,
+    name: item.name,
+    mimeType: item.mimeType,
+    src: urls[i] ?? null,
+    actionsSource: {
+      kind: "image" as const,
+      name: item.name,
+      src: urls[i] ?? null,
+      asset: {
+        environmentId,
+        resource: {
+          _tag: "attachment" as const,
+          attachmentId: item.id,
+          fileName: item.name,
+          mimeType: item.mimeType,
+        },
+      },
+    },
+  }));
+  const index = images.findIndex((image) => image.id === selected);
+  const file = attachments.find(
+    (item) => item.type === "file" && !item.unavailable && item.id === selected,
+  );
+  return (
+    <div className="flex min-w-0 flex-col gap-2">
+      {images.length ? (
+        <div
+          className={cn(
+            "grid gap-1",
+            images.length === 1 ? "max-w-96" : "w-80 max-w-full grid-cols-2",
+          )}
+        >
+          {images.map((image) => (
+            <button
+              type="button"
+              key={image.id}
+              disabled={image.src === null}
+              onClick={() => setSelected(image.id)}
+              aria-label={gt("Preview {name}", { name: image.name })}
+              className="overflow-hidden rounded-lg bg-muted"
+            >
+              {image.src ? (
+                <AttachmentImage
+                  src={image.src}
+                  name={image.name}
+                  mimeType={image.mimeType}
+                  alt={image.name}
+                  loading="lazy"
+                  className={
+                    images.length === 1
+                      ? "mx-auto max-h-80 max-w-full object-contain"
+                      : "aspect-square w-full object-cover"
+                  }
+                />
+              ) : (
+                <span className="p-2 text-xs">{image.name}</span>
+              )}
+            </button>
+          ))}
+        </div>
+      ) : null}
+      {attachments
+        .filter((item) => item.type === "file" || item.unavailable)
+        .map((item) => (
+          <button
+            key={item.id}
+            type="button"
+            disabled={item.unavailable}
+            onClick={() => setSelected(item.id)}
+            className="flex max-w-full items-center gap-2 rounded-lg border border-border/70 px-3 py-2 text-start text-sm"
+          >
+            {item.type === "image" ? (
+              <ImageIcon className="size-4 shrink-0" />
+            ) : (
+              <PierreEntryIcon kind="file" pathValue={item.name} theme={theme} />
+            )}
+            <span className="min-w-0 break-all">{item.name}</span>
+            <span className="shrink-0 text-xs text-muted-foreground">
+              {item.unavailable
+                ? gt("Historical attachment preview unavailable")
+                : formatAttachmentSize(item.sizeBytes, messages)}
+            </span>
+          </button>
+        ))}
+      {index >= 0 ? (
+        <ExpandedImageDialog preview={{ images, index }} onClose={() => setSelected(null)} />
+      ) : null}
+      {file ? (
+        <Dialog
+          open
+          onOpenChange={(open) => {
+            if (!open) setSelected(null);
+          }}
+        >
+          <DialogPopup
+            className="h-[min(85vh,52rem)] max-w-4xl overflow-hidden"
+            showCloseButton={false}
+          >
+            <DialogTitle className="sr-only">{file.name}</DialogTitle>
+            <AttachmentFilePreview
+              name={file.name}
+              mimeType={file.mimeType}
+              sizeBytes={file.sizeBytes}
+              asset={{ environmentId, attachmentId: file.id }}
+              onClose={() => setSelected(null)}
+            />
+          </DialogPopup>
+        </Dialog>
+      ) : null}
+    </div>
+  );
+}
+
 export const PaUserMessageRow = memo(function PaUserMessageRow({
   message,
+  environmentId,
 }: {
   readonly message: PaMessage;
+  readonly environmentId: EnvironmentId | null;
 }) {
   const [expanded, setExpanded] = useState(false);
   const { ref: contentRef, tallEnough: canCollapse } = useTallEnoughToFold(
@@ -220,32 +369,37 @@ export const PaUserMessageRow = memo(function PaUserMessageRow({
   return (
     <div className="group flex min-w-0 flex-col items-end gap-1 pb-4">
       <div
-        className="relative min-w-0 max-w-[80%] rounded-2xl bg-message p-3 text-message-foreground"
+        className="relative min-w-0 max-w-[80%] space-y-2 rounded-2xl bg-message p-3 text-message-foreground"
         data-user-message-bubble=""
       >
-        <div
-          className={cn("relative", isCollapsed && "max-h-44 overflow-hidden")}
-          style={
-            isCollapsed
-              ? {
-                  WebkitMaskImage: COLLAPSED_USER_MESSAGE_FADE_MASK,
-                  maskImage: COLLAPSED_USER_MESSAGE_FADE_MASK,
-                }
-              : undefined
-          }
-        >
-          <div ref={contentRef}>
-            <ChatMarkdown
-              text={message.text}
-              cwd={undefined}
-              className="user-message-markdown text-message-foreground"
-              lineBreaks
-              parseRawHtml={false}
-              extensions={USER_MESSAGE_MARKDOWN}
-              headingLevelOffset={MESSAGE_HEADING_LEVEL}
-            />
+        {environmentId && message.attachments?.length ? (
+          <PaMessageAttachments environmentId={environmentId} attachments={message.attachments} />
+        ) : null}
+        {message.text.trim() ? (
+          <div
+            className={cn("relative", isCollapsed && "max-h-44 overflow-hidden")}
+            style={
+              isCollapsed
+                ? {
+                    WebkitMaskImage: COLLAPSED_USER_MESSAGE_FADE_MASK,
+                    maskImage: COLLAPSED_USER_MESSAGE_FADE_MASK,
+                  }
+                : undefined
+            }
+          >
+            <div ref={contentRef}>
+              <ChatMarkdown
+                text={message.text}
+                cwd={undefined}
+                className="user-message-markdown text-message-foreground"
+                lineBreaks
+                parseRawHtml={false}
+                extensions={USER_MESSAGE_MARKDOWN}
+                headingLevelOffset={MESSAGE_HEADING_LEVEL}
+              />
+            </div>
           </div>
-        </div>
+        ) : null}
         {canCollapse ? (
           <div className="mt-1.5 flex items-center justify-end">
             <Button
@@ -255,7 +409,7 @@ export const PaUserMessageRow = memo(function PaUserMessageRow({
               aria-expanded={expanded}
               onClick={() => setExpanded((v) => !v)}
             >
-              {expanded ? <T>收起</T> : <T>展开完整消息</T>}
+              {expanded ? <T>Collapse</T> : <T>Show full message</T>}
             </Button>
           </div>
         ) : null}
@@ -268,7 +422,7 @@ export const PaUserMessageRow = memo(function PaUserMessageRow({
         )}
       >
         <PaTimestamp timestamp={message.timestamp} />
-        <MessageCopyButton text={message.text} variant="ghost" />
+        {message.text ? <MessageCopyButton text={message.text} variant="ghost" /> : null}
       </div>
     </div>
   );
@@ -336,7 +490,7 @@ const PaWorkStepRow = memo(function PaWorkStepRow({
     const hasContent = step.text.trim().length > 0;
     const preview = hasContent
       ? step.text.slice(0, THOUGHT_PREVIEW_SOURCE_MAX_LENGTH)
-      : gt("思考过程");
+      : gt("Reasoning details");
 
     return (
       <WorkLogRow
@@ -363,7 +517,9 @@ const PaWorkStepRow = memo(function PaWorkStepRow({
         }
         label={
           expanded ? (
-            <span className="text-secondary-label">{active ? <T>思考中</T> : <T>思考过程</T>}</span>
+            <span className="text-secondary-label">
+              {active ? <T>Thinking</T> : <T>Reasoning details</T>}
+            </span>
           ) : (
             <span
               className={cn("block truncate text-secondary-label", active && "live-tool-shine")}
@@ -373,7 +529,9 @@ const PaWorkStepRow = memo(function PaWorkStepRow({
                 text={preview}
                 cwd={undefined}
                 parseRawHtml={false}
-                extensions={thoughtPreviewMarkdown(active ? gt("思考中") : gt("思考过程"))}
+                extensions={thoughtPreviewMarkdown(
+                  active ? gt("Thinking") : gt("Reasoning details"),
+                )}
               />
             </span>
           )
@@ -491,11 +649,11 @@ const PaWorkStepRow = memo(function PaWorkStepRow({
               <div className="space-y-1">
                 <div className="flex items-center justify-between gap-2 text-2xs font-medium text-muted-foreground">
                   <span>
-                    <T>命令</T>
+                    <T>Command</T>
                   </span>
                   <MessageCopyButton
                     text={inspector.command}
-                    label={gt("复制命令")}
+                    label={gt("Copy command")}
                     variant="ghost"
                   />
                 </div>
@@ -508,11 +666,11 @@ const PaWorkStepRow = memo(function PaWorkStepRow({
               <div className="space-y-1">
                 <div className="flex items-center justify-between gap-2 text-2xs font-medium text-muted-foreground">
                   <span>
-                    <T>参数</T>
+                    <T>Arguments</T>
                   </span>
                   <MessageCopyButton
                     text={inspector.argsJson}
-                    label={gt("复制参数")}
+                    label={gt("Copy arguments")}
                     variant="ghost"
                   />
                 </div>
@@ -525,11 +683,11 @@ const PaWorkStepRow = memo(function PaWorkStepRow({
               <div className="space-y-1">
                 <div className="flex items-center justify-between gap-2 text-2xs font-medium text-muted-foreground">
                   <span>
-                    <T>输出</T>
+                    <T>Output</T>
                   </span>
                   <MessageCopyButton
                     text={inspector.output}
-                    label={gt("复制输出")}
+                    label={gt("Copy output")}
                     variant="ghost"
                   />
                 </div>
@@ -702,7 +860,7 @@ function PaLiveWorkGroup({
       <WorkLogBlock>
         <PaLiveShimmerActivityRow
           iconKind="reasoning"
-          label={statusText || gt("思考中")}
+          label={statusText || gt("Thinking")}
           active
           shimmer
         />
@@ -742,7 +900,7 @@ function PaLiveWorkGroup({
                   text={thoughtLine}
                   cwd={undefined}
                   parseRawHtml={false}
-                  extensions={thoughtPreviewMarkdown(gt("思考中"))}
+                  extensions={thoughtPreviewMarkdown(gt("Thinking"))}
                 />
               </span>
             }
@@ -774,7 +932,7 @@ function PaLiveWorkGroup({
                 iconKind="reasoning"
                 active
                 shimmer
-                label={statusText || gt("思考中")}
+                label={statusText || gt("Thinking")}
               />
             )}
           </div>
@@ -833,18 +991,18 @@ export const PaLiveTurnView = memo(function PaLiveTurnView({
             >
               {liveTurn.startedAt ? (
                 <>
-                  <T>处理中</T> <PaElapsedTimer startedAt={liveTurn.startedAt} />
+                  <T>Working</T> <PaElapsedTimer startedAt={liveTurn.startedAt} />
                 </>
               ) : (
-                <T>处理中...</T>
+                <T>Working…</T>
               )}
               <ActivityShimmerOverlay>
                 {liveTurn.startedAt ? (
                   <>
-                    <T>处理中</T> <PaElapsedTimer startedAt={liveTurn.startedAt} />
+                    <T>Working</T> <PaElapsedTimer startedAt={liveTurn.startedAt} />
                   </>
                 ) : (
-                  <T>处理中...</T>
+                  <T>Working…</T>
                 )}
               </ActivityShimmerOverlay>
             </span>
@@ -884,7 +1042,7 @@ export const PaLiveTurnView = memo(function PaLiveTurnView({
         <WorkLogBlock>
           <PaLiveShimmerActivityRow
             iconKind="reasoning"
-            label={liveTurn.statusText || gt("思考中")}
+            label={liveTurn.statusText || gt("Thinking")}
             active
             shimmer
           />
@@ -907,10 +1065,14 @@ export const PaCompactionRow = memo(function PaCompactionRow({
     <div className="pb-3">
       <TimelineSystemDivider
         icon={Minimize2Icon}
-        label={gt("上下文已压缩")}
+        label={
+          message.compactedMessages
+            ? gt("Context compacted · {count} messages", { count: message.compactedMessages })
+            : gt("Context compacted")
+        }
         {...(hasDetail
           ? {
-              actionLabel: expanded ? gt("收起摘要") : gt("查看压缩摘要"),
+              actionLabel: expanded ? gt("Collapse summary") : gt("View compaction summary"),
               onAction: () => setExpanded((v) => !v),
             }
           : {})}
@@ -940,7 +1102,7 @@ export const PaSystemOutputRow = memo(function PaSystemOutputRow({
           <span className="flex items-center gap-1.5">
             <TerminalIcon className="size-3" />
             <span>
-              <T>命令输出</T>
+              <T>Command output</T>
             </span>
           </span>
           <div className="flex items-center gap-1 opacity-0 transition-opacity pointer-coarse:opacity-100 group-hover/system:opacity-100">

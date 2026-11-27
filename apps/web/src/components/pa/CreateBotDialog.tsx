@@ -19,6 +19,7 @@ import { Input } from "../ui/input";
 import { Label } from "../ui/label";
 import { Switch } from "../ui/switch";
 import { Textarea } from "../ui/textarea";
+import { PaNativeSelect } from "./PaNativeSelect";
 import { BotAvatar, PA_AVATAR_COLORS, PA_AVATAR_SHAPES } from "./BotAvatar";
 import { paApi, paErrorMessage } from "./paApi";
 
@@ -75,17 +76,18 @@ export function CreateBotDialog({
   const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!activeInstance || !activeInstance.online) {
-      setError(gt("当前没有可以创建 Bot 的在线引擎"));
+      setError(gt("No online engine can create bots"));
       return;
     }
     if (!derivedSlug) {
-      setError(gt("请填写以英文或数字开头的标识（例如 news-bot）"));
+      setError(gt("Start the ID with a letter or number (e.g. news-bot)"));
       return;
     }
     setSubmitting(true);
     setError(null);
+    let bot: PaBotSummary;
     try {
-      const bot = await paApi.createBot({
+      bot = await paApi.createBot({
         instanceId: activeInstance.instanceId,
         agentRef: derivedSlug,
         name: name.trim() || derivedSlug,
@@ -95,14 +97,15 @@ export function CreateBotDialog({
         avatarShape,
         pinned,
       });
-      resetForm();
-      onOpenChange(false);
-      onCreated(bot);
     } catch (err) {
-      setError(paErrorMessage(err, gt("创建 Bot 失败")));
-    } finally {
+      setError(paErrorMessage(err, gt("Could not create bot")));
       setSubmitting(false);
+      return;
     }
+    setSubmitting(false);
+    resetForm();
+    onOpenChange(false);
+    onCreated(bot);
   };
 
   return (
@@ -114,13 +117,13 @@ export function CreateBotDialog({
       }}
     >
       <DialogPopup className="max-w-lg">
-        <form onSubmit={handleSubmit} className="flex min-h-0 flex-1 flex-col">
+        <form onSubmit={handleSubmit} className="flex min-h-0 flex-1 flex-col max-sm:pb-safe">
           <DialogHeader>
             <DialogTitle>
-              <T>新建 Bot</T>
+              <T>Create bot</T>
             </DialogTitle>
             <DialogDescription>
-              <T>每个 Bot 是引擎里的一个独立 Agent，拥有自己的记忆、人设和模型。</T>
+              <T>Each bot has its own memory, instructions and model.</T>
             </DialogDescription>
           </DialogHeader>
 
@@ -129,7 +132,7 @@ export function CreateBotDialog({
               <BotAvatar color={avatarColor} shape={avatarShape} size="md" starred={pinned} />
               <div className="min-w-0 flex-1">
                 <div className="truncate font-medium text-sm">
-                  {name.trim() || derivedSlug || gt("新 Bot")}
+                  {name.trim() || derivedSlug || gt("New bot")}
                 </div>
                 <div className="mt-1 flex flex-wrap items-center gap-1.5">
                   {instances.map((instance) => (
@@ -139,8 +142,8 @@ export function CreateBotDialog({
                       size="sm"
                     >
                       {instance.online
-                        ? gt("{label} 在线", { label: instance.label })
-                        : gt("{label} 离线", { label: instance.label })}
+                        ? gt("{label} online", { label: instance.label })
+                        : gt("{label} offline", { label: instance.label })}
                     </Badge>
                   ))}
                 </div>
@@ -150,13 +153,12 @@ export function CreateBotDialog({
             {creatable.length > 1 ? (
               <div className="space-y-1.5">
                 <Label htmlFor="pa-create-instance">
-                  <T>引擎</T>
+                  <T>Engine</T>
                 </Label>
-                <select
+                <PaNativeSelect
                   id="pa-create-instance"
                   value={activeInstance?.instanceId ?? ""}
                   onChange={(e) => setSelectedInstanceId(e.target.value)}
-                  className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
                 >
                   {creatable.map((instance) => (
                     <option
@@ -167,18 +169,18 @@ export function CreateBotDialog({
                       {instance.label}
                     </option>
                   ))}
-                </select>
+                </PaNativeSelect>
               </div>
             ) : null}
 
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <div className="space-y-1.5">
                 <Label htmlFor="pa-create-name">
-                  <T>显示名称</T>
+                  <T>Display name</T>
                 </Label>
                 <Input
                   id="pa-create-name"
-                  placeholder={gt("例如：调研哥 / 币哥")}
+                  placeholder={gt("e.g. Research assistant")}
                   value={name}
                   onChange={(e) => setName(e.target.value)}
                   autoFocus
@@ -186,11 +188,11 @@ export function CreateBotDialog({
               </div>
               <div className="space-y-1.5">
                 <Label htmlFor="pa-create-agent-ref">
-                  <T>标识（英文/数字）</T>
+                  <T>ID (letters and numbers)</T>
                 </Label>
                 <Input
                   id="pa-create-agent-ref"
-                  placeholder={gt("例如：research-bot")}
+                  placeholder={gt("e.g. research-bot")}
                   value={agentRef}
                   onChange={(e) => setAgentRef(e.target.value)}
                 />
@@ -199,11 +201,11 @@ export function CreateBotDialog({
 
             <div className="space-y-1.5">
               <Label htmlFor="pa-create-desc">
-                <T>一句话简介（可选）</T>
+                <T>Short description (optional)</T>
               </Label>
               <Input
                 id="pa-create-desc"
-                placeholder={gt("例如：每天整理 X 摘要和 AI 圈动态")}
+                placeholder={gt("e.g. Summarizes AI news daily")}
                 value={description}
                 onChange={(e) => setDescription(e.target.value)}
               />
@@ -211,7 +213,7 @@ export function CreateBotDialog({
 
             <div className="space-y-2">
               <Label>
-                <T>头像造型与配色</T>
+                <T>Avatar shape and color</T>
               </Label>
               <div className="flex flex-wrap gap-2">
                 {PA_AVATAR_SHAPES.map((item) => (
@@ -244,7 +246,7 @@ export function CreateBotDialog({
                     aria-label={m(swatch.label)}
                     onClick={() => setAvatarColor(swatch.value)}
                     className={cn(
-                      "size-6 rounded-full transition-transform",
+                      "size-6 rounded-full transition-transform pointer-coarse:size-8",
                       avatarColor === swatch.value &&
                         "scale-110 ring-2 ring-foreground ring-offset-2 ring-offset-background",
                     )}
@@ -256,12 +258,12 @@ export function CreateBotDialog({
 
             <div className="space-y-1.5">
               <Label htmlFor="pa-create-instructions">
-                <T>人设 / 指令（可选）</T>
+                <T>Instructions (optional)</T>
               </Label>
               <Textarea
                 id="pa-create-instructions"
                 rows={4}
-                placeholder={gt("描述这个 Bot 的职责、回复风格和规则...")}
+                placeholder={gt("Describe the bot’s role, style and instructions…")}
                 value={instructions}
                 onChange={(e) => setInstructions(e.target.value)}
               />
@@ -270,10 +272,10 @@ export function CreateBotDialog({
             <div className="flex items-center justify-between rounded-lg border border-border/60 px-3 py-2.5">
               <div>
                 <div className="font-medium text-sm">
-                  <T>置顶到 Bot 页顶部</T>
+                  <T>Pin to the top of Bots</T>
                 </div>
                 <div className="text-muted-foreground text-xs">
-                  <T>以大头像常驻在顶部快捷区</T>
+                  <T>Show a large avatar in the shortcuts section</T>
                 </div>
               </div>
               <Switch checked={pinned} onCheckedChange={setPinned} />
@@ -288,7 +290,7 @@ export function CreateBotDialog({
 
           <DialogFooter>
             <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
-              <T>取消</T>
+              <T>Cancel</T>
             </Button>
             <Button type="submit" disabled={submitting || !canCreate}>
               {submitting ? (
@@ -296,7 +298,7 @@ export function CreateBotDialog({
               ) : (
                 <PlusIcon className="mr-1.5 size-4" />
               )}
-              <T>创建并进入对话</T>
+              <T>Create and open chat</T>
             </Button>
           </DialogFooter>
         </form>

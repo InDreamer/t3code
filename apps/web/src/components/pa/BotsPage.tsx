@@ -62,7 +62,7 @@ export function BotsPage() {
   const settingsBot = settingsBotId ? (bots.find((b) => b.botId === settingsBotId) ?? null) : null;
 
   return (
-    <SidebarInset className="flex h-dvh min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+    <SidebarInset className="flex h-(--app-viewport-height,100svh) min-h-0 min-w-0 flex-1 flex-col overflow-hidden overscroll-y-none md:h-(--app-viewport-height,100dvh)">
       {activeBot ? (
         <BotChatPane
           key={activeBot.botId}
@@ -93,7 +93,7 @@ export function BotsPage() {
               onClick={() => setPaCreateDialogOpen(true)}
             >
               <PlusIcon className="size-3.5" />
-              <T>新建 Bot</T>
+              <T>Create bot</T>
             </Button>
           </WorkspacePageHeader>
 
@@ -101,7 +101,7 @@ export function BotsPage() {
             {loading ? (
               <div className="flex items-center gap-2 text-sm">
                 <Loader2Icon className="size-4 animate-spin" />
-                <T>正在加载 Bots...</T>
+                <T>Loading bots…</T>
               </div>
             ) : (
               <>
@@ -118,8 +118,8 @@ export function BotsPage() {
                         className="rounded-xl border border-warning/40 bg-warning-surface p-3 text-xs text-warning-foreground"
                       >
                         <T>
-                          <Var>{instance.label}</Var> 当前未连接：
-                          <Var>{instance.error || gt("请检查引擎服务状态")}</Var>
+                          <Var>{instance.label}</Var> is offline.
+                          <Var>{instance.error || gt("Check engine status")}</Var>
                         </T>
                       </div>
                     ))}
@@ -130,15 +130,15 @@ export function BotsPage() {
                 </div>
                 <div className="space-y-1">
                   <div className="text-base font-medium text-foreground">
-                    <T>还没有可用的 Bot</T>
+                    <T>No bots available</T>
                   </div>
                   <p className="max-w-sm text-xs">
-                    <T>创建一个 Personal Agent Bot，或检查引擎连接状态。</T>
+                    <T>Create a personal agent bot or check the engine connection.</T>
                   </p>
                 </div>
                 <Button type="button" size="sm" onClick={() => setPaCreateDialogOpen(true)}>
                   <PlusIcon className="size-4" />
-                  <T>新建 Bot</T>
+                  <T>Create bot</T>
                 </Button>
               </>
             )}

@@ -79,7 +79,7 @@ export function loadPaBots(quiet: boolean): Promise<void> {
         ...snapshot,
         loading: false,
         refreshing: false,
-        error: paErrorMessage(err, m(msg("无法获取 Bot 列表"))),
+        error: paErrorMessage(err, m(msg("Could not load bots"))),
       });
     })
     .finally(() => {

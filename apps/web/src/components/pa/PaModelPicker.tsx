@@ -83,7 +83,8 @@ function PaModelPickerContent({
         setError(null);
       })
       .catch((err) => {
-        if (requestRef.current === request) setError(paErrorMessage(err, gt("加载模型列表失败")));
+        if (requestRef.current === request)
+          setError(paErrorMessage(err, gt("Could not load models")));
       })
       .finally(() => {
         if (requestRef.current === request) setLoading(false);
@@ -131,7 +132,7 @@ function PaModelPickerContent({
         ...(confirm ? { confirm: true } : {}),
       })
       .catch((err) => {
-        setError(paErrorMessage(err, gt("切换模型失败")));
+        setError(paErrorMessage(err, gt("Could not switch model")));
         return null;
       });
     setSavingKey(null);
@@ -157,15 +158,15 @@ function PaModelPickerContent({
         <span className="min-w-0 truncate">{option.label}</span>
         {option.badge === "current" ? (
           <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-2xs text-foreground/80">
-            <T>当前</T>
+            <T>Current</T>
           </span>
         ) : option.badge === "custom" ? (
           <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-2xs text-muted-foreground">
-            <T>自定义</T>
+            <T>Custom</T>
           </span>
         ) : option.badge === "detected" ? (
           <span className="shrink-0 text-2xs text-muted-foreground/75">
-            <T>自动检测</T>
+            <T>Auto-detect</T>
           </span>
         ) : null}
       </div>
@@ -181,7 +182,7 @@ function PaModelPickerContent({
             aria-pressed={selected}
             onClick={() => void choose(option.id, model)}
             className={cn(
-              "flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs transition-colors disabled:opacity-64",
+              "flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs transition-colors disabled:opacity-64 pointer-coarse:py-2.5",
               selected ? "bg-accent text-accent-foreground" : "hover:bg-muted/60",
             )}
           >
@@ -201,13 +202,13 @@ function PaModelPickerContent({
     <div className="flex max-h-[min(24rem,60dvh)] min-w-0 flex-col gap-2">
       <div className="flex items-center justify-between gap-2 px-1">
         <span className="text-xs font-medium text-muted-foreground">
-          <T>切换模型</T>
+          <T>Switch model</T>
         </span>
         <Button
           type="button"
           size="icon-xs"
           variant="ghost"
-          aria-label={gt("刷新模型列表")}
+          aria-label={gt("Refresh models")}
           disabled={loading}
           onClick={() => {
             setLoading(true);
@@ -222,7 +223,7 @@ function PaModelPickerContent({
         <Input
           size="sm"
           type="search"
-          placeholder={gt("搜索模型或提供方")}
+          placeholder={gt("Search models or providers")}
           value={query}
           onChange={(event) => onQueryChange(event.target.value)}
         />
@@ -233,7 +234,7 @@ function PaModelPickerContent({
           <p className="whitespace-pre-wrap break-words text-foreground">{confirm.message}</p>
           <div className="flex justify-end gap-1.5">
             <Button type="button" size="xs" variant="outline" onClick={() => setConfirm(null)}>
-              <T>取消</T>
+              <T>Cancel</T>
             </Button>
             <Button
               type="button"
@@ -241,7 +242,7 @@ function PaModelPickerContent({
               disabled={savingKey !== null}
               onClick={() => void choose(confirm.provider, confirm.model, true)}
             >
-              <T>确认切换</T>
+              <T>Confirm switch</T>
             </Button>
           </div>
         </div>
@@ -257,12 +258,12 @@ function PaModelPickerContent({
         {!catalog && loading ? (
           <div className="flex items-center justify-center gap-2 py-6 text-xs text-muted-foreground">
             <Loader2Icon className="size-3.5 animate-spin" />
-            <T>正在加载模型...</T>
+            <T>Loading models…</T>
           </div>
         ) : null}
         {catalog && !hasVisibleGroups ? (
           <div className="py-6 text-center text-xs text-muted-foreground">
-            {needle ? <T>没有匹配的模型</T> : <T>没有可选的模型</T>}
+            {needle ? <T>No matching models</T> : <T>No models available</T>}
           </div>
         ) : null}
         {needle ? (
@@ -276,7 +277,7 @@ function PaModelPickerContent({
                   type="button"
                   aria-expanded={showSecondary}
                   onClick={() => setShowSecondary((prev) => !prev)}
-                  className="flex w-full min-w-0 items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-2xs font-medium text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
+                  className="flex w-full min-w-0 items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-2xs font-medium text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground pointer-coarse:py-2.5"
                 >
                   {showSecondary ? (
                     <ChevronDownIcon className="size-3 shrink-0" />
@@ -284,7 +285,7 @@ function PaModelPickerContent({
                     <ChevronRightIcon className="size-3 shrink-0" />
                   )}
                   <span className="min-w-0 flex-1 truncate">
-                    {gt("其他检测到的提供方（{names} · {count}）", {
+                    {gt("Other detected providers ({names} · {count})", {
                       names: secondaryNames,
                       count: secondaryModelCount,
                     })}
@@ -324,7 +325,7 @@ function PaReasoningPicker({
     ? formatPaReasoningLabel(gt, activeLevel.id, activeLevel.label)
     : currentEffort
       ? formatPaReasoningLabel(gt, currentEffort)
-      : gt("推理");
+      : gt("Reasoning");
   const triggerGlyph = resolvePaReasoningGlyph(activeLevel?.id ?? currentEffort, levels);
 
   const pickEffort = async (level: PaReasoningLevel) => {
@@ -342,7 +343,7 @@ function PaReasoningPicker({
         reasoningEffort: level.id,
       })
       .catch((err) => {
-        setError(paErrorMessage(err, gt("切换推理等级失败")));
+        setError(paErrorMessage(err, gt("Could not change reasoning effort")));
         return null;
       });
     setSavingLevel(null);
@@ -365,8 +366,8 @@ function PaReasoningPicker({
             type="button"
             size="xs"
             variant="ghost-muted"
-            className="shrink-0"
-            aria-label={gt("推理等级：{level}", { level: triggerLabel })}
+            className="min-w-0 shrink"
+            aria-label={gt("Reasoning effort: {level}", { level: triggerLabel })}
           >
             <EffortGlyph count={triggerGlyph.count} filled={triggerGlyph.filled} size="xs" />
             <span className="truncate">{triggerLabel}</span>
@@ -383,7 +384,7 @@ function PaReasoningPicker({
         <div className="flex flex-col gap-1.5">
           <div className="flex items-center justify-between gap-2 px-2 py-0.5">
             <span className="text-xs font-medium text-muted-foreground">
-              <T>推理等级</T>
+              <T>Reasoning effort</T>
             </span>
           </div>
 
@@ -393,7 +394,11 @@ function PaReasoningPicker({
             </div>
           ) : null}
 
-          <div role="radiogroup" aria-label={gt("推理等级")} className="flex flex-col gap-0.5">
+          <div
+            role="radiogroup"
+            aria-label={gt("Reasoning effort")}
+            className="flex flex-col gap-0.5"
+          >
             {levels.map((level) => {
               const selected =
                 level.id.toLowerCase() === (activeLevel?.id ?? currentEffort ?? "").toLowerCase();
@@ -408,7 +413,7 @@ function PaReasoningPicker({
                   disabled={savingLevel !== null}
                   onClick={() => void pickEffort(level)}
                   className={cn(
-                    "flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs transition-colors disabled:opacity-64",
+                    "flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs transition-colors disabled:opacity-64 pointer-coarse:py-2.5",
                     selected ? "bg-accent text-accent-foreground" : "hover:bg-muted/60",
                   )}
                 >
@@ -512,7 +517,7 @@ export function PaModelPicker({
               size="xs"
               variant="ghost-muted"
               className="min-w-0 max-w-36 shrink sm:max-w-52"
-              aria-label={gt("切换模型：{model}", { model: label })}
+              aria-label={gt("Switch model: {model}", { model: label })}
             >
               <span className="min-w-0 truncate">{label}</span>
               <ChevronDownIcon className="size-3 opacity-70" />

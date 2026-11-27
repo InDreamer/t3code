@@ -63,21 +63,21 @@ export function formatPaReasoningLabel(
   switch (levelId.toLowerCase()) {
     case "none":
     case "off":
-      return gt("关闭");
+      return gt("Off");
     case "minimal":
-      return gt("极低");
+      return gt("Minimal");
     case "low":
-      return gt("低");
+      return gt("Low");
     case "medium":
-      return gt("中");
+      return gt("Medium");
     case "high":
-      return gt("高");
+      return gt("High");
     case "xhigh":
-      return gt("超高");
+      return gt("Extra high");
     case "max":
-      return gt("最大");
+      return gt("Maximum");
     case "ultra":
-      return gt("极限");
+      return gt("Ultra");
     default:
       return fallbackLabel || levelId;
   }

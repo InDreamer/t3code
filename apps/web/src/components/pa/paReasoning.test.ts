@@ -66,8 +66,8 @@ describe("paReasoning", () => {
 
   it("formats known levels cleanly and falls back for custom engine levels", () => {
     const id = (text: string) => text;
-    expect(formatPaReasoningLabel(id, "none")).toBe("关闭");
-    expect(formatPaReasoningLabel(id, "high")).toBe("高");
+    expect(formatPaReasoningLabel(id, "none")).toBe("Off");
+    expect(formatPaReasoningLabel(id, "high")).toBe("High");
     expect(formatPaReasoningLabel(id, "custom-tier", "Custom Tier")).toBe("Custom Tier");
   });
 });

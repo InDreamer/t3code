@@ -3,6 +3,19 @@ import { describe, expect, it, vi } from "vite-plus/test";
 import { sendPaChatMessage, trackAdmittedPaRow } from "./BotChatPane.logic";
 
 describe("PA send receipts", () => {
+  it("reuses the input id only while the text and uploaded attachment ids match", async () => {
+    const failed = new Map<string, { text: string; inputId: string; attachmentKey?: string }>();
+    const send = vi
+      .fn<(id: string) => Promise<PaSendResult>>()
+      .mockRejectedValue(new PaError({ reason: "Unavailable", message: "lost" }));
+    let next = 0;
+    for (const ids of [["a"], ["a"], ["b"]]) {
+      await expect(
+        sendPaChatMessage(failed, "s", "", () => String(++next), send, ids),
+      ).rejects.toMatchObject({ reason: "Unavailable" });
+    }
+    expect(send.mock.calls.map(([id]) => id)).toEqual(["1", "1", "2"]);
+  });
   it("preserves another session's retry id and retires a command id after permanent conflict", async () => {
     const failed = new Map<string, { text: string; inputId: string }>();
     const send = vi
@@ -41,5 +54,12 @@ describe("PA send receipts", () => {
       trackAdmittedPaRow(rows, "a", "optimistic-row", result, completionToken !== beforeSend),
     ).toBe(true);
     expect(rows.get("a")?.get("optimistic-row")).toBe(true);
+  });
+
+  it("keeps no local row for a send that waits in the engine's queue", () => {
+    const rows = new Map<string, Map<string, boolean>>();
+    const queued: PaSendResult = { kind: "turn", sessionId: "a", submissionId: "q", queued: true };
+    expect(trackAdmittedPaRow(rows, "a", "optimistic-row", queued, false)).toBe(false);
+    expect(rows.has("a")).toBe(false);
   });
 });

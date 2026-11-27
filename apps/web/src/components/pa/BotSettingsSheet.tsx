@@ -48,6 +48,7 @@ import { Separator } from "../ui/separator";
 import { Sheet, SheetDescription, SheetHeader, SheetPopup, SheetTitle } from "../ui/sheet";
 import { Switch } from "../ui/switch";
 import { Textarea } from "../ui/textarea";
+import { PaNativeSelect } from "./PaNativeSelect";
 import { BotAvatar, PA_AVATAR_COLORS, PA_AVATAR_SHAPES } from "./BotAvatar";
 import { paApi, paErrorMessage } from "./paApi";
 import {
@@ -146,9 +147,9 @@ function ToggleListSection({
     readonly id: ToggleFilterMode;
     readonly label: string;
   }> = [
-    { id: "all", label: gt("全部 ({count})", { count: section.items.length }) },
-    { id: "enabled", label: gt("已启用 ({count})", { count: enabled.size }) },
-    { id: "disabled", label: gt("未启用 ({count})", { count: disabledCount }) },
+    { id: "all", label: gt("All ({count})", { count: section.items.length }) },
+    { id: "enabled", label: gt("Enabled ({count})", { count: enabled.size }) },
+    { id: "disabled", label: gt("Disabled ({count})", { count: disabledCount }) },
   ];
 
   return (
@@ -174,7 +175,7 @@ function ToggleListSection({
         </div>
         <Badge variant="outline" size="sm" className="shrink-0">
           <T>
-            已启用 <Var>{enabled.size}</Var> / <Var>{section.items.length}</Var>
+            Enabled <Var>{enabled.size}</Var> / <Var>{section.items.length}</Var>
           </T>
         </Badge>
       </button>
@@ -185,7 +186,7 @@ function ToggleListSection({
             <Input
               size="sm"
               type="search"
-              placeholder={gt("搜索名称、分类或说明...")}
+              placeholder={gt("Search names, categories or descriptions…")}
               value={filter}
               onChange={(e) => {
                 setFilter(e.target.value);
@@ -208,7 +209,7 @@ function ToggleListSection({
                       setPage(1);
                     }}
                     className={cn(
-                      "rounded-md px-2 py-1 text-2xs font-medium transition-colors",
+                      "rounded-md px-2 py-1 text-2xs font-medium transition-colors pointer-coarse:py-1.5",
                       active
                         ? "bg-accent text-accent-foreground"
                         : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
@@ -223,7 +224,7 @@ function ToggleListSection({
 
           {pageSlice.items.length === 0 ? (
             <div className="py-6 text-center text-muted-foreground text-xs">
-              <T>没有匹配的项目</T>
+              <T>No matching items</T>
             </div>
           ) : (
             <div className="space-y-1.5">
@@ -265,7 +266,7 @@ function ToggleListSection({
           {pageSlice.totalPages > 1 ? (
             <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border/50 pt-2 text-2xs text-muted-foreground">
               <span>
-                {gt("第 {start}-{end} 项 · 共 {total} 项", {
+                {gt("{start}–{end} of {total}", {
                   start: pageSlice.startIndex,
                   end: pageSlice.endIndex,
                   total: pageSlice.totalItems,
@@ -277,7 +278,7 @@ function ToggleListSection({
                   size="icon-xs"
                   variant="ghost"
                   disabled={pageSlice.page <= 1}
-                  aria-label={gt("上一页")}
+                  aria-label={gt("Previous page")}
                   onClick={() => setPage(pageSlice.page - 1)}
                 >
                   <ChevronLeftIcon className="size-3.5" />
@@ -305,7 +306,7 @@ function ToggleListSection({
                   size="icon-xs"
                   variant="ghost"
                   disabled={pageSlice.page >= pageSlice.totalPages}
-                  aria-label={gt("下一页")}
+                  aria-label={gt("Next page")}
                   onClick={() => setPage(pageSlice.page + 1)}
                 >
                   <ChevronRightIcon className="size-3.5" />
@@ -361,18 +362,17 @@ function OptionsSection({
             return (
               <div key={field.id} className="space-y-1.5">
                 <Label htmlFor={id}>{field.label}</Label>
-                <select
+                <PaNativeSelect
                   id={id}
                   value={typeof current === "string" ? current : ""}
                   onChange={(e) => set(e.target.value)}
-                  className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
                 >
                   {field.choices.map((choice) => (
                     <option key={choice.id} value={choice.id}>
                       {choice.label}
                     </option>
                   ))}
-                </select>
+                </PaNativeSelect>
               </div>
             );
         }
@@ -434,6 +434,7 @@ function BotSettingsBody({
   const [newScheduleName, setNewScheduleName] = useState("");
   const [newScheduleSpec, setNewScheduleSpec] = useState("every 1h");
   const [newSchedulePrompt, setNewSchedulePrompt] = useState("");
+  const [newScheduleDeliver, setNewScheduleDeliver] = useState("");
 
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- loads the agent's config sections, model catalog and schedules when the editor opens
   useEffect(() => {
@@ -468,7 +469,7 @@ function BotSettingsBody({
     }
     Promise.all(loads)
       .catch((err) => {
-        if (!cancelled) setError(paErrorMessage(err, gt("加载 Bot 配置失败")));
+        if (!cancelled) setError(paErrorMessage(err, gt("Could not load bot settings")));
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -533,11 +534,11 @@ function BotSettingsBody({
       !modelChanged &&
       !reasoningChanged
     ) {
-      setSavedNotice(gt("没有需要保存的修改"));
+      setSavedNotice(gt("No changes to save"));
       return;
     }
     if (modelChanged && !submittedProvider) {
-      setError(gt("请选择模型提供方"));
+      setError(gt("Select a model provider"));
       return;
     }
     for (const section of changedSections) {
@@ -549,7 +550,7 @@ function BotSettingsBody({
         draft.enabled.length < section.minEnabled
       ) {
         setError(
-          gt("「{section}」至少需要启用 {count} 项", {
+          gt("Enable at least {count} items in {section}", {
             section: section.label,
             count: section.minEnabled,
           }),
@@ -622,9 +623,9 @@ function BotSettingsBody({
         }
         onSaved();
       }
-      setSavedNotice(gt("已保存"));
+      setSavedNotice(gt("Saved"));
     } catch (err) {
-      setError(paErrorMessage(err, gt("保存失败")));
+      setError(paErrorMessage(err, gt("Could not save")));
     }
     setSaving(false);
   };
@@ -655,38 +656,46 @@ function BotSettingsBody({
         ...(newScheduleName.trim() ? { name: newScheduleName.trim() } : {}),
         schedule: newScheduleSpec.trim(),
         prompt: newSchedulePrompt.trim(),
+        ...(newScheduleDeliver.trim() ? { deliver: newScheduleDeliver.trim() } : {}),
       },
-      gt("新增定时任务失败"),
+      gt("Could not add scheduled task"),
     );
     if (added) {
       setNewScheduleName("");
       setNewSchedulePrompt("");
+      setNewScheduleDeliver("");
     }
   };
 
   const tabs: ReadonlyArray<{ id: SettingsTab; label: string; icon: React.ReactNode }> = [
-    { id: "profile", label: gt("资料"), icon: <UserRoundIcon className="size-3.5" /> },
+    { id: "profile", label: gt("Profile"), icon: <UserRoundIcon className="size-3.5" /> },
     ...(modelsSupported
-      ? [{ id: "model" as const, label: gt("模型"), icon: <CpuIcon className="size-3.5" /> }]
+      ? [{ id: "model" as const, label: gt("Model"), icon: <CpuIcon className="size-3.5" /> }]
       : []),
     ...(toggleSections.length > 0
       ? [
           {
             id: "toggles" as const,
-            label: gt("能力"),
+            label: gt("Capabilities"),
             icon: <SlidersHorizontalIcon className="size-3.5" />,
           },
         ]
       : []),
     ...(schedulesSupported
-      ? [{ id: "schedules" as const, label: gt("定时"), icon: <ClockIcon className="size-3.5" /> }]
+      ? [
+          {
+            id: "schedules" as const,
+            label: gt("Schedule"),
+            icon: <ClockIcon className="size-3.5" />,
+          },
+        ]
       : []),
   ];
   const activeTab = tabs.some((item) => item.id === tab) ? tab : "profile";
 
   return (
     <>
-      <div className="border-b border-border/60" style={{ paddingTop: "env(safe-area-inset-top)" }}>
+      <div className="border-b border-border/60 pt-safe">
         <SheetHeader>
           <div className="flex items-center gap-3 pr-8">
             <BotAvatar color={avatarColor} shape={avatarShape} size="sm" starred={pinned} />
@@ -707,7 +716,7 @@ function BotSettingsBody({
                 render={<a href={config.nativeConsoleUrl} target="_blank" rel="noreferrer" />}
               >
                 <ExternalLinkIcon className="size-3.5" />
-                <T>高级设置</T>
+                <T>Advanced settings</T>
               </Button>
             ) : null}
           </div>
@@ -723,7 +732,7 @@ function BotSettingsBody({
                   type="button"
                   onClick={() => setTab(item.id)}
                   className={cn(
-                    "flex items-center justify-center gap-1 rounded-md py-1.5 font-medium text-xs transition-colors",
+                    "flex items-center justify-center gap-1 rounded-md py-1.5 font-medium text-xs transition-colors pointer-coarse:py-2",
                     activeTab === item.id
                       ? "bg-background text-foreground shadow-xs"
                       : "text-muted-foreground hover:text-foreground",
@@ -743,7 +752,7 @@ function BotSettingsBody({
           {loading ? (
             <div className="flex items-center justify-center py-12 text-muted-foreground text-sm">
               <Loader2Icon className="mr-2 size-4 animate-spin" />
-              <T>正在读取配置...</T>
+              <T>Loading settings…</T>
             </div>
           ) : null}
 
@@ -767,7 +776,7 @@ function BotSettingsBody({
                   disabled={saving}
                   onClick={() => setPendingConfirm(null)}
                 >
-                  <T>取消</T>
+                  <T>Cancel</T>
                 </Button>
                 <Button
                   type="button"
@@ -780,7 +789,7 @@ function BotSettingsBody({
                     })
                   }
                 >
-                  <T>确认切换</T>
+                  <T>Confirm switch</T>
                 </Button>
               </div>
             </div>
@@ -796,7 +805,7 @@ function BotSettingsBody({
             <div className="space-y-4">
               <div className="space-y-1.5">
                 <Label htmlFor="pa-edit-name">
-                  <T>名称</T>
+                  <T>Name</T>
                 </Label>
                 <Input id="pa-edit-name" value={name} onChange={(e) => setName(e.target.value)} />
               </div>
@@ -804,10 +813,10 @@ function BotSettingsBody({
               <div className="flex items-center justify-between rounded-lg border border-border/60 px-3 py-2.5">
                 <div>
                   <div className="font-medium text-sm">
-                    <T>置顶到顶部</T>
+                    <T>Pin to top</T>
                   </div>
                   <div className="text-muted-foreground text-xs">
-                    <T>显示在 Bot 页大头像置顶区</T>
+                    <T>Show in the pinned bots section</T>
                   </div>
                 </div>
                 <Switch checked={pinned} onCheckedChange={setPinned} />
@@ -815,7 +824,7 @@ function BotSettingsBody({
 
               <div className="space-y-2">
                 <Label>
-                  <T>头像外观</T>
+                  <T>Avatar appearance</T>
                 </Label>
                 <div className="flex flex-wrap gap-1.5">
                   {PA_AVATAR_SHAPES.map((item) => (
@@ -848,7 +857,7 @@ function BotSettingsBody({
                       aria-label={m(swatch.label)}
                       onClick={() => setAvatarColor(swatch.value)}
                       className={cn(
-                        "size-6 rounded-full",
+                        "size-6 rounded-full pointer-coarse:size-8",
                         avatarColor === swatch.value &&
                           "ring-2 ring-foreground ring-offset-2 ring-offset-background",
                       )}
@@ -878,7 +887,7 @@ function BotSettingsBody({
                         rows={8}
                         value={draft.text}
                         placeholder={
-                          section.placeholder ?? gt("输入该 Bot 的系统提示词和行为规范...")
+                          section.placeholder ?? gt("Enter system instructions for this bot…")
                         }
                         onChange={(e) =>
                           setDrafts((prev) => ({
@@ -914,9 +923,9 @@ function BotSettingsBody({
             <div className="space-y-4">
               <div className="space-y-1.5">
                 <Label htmlFor="pa-model-provider">
-                  <T>模型服务商</T>
+                  <T>Model provider</T>
                 </Label>
-                <select
+                <PaNativeSelect
                   id="pa-model-provider"
                   value={provider}
                   onChange={(e) => {
@@ -926,40 +935,38 @@ function BotSettingsBody({
                     const found = catalog.providers.find((p) => p.id === next);
                     if (found?.models[0]) setModel(found.models[0].id);
                   }}
-                  className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
                 >
-                  {catalog.current?.provider ? null : <option value="">{gt("跟随默认")}</option>}
+                  {catalog.current?.provider ? null : <option value="">{gt("Use default")}</option>}
                   {catalog.providers.map((opt) => (
                     <option key={opt.id} value={opt.id}>
                       {opt.label} ({opt.id})
                     </option>
                   ))}
-                </select>
+                </PaNativeSelect>
               </div>
 
               <div className="space-y-1.5">
                 <Label htmlFor="pa-model-name">
-                  <T>默认模型</T>
+                  <T>Default model</T>
                 </Label>
                 {activeProvider && activeProvider.models.length > 0 ? (
-                  <select
+                  <PaNativeSelect
                     id="pa-model-name"
                     value={model}
                     onChange={(e) => {
                       setModel(e.target.value);
                       setPendingConfirm(null);
                     }}
-                    className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
                   >
                     {model && !activeProvider.models.some((item) => item.id === model) ? (
-                      <option value={model}>{gt("{model}（当前）", { model })}</option>
+                      <option value={model}>{gt("{model} (current)", { model })}</option>
                     ) : null}
                     {activeProvider.models.map((item) => (
                       <option key={item.id} value={item.id}>
                         {item.id}
                       </option>
                     ))}
-                  </select>
+                  </PaNativeSelect>
                 ) : catalog.allowCustom ? (
                   <Input
                     id="pa-model-name"
@@ -968,11 +975,11 @@ function BotSettingsBody({
                       setModel(e.target.value);
                       setPendingConfirm(null);
                     }}
-                    placeholder={gt("输入模型名称")}
+                    placeholder={gt("Enter a model name")}
                   />
                 ) : (
                   <div className="text-muted-foreground text-xs">
-                    <T>没有可选的模型</T>
+                    <T>No models available</T>
                   </div>
                 )}
               </div>
@@ -980,11 +987,11 @@ function BotSettingsBody({
               {reasoningLevels.length > 0 ? (
                 <div className="space-y-1.5">
                   <Label>
-                    <T>推理等级</T>
+                    <T>Reasoning effort</T>
                   </Label>
                   <div
                     role="radiogroup"
-                    aria-label={gt("推理等级")}
+                    aria-label={gt("Reasoning effort")}
                     className="grid grid-cols-4 gap-1.5"
                   >
                     {reasoningLevels.map((level) => {
@@ -1015,7 +1022,7 @@ function BotSettingsBody({
                 </div>
               ) : selectedModelOption?.reasoning === false ? (
                 <p className="text-2xs text-muted-foreground">
-                  <T>当前模型不支持调节推理等级</T>
+                  <T>This model does not support changing reasoning effort</T>
                 </p>
               ) : null}
             </div>
@@ -1048,12 +1055,12 @@ function BotSettingsBody({
               <div className="space-y-2">
                 <Label>
                   <T>
-                    已有定时任务（<Var>{schedules.length}</Var>）
+                    Scheduled tasks (<Var>{schedules.length}</Var>)
                   </T>
                 </Label>
                 {schedules.length === 0 ? (
                   <div className="rounded-lg border border-dashed border-border/60 py-6 text-center text-muted-foreground text-xs">
-                    <T>这个 Bot 暂时还没有定时任务</T>
+                    <T>This bot has no scheduled tasks yet</T>
                   </div>
                 ) : (
                   <div className="space-y-2">
@@ -1071,13 +1078,13 @@ function BotSettingsBody({
                               <span className="truncate font-medium text-xs">{job.name}</span>
                               {!job.enabled ? (
                                 <Badge variant="outline" size="sm">
-                                  <T>已暂停</T>
+                                  <T>Paused</T>
                                 </Badge>
                               ) : null}
                             </div>
                             <div className="text-2xs text-muted-foreground">
                               {job.nextRunAt
-                                ? gt("{schedule} · 下次 {nextRunAt}", {
+                                ? gt("{schedule} · Next run {nextRunAt}", {
                                     schedule: job.schedule,
                                     nextRunAt: job.nextRunAt,
                                   })
@@ -1091,11 +1098,11 @@ function BotSettingsBody({
                               variant="ghost"
                               className="size-7"
                               disabled={scheduleBusy}
-                              title={job.enabled ? gt("暂停") : gt("恢复")}
+                              title={job.enabled ? gt("Pause") : gt("Resume")}
                               onClick={() =>
                                 void mutateSchedule(
                                   { action: job.enabled ? "pause" : "resume", scheduleId: job.id },
-                                  gt("定时任务操作失败"),
+                                  gt("Schedule operation failed"),
                                 )
                               }
                             >
@@ -1111,11 +1118,11 @@ function BotSettingsBody({
                               variant="ghost-destructive"
                               className="size-7"
                               disabled={scheduleBusy}
-                              title={gt("删除")}
+                              title={gt("Delete")}
                               onClick={() =>
                                 void mutateSchedule(
                                   { action: "remove", scheduleId: job.id },
-                                  gt("定时任务操作失败"),
+                                  gt("Schedule operation failed"),
                                 )
                               }
                             >
@@ -1128,6 +1135,11 @@ function BotSettingsBody({
                             {job.prompt}
                           </p>
                         ) : null}
+                        {job.deliver ? (
+                          <div className="truncate text-2xs text-muted-foreground">
+                            {gt("Deliver to {deliver}", { deliver: job.deliver })}
+                          </div>
+                        ) : null}
                       </div>
                     ))}
                   </div>
@@ -1138,23 +1150,32 @@ function BotSettingsBody({
 
               <form onSubmit={handleAddSchedule} className="space-y-2.5">
                 <Label>
-                  <T>新增定时任务</T>
+                  <T>New scheduled task</T>
                 </Label>
                 <Input
-                  placeholder={gt("任务名称（例如：每日早报）")}
+                  placeholder={gt("Task name (e.g. daily briefing)")}
                   value={newScheduleName}
                   onChange={(e) => setNewScheduleName(e.target.value)}
                 />
                 <Input
-                  placeholder={gt("调度表达式（如 every 1h / 0 9 * * *）")}
+                  placeholder={gt("Schedule (e.g. every 1h or 0 9 * * *)")}
                   value={newScheduleSpec}
                   onChange={(e) => setNewScheduleSpec(e.target.value)}
                 />
                 <Textarea
                   rows={3}
-                  placeholder={gt("到期时要让 Bot 执行的指令...")}
+                  placeholder={gt("Instructions for the bot when the task runs…")}
                   value={newSchedulePrompt}
                   onChange={(e) => setNewSchedulePrompt(e.target.value)}
+                />
+                <Input
+                  placeholder={gt("Delivery target (optional, e.g. local, origin or {example})", {
+                    example: "telegram:<id>",
+                  })}
+                  aria-label={gt("Delivery target")}
+                  value={newScheduleDeliver}
+                  maxLength={200}
+                  onChange={(e) => setNewScheduleDeliver(e.target.value)}
                 />
                 <Button
                   type="submit"
@@ -1168,7 +1189,7 @@ function BotSettingsBody({
                   ) : (
                     <PlusIcon className="mr-1.5 size-3.5" />
                   )}
-                  <T>添加定时任务</T>
+                  <T>Add scheduled task</T>
                 </Button>
               </form>
             </div>
@@ -1177,12 +1198,9 @@ function BotSettingsBody({
       </ScrollArea>
 
       {activeTab !== "schedules" ? (
-        <div
-          className="flex items-center justify-end gap-2 border-t border-border/60 px-5 py-3"
-          style={{ paddingBottom: "max(0.75rem, env(safe-area-inset-bottom))" }}
-        >
+        <div className="flex items-center justify-end gap-2 border-t border-border/60 px-5 py-3">
           <Button type="button" variant="outline" size="sm" onClick={onClose}>
-            <T>关闭</T>
+            <T>Close</T>
           </Button>
           <Button
             type="button"
@@ -1195,7 +1213,7 @@ function BotSettingsBody({
             ) : (
               <SaveIcon className="mr-1.5 size-3.5" />
             )}
-            <T>保存修改</T>
+            <T>Save changes</T>
           </Button>
         </div>
       ) : null}
@@ -1220,13 +1238,16 @@ export function BotSettingsSheet({
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetPopup side="right" className="flex w-full max-w-md flex-col">
         {open && bot ? (
-          <BotSettingsBody
-            key={bot.botId}
-            bot={bot}
-            capabilities={capabilities}
-            onClose={() => onOpenChange(false)}
-            onSaved={onSaved}
-          />
+          // Clears the home indicator and a landscape notch on the sheet's docked edge.
+          <div className="flex min-h-0 flex-1 flex-col pr-safe pb-safe">
+            <BotSettingsBody
+              key={bot.botId}
+              bot={bot}
+              capabilities={capabilities}
+              onClose={() => onOpenChange(false)}
+              onSaved={onSaved}
+            />
+          </div>
         ) : null}
       </SheetPopup>
     </Sheet>

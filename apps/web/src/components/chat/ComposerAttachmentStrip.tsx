@@ -171,7 +171,7 @@ export function ComposerAttachmentMediaRow({
   readonly supportsAttachmentUploads: boolean;
   readonly maxFileAttachmentBytes: number | null;
   readonly environmentId: EnvironmentId;
-  readonly attachmentDraftTarget: ScopedThreadRef | DraftId;
+  readonly attachmentDraftTarget?: ScopedThreadRef | DraftId;
   readonly canOperateThread: boolean;
   readonly onCopySnapshot: (imageId: string) => Promise<void>;
   readonly onExpandImage: (preview: ExpandedImagePreview) => void;
@@ -313,7 +313,9 @@ export function ComposerAttachmentMediaRow({
                           retryAttachmentUpload({
                             environmentId,
                             image: ready,
-                            draftTarget: attachmentDraftTarget,
+                            ...(attachmentDraftTarget !== undefined
+                              ? { draftTarget: attachmentDraftTarget }
+                              : {}),
                           })
                         }
                         disabled={!canOperateThread}
@@ -413,7 +415,9 @@ export function ComposerAttachmentMediaRow({
                         retryAttachmentUpload({
                           environmentId,
                           image: file,
-                          draftTarget: attachmentDraftTarget,
+                          ...(attachmentDraftTarget !== undefined
+                            ? { draftTarget: attachmentDraftTarget }
+                            : {}),
                         })
                       }
                       disabled={!canOperateThread}
@@ -463,7 +467,7 @@ export function ComposerAttachmentFileList({
   readonly maxFileAttachmentBytes: number | null;
   readonly fileStagingLimit: number | null;
   readonly environmentId: EnvironmentId;
-  readonly attachmentDraftTarget: ScopedThreadRef | DraftId;
+  readonly attachmentDraftTarget?: ScopedThreadRef | DraftId;
   readonly canOperateThread: boolean;
   readonly onPreviewFile: (fileId: string) => void;
   readonly onRemoveFile: (fileId: string) => void;
@@ -523,7 +527,9 @@ export function ComposerAttachmentFileList({
                         retryAttachmentUpload({
                           environmentId,
                           image: file,
-                          draftTarget: attachmentDraftTarget,
+                          ...(attachmentDraftTarget !== undefined
+                            ? { draftTarget: attachmentDraftTarget }
+                            : {}),
                         })
                       }
                       disabled={!canOperateThread}

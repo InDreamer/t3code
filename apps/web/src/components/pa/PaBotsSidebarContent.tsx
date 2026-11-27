@@ -44,17 +44,17 @@ export function PaBotsSidebarContent() {
       return target.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
     }
     if (dayDiff === 1) {
-      return gt("昨天");
+      return gt("Yesterday");
     }
     if (dayDiff > 1 && dayDiff < 7) {
       const weekdays = [
-        gt("周日"),
-        gt("周一"),
-        gt("周二"),
-        gt("周三"),
-        gt("周四"),
-        gt("周五"),
-        gt("周六"),
+        gt("Sun"),
+        gt("Mon"),
+        gt("Tue"),
+        gt("Wed"),
+        gt("Thu"),
+        gt("Fri"),
+        gt("Sat"),
       ];
       return weekdays[target.getDay()] ?? "";
     }
@@ -122,9 +122,9 @@ export function PaBotsSidebarContent() {
                 type="search"
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                placeholder={gt("搜索 Bot")}
-                aria-label={gt("搜索 Bot")}
-                className="min-w-0 flex-1 bg-transparent text-xs text-sidebar-foreground outline-none placeholder:text-sidebar-muted-foreground"
+                placeholder={gt("Search bots")}
+                aria-label={gt("Search bots")}
+                className="min-w-0 flex-1 bg-transparent text-xs text-sidebar-foreground outline-none placeholder:text-sidebar-muted-foreground pointer-coarse:text-(length:--font-size-input-touch)"
               />
             </div>
 
@@ -135,7 +135,7 @@ export function PaBotsSidebarContent() {
                     type="button"
                     size="icon-xs"
                     variant="ghost-muted"
-                    aria-label={gt("刷新 Bot 列表")}
+                    aria-label={gt("Refresh bots")}
                     disabled={refreshing}
                     onClick={() => void loadPaBots(true)}
                   />
@@ -144,7 +144,7 @@ export function PaBotsSidebarContent() {
                 <RefreshCwIcon className={cn("size-3.5", refreshing && "animate-spin")} />
               </TooltipTrigger>
               <TooltipPopup side="bottom">
-                <T>刷新 Bot 列表</T>
+                <T>Refresh bots</T>
               </TooltipPopup>
             </Tooltip>
 
@@ -155,7 +155,7 @@ export function PaBotsSidebarContent() {
                     type="button"
                     size="icon-xs"
                     variant="ghost-muted"
-                    aria-label={gt("新建 Bot")}
+                    aria-label={gt("Create bot")}
                     onClick={openCreate}
                   />
                 }
@@ -163,7 +163,7 @@ export function PaBotsSidebarContent() {
                 <PlusIcon className="size-3.5" />
               </TooltipTrigger>
               <TooltipPopup side="bottom">
-                <T>新建 Bot</T>
+                <T>Create bot</T>
               </TooltipPopup>
             </Tooltip>
           </div>
@@ -186,8 +186,8 @@ export function PaBotsSidebarContent() {
                   className="rounded-lg border border-warning/35 bg-warning-surface px-2.5 py-2 text-2xs text-warning-foreground"
                 >
                   <T>
-                    <Var>{instance.label}</Var> 未连接：
-                    <Var>{instance.error || gt("请检查服务状态")}</Var>
+                    <Var>{instance.label}</Var> disconnected.
+                    <Var>{instance.error || gt("Check service status")}</Var>
                   </T>
                 </div>
               ))}
@@ -231,9 +231,9 @@ export function PaBotsSidebarContent() {
                     </button>
                     <button
                       type="button"
-                      aria-label={gt("配置 {name}", { name: bot.name })}
+                      aria-label={gt("Configure {name}", { name: bot.name })}
                       onClick={() => openSettings(bot.botId)}
-                      className="absolute top-1 right-1 flex size-5 items-center justify-center rounded-full bg-background/85 text-muted-foreground opacity-100 shadow-xs transition-opacity hover:text-foreground sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100"
+                      className="absolute top-1 right-1 flex size-5 items-center justify-center rounded-full bg-background/85 text-muted-foreground opacity-100 shadow-xs transition-opacity hover:text-foreground pointer-coarse:after:absolute pointer-coarse:after:-inset-2.5 sm:pointer-fine:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100"
                     >
                       <Settings2Icon className="size-2.5" />
                     </button>
@@ -265,10 +265,10 @@ export function PaBotsSidebarContent() {
               </div>
               <div className="space-y-0.5">
                 <div className="text-xs font-medium text-sidebar-foreground">
-                  <T>没有匹配的 Bot</T>
+                  <T>No matching bots</T>
                 </div>
                 <p className="text-2xs text-sidebar-muted-foreground">
-                  <T>点击上方 + 创建一个新的 Bot</T>
+                  <T>Select + above to create a bot</T>
                 </p>
               </div>
             </div>
@@ -320,12 +320,12 @@ export function PaBotsSidebarContent() {
                       </div>
                     </button>
 
-                    <div className="shrink-0 opacity-100 transition-opacity sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100">
+                    <div className="shrink-0 opacity-100 transition-opacity sm:pointer-fine:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100">
                       <Button
                         type="button"
                         size="icon-xs"
                         variant="ghost-muted"
-                        aria-label={gt("配置 {name}", { name: bot.name })}
+                        aria-label={gt("Configure {name}", { name: bot.name })}
                         onClick={() => openSettings(bot.botId)}
                       >
                         <Settings2Icon className="size-3" />
