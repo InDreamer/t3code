@@ -11,9 +11,12 @@ import { startAppServices } from "./appInit";
 import { AppRoot } from "./AppRoot";
 import { whenLocaleReady } from "./i18n/runtime";
 import { chunkLoadState } from "./lib/chunkReloadGuard";
+import { fitShellToVisualViewport } from "./lib/visualViewportFit";
 
 const stopTrackingKeyboardLayout = trackKeyboardLayout();
 import.meta.hot?.dispose(stopTrackingKeyboardLayout);
+const stopFittingShell = fitShellToVisualViewport(window, isElectron);
+import.meta.hot?.dispose(stopFittingShell);
 
 const router = startAppServices();
 

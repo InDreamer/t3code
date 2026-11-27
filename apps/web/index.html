@@ -392,6 +392,17 @@
         }
       })();
     </script>
+    <script>
+      // iOS zooms into a focused field under 16px and a standalone app has no way to zoom back
+      // out. maximum-scale stops that; iOS still allows pinch zoom, which Android would lose.
+      if (
+        navigator.maxTouchPoints > 1 &&
+        /^(iPhone|iPad|iPod|MacIntel)$/.test(navigator.platform)
+      ) {
+        const viewport = document.querySelector('meta[name="viewport"]');
+        viewport.content += ", maximum-scale=1.0";
+      }
+    </script>
     <style>
       html,
       body,

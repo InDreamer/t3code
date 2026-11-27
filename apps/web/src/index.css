@@ -133,6 +133,8 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
   --thread-details-panel-width: 17.5rem;
   /* The prompt on phones: iOS zooms into any input under 16px on focus. */
   --font-size-prompt-touch: max(var(--font-size-prompt, 1rem), 16px);
+  /* Other touch fields, when Appearance shrinks 1rem below 16px. */
+  --font-size-input-touch: max(1rem, 16px);
   /* Horizontal gutter shared by the page header and the chat column, clear of
      the device's safe area. */
   --workspace-gutter: 0.75rem;
@@ -1755,9 +1757,11 @@ body {
   }
 }
 
+/* --app-viewport-height is set only while an iOS keyboard covers the page; see
+   lib/visualViewportFit.ts. */
 html,
 body {
-  min-height: calc(100svh + env(safe-area-inset-top));
+  min-height: calc(var(--app-viewport-height, 100svh) + env(safe-area-inset-top));
   overscroll-behavior: none;
 }
 
@@ -1776,6 +1780,12 @@ body {
   overscroll-behavior-y: none;
   padding-top: max(env(safe-area-inset-top), 0px);
   padding-right: var(--desktop-window-right-resize-inset);
+}
+
+/* Follows a visual viewport iOS panned down to the focused field. Fixed controls such as the
+   sidebar trigger move with it, since a translated #root contains them. */
+html[data-visual-viewport-fit] #root {
+  translate: 0 var(--app-viewport-offset-top, 0px);
 }
 
 .electron-windows {
