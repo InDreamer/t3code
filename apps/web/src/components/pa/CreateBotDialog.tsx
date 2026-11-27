@@ -1,8 +1,10 @@
+import { useAtomValue } from "@effect/atom-react";
 import type { PaAvatarShape, PaBotSummary, PaInstanceStatus } from "@t3tools/contracts";
 import { T, useGT, useMessages } from "gt-react";
 import { Loader2Icon, PlusIcon } from "lucide-react";
 import { useState } from "react";
 
+import { usePrimaryEnvironmentId } from "../../state/environments";
 import { cn } from "../../lib/utils";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
@@ -27,7 +29,7 @@ import {
 } from "@t3tools/client-runtime/pa/avatar";
 import { derivePaAgentSlug, paCreatableInstances } from "@t3tools/client-runtime/pa/roster";
 import { BotAvatar } from "./BotAvatar";
-import { paApi, paErrorMessage } from "./paApi";
+import { paApi, paCreateBotPermissionAtom, paErrorMessage } from "./paApi";
 
 export function CreateBotDialog({
   open,
@@ -41,6 +43,7 @@ export function CreateBotDialog({
   readonly onCreated: (bot: PaBotSummary) => void;
 }) {
   const gt = useGT();
+  const mayCreate = useAtomValue(paCreateBotPermissionAtom(usePrimaryEnvironmentId()));
   const m = useMessages();
   const creatable = paCreatableInstances(instances);
   const [selectedInstanceId, setSelectedInstanceId] = useState<string | null>(null);
@@ -59,7 +62,7 @@ export function CreateBotDialog({
     creatable.find((i) => i.online) ??
     creatable[0] ??
     null;
-  const canCreate = activeInstance !== null && activeInstance.online;
+  const canCreate = mayCreate && activeInstance !== null && activeInstance.online;
 
   const derivedSlug = derivePaAgentSlug(agentRef, name);
 
@@ -76,6 +79,7 @@ export function CreateBotDialog({
 
   const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
+    if (!mayCreate || submitting) return;
     if (!activeInstance || !activeInstance.online) {
       setError(gt("No online engine can create bots"));
       return;

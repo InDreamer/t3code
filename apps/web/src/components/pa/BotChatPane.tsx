@@ -39,7 +39,6 @@ import {
 import type {
   PaBotSummary,
   PaCapabilities,
-  PaClarifyAnswer,
   PaManageQueuedItemInput,
   PaMessage,
   PaPendingRequest,
@@ -61,7 +60,13 @@ import {
   summarizePaLiveActivity,
 } from "@t3tools/client-runtime/pa/presentation";
 import { BotAvatar } from "./BotAvatar";
-import { paApi, paErrorMessage, paSendPermissionAtom } from "./paApi";
+import {
+  paApi,
+  paErrorMessage,
+  paSendPermissionAtom,
+  paSelectModelPermissionAtom,
+  paUpdateMetaPermissionAtom,
+} from "./paApi";
 import { PaComposer, type PaClarifyAnswers } from "./PaComposer";
 import type { PaSecretAnswer } from "./PaSecretRequestForm";
 import { PaSessionPicker } from "./PaSessionPicker";
@@ -109,6 +114,8 @@ export function BotChatPane({
   const [fallbackSessionId, setFallbackSessionId] = useState<string | null>(null);
   const activeSessionId = selectedSessionId ?? fallbackSessionId;
   const environmentId = usePrimaryEnvironmentId();
+  const canSelectModel = useAtomValue(paSelectModelPermissionAtom(environmentId));
+  const canMarkRead = useAtomValue(paUpdateMetaPermissionAtom(environmentId));
   const canOperate = useAtomValue(paSendPermissionAtom(environmentId));
   const [sessionsOpen, setSessionsOpen] = useState(false);
   const [loadingSessions, setLoadingSessions] = useState(true);
@@ -173,7 +180,6 @@ export function BotChatPane({
     },
   );
 
-  const [clarifyAnswers, setClarifyAnswers] = useState<Record<string, PaClarifyAnswers>>({});
   const [respondingIds, setRespondingIds] = useState<ReadonlySet<string>>(() => new Set());
   const [queueBusyIds, setQueueBusyIds] = useState<ReadonlySet<string>>(() => new Set());
 
@@ -191,8 +197,12 @@ export function BotChatPane({
   const canRenameSession = canOperate && capabilities?.sessions.renameExisting === true;
   const canInterrupt = capabilities?.execution.interrupt !== false;
   const canSteer = capabilities?.execution.steer === true;
-  const slashCommands = commandsSupported ? loadedSlashCommands : NO_SLASH_COMMANDS;
+  const commands = commandsSupported ? loadedSlashCommands : NO_SLASH_COMMANDS;
+  const slashCommands = commands.filter(
+    (command) => canSelectModel || command.handling !== "client:model-picker",
+  );
 
+  const draftEdits = useRef(new Map<string, number>());
   const [drafts, setDrafts] = useState<Readonly<Record<string, string>>>({});
   const draft = activeSessionId ? (drafts[activeSessionId] ?? "") : "";
   const setDraft = (value: string | ((previous: string) => string)) => {
@@ -362,7 +372,7 @@ export function BotChatPane({
         if (targetId !== initialProp) {
           stableSelectSession(targetId);
         }
-        if (stableBotUnread()) {
+        if (canMarkRead && stableBotUnread()) {
           void paApi
             .markRead(bot.botId)
             .then(() => stableOnActivity())
@@ -385,6 +395,7 @@ export function BotChatPane({
   }, [
     bot.botId,
     canCreateSession,
+    canMarkRead,
     gt,
     getSelectedSessionProp,
     updateLiveTurn,
@@ -485,14 +496,24 @@ export function BotChatPane({
     isNearBottomRef.current = true;
 
     runningRef.current = false;
+    const endTurn = () => {
+      const token = (settleTokensRef.current.get(sessionId) ?? 0) + 1;
+      settleTokensRef.current.set(sessionId, token);
+      const pending = pendingUserRowsRef.current.get(sessionId);
+      pending?.forEach((_ended, id) => pending.set(id, true));
+      return token;
+    };
     const handleEvent = (event: PaStreamEvent) => {
       if (closed || activeSessionIdRef.current !== sessionId) return;
       switch (event.type) {
-        case "snapshot":
+        case "snapshot": {
+          const ended = runningRef.current && !event.running;
+          if (ended) endTurn();
           runningRef.current = event.running;
           updateLiveTurn(sessionId, (prev) => reducePaStreamEvent(prev, event, Date.now()));
-          if (!transcriptRead || event.snapshotRequired) readTranscript();
+          if (!transcriptRead || event.snapshotRequired || ended) readTranscript();
           return;
+        }
         case "notice":
           if (event.persistent) {
             appendLocalMessage(sessionId, paNoticeMessage(event, localTimestampNow()));
@@ -521,16 +542,17 @@ export function BotChatPane({
         case "error": {
           runningRef.current = false;
           // An error ends the turn too: a send that resolves after it must not re-mark it running.
-          const token = (settleTokensRef.current.get(sessionId) ?? 0) + 1;
-          settleTokensRef.current.set(sessionId, token);
-          const pending = pendingUserRowsRef.current.get(sessionId);
-          pending?.forEach((_ended, id) => pending.set(id, true));
+          const token = endTurn();
           updateLiveTurn(sessionId, (prev) => ({
             ...reducePaStreamEvent(prev, event, Date.now()),
             settleToken: token,
           }));
           void loadTranscript(sessionId, false, token);
           if (event.type === "turn.completed") {
+            if (!canMarkRead) {
+              stableOnActivity();
+              return;
+            }
             void paApi
               .markRead(bot.botId)
               .catch(() => undefined)
@@ -577,6 +599,7 @@ export function BotChatPane({
   }, [
     bot.botId,
     activeSessionId,
+    canMarkRead,
     appendLocalMessage,
     getSettingsVersion,
     gt,
@@ -810,11 +833,13 @@ export function BotChatPane({
     const attachments = options?.attachments ?? [];
     if ((!text && !attachments.length) || !sessionId || sending || !canOperate) return false;
     const queued = options?.queued === true;
+    const draftRevision = draftEdits.current.get(sessionId);
     const restoreDraft = rawOverride === undefined || options?.restoreDraft === true;
 
     // The engine's catalog marks the commands a client runs itself (new session, stop, model).
-    const clientAction = attachments.length ? null : parsePaClientSlashAction(text, slashCommands);
+    const clientAction = attachments.length ? null : parsePaClientSlashAction(text, commands);
     if (clientAction) {
+      if (clientAction.kind === "model-picker" && !canSelectModel) return false;
       if (rawOverride === undefined) setDraft("");
       updateLiveTurn(sessionId, (prev) => ({ ...prev, error: null }));
       switch (clientAction.kind) {
@@ -863,7 +888,7 @@ export function BotChatPane({
         (id) => paApi.sendMessage(bot.botId, sessionId, text, id, queued, attachments),
         attachments.map((item) => item.id),
       );
-      if (attachments.length && res.kind === "turn" && activeSessionIdRef.current === sessionId) {
+      if (attachments.length && res.kind === "turn") {
         setDraft((current) => (current.trim() === text ? "" : current));
       }
       if (res.kind === "turn" && res.queued === true) {
@@ -911,7 +936,11 @@ export function BotChatPane({
       }
     } catch (err) {
       removeLocalMessage(sessionId, optimisticMsg.id);
-      if (!attachments.length && restoreDraft && activeSessionIdRef.current === sessionId) {
+      if (
+        !attachments.length &&
+        restoreDraft &&
+        draftRevision === draftEdits.current.get(sessionId)
+      ) {
         setDraft((current) => (current ? current : text));
       }
       updateLiveTurn(sessionId, (prev) => ({
@@ -929,7 +958,14 @@ export function BotChatPane({
   const handleSteer = async () => {
     const text = draft.trim();
     const sessionId = activeSessionId;
-    if (!text || !sessionId || sending || !canOperate) return;
+    if (
+      !text ||
+      !sessionId ||
+      sending ||
+      !canOperate ||
+      (!canSelectModel && parsePaClientSlashAction(text, commands)?.kind === "model-picker")
+    )
+      return;
     setSending(true);
     setDraft("");
     updateLiveTurn(sessionId, (prev) => ({ ...prev, error: null }));
@@ -1016,10 +1052,13 @@ export function BotChatPane({
     }
   };
 
-  const handleRespondRequest = async (req: PaPendingRequest, decision?: string) => {
+  const handleRespondRequest = async (
+    req: PaPendingRequest,
+    decision?: string,
+    answers?: PaClarifyAnswers,
+  ) => {
     if (!canOperate || !activeSessionId || respondingIds.has(req.requestId)) return;
     const sessionId = activeSessionId;
-    const answers = clarifyAnswers[req.requestId];
     setRespondingIds((prev) => new Set(prev).add(req.requestId));
     try {
       await paApi.respondRequest({
@@ -1304,21 +1343,24 @@ export function BotChatPane({
             capabilities={capabilities}
             sessionId={activeSessionId}
             draft={draft}
-            onDraftChange={setDraft}
+            onDraftChange={(value) => {
+              if (!activeSessionId || value === draft) return;
+              draftEdits.current.set(
+                activeSessionId,
+                (draftEdits.current.get(activeSessionId) ?? 0) + 1,
+              );
+              setDraft(value);
+            }}
             running={running}
             sending={sending}
             disabled={!activeSessionId || !canOperate}
             slashCommands={slashCommands}
             openRequests={openRequests}
             respondingIds={respondingIds}
-            clarifyAnswers={clarifyAnswers}
-            onClarifyAnswerChange={(reqId, qId, val: PaClarifyAnswer) =>
-              setClarifyAnswers((prev) => ({
-                ...prev,
-                [reqId]: { ...prev[reqId], [qId]: val },
-              }))
+            canSelectModel={canSelectModel}
+            onRespondRequest={(req, decision, answers) =>
+              void handleRespondRequest(req, decision, answers)
             }
-            onRespondRequest={(req, decision) => void handleRespondRequest(req, decision)}
             onRespondSecret={handleRespondSecret}
             onSend={(options) => handleSend(undefined, options)}
             onSteer={() => void handleSteer()}

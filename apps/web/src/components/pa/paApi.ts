@@ -29,6 +29,11 @@ import { readPrimaryEnvironmentId } from "../../state/environments";
 import { primaryEnvironmentIdAtom } from "../../state/primaryEnvironment";
 
 const pa = createPaEnvironmentCommands(connectionAtomRuntime);
+export const paCreateBotPermissionAtom = pa.createBot.permissionAtom;
+export const paSelectModelPermissionAtom = pa.selectBotModel.permissionAtom;
+export const paPatchConfigPermissionAtom = pa.patchBotConfig.permissionAtom;
+export const paMutateSchedulePermissionAtom = pa.mutateSchedule.permissionAtom;
+export const paUpdateMetaPermissionAtom = pa.updateBotMeta.permissionAtom;
 export const paSendPermissionAtom = pa.sendMessage.permissionAtom;
 
 const PRIMARY_ENVIRONMENT_WAIT_MS = 15_000;

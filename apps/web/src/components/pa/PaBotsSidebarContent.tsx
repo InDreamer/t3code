@@ -1,3 +1,4 @@
+import { useAtomValue } from "@effect/atom-react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import {
   filterPaBots,
@@ -11,11 +12,13 @@ import { T, useGT, useMessages, Var } from "gt-react";
 import { BotIcon, PlusIcon, RefreshCwIcon, SearchIcon, Settings2Icon } from "lucide-react";
 import { useState } from "react";
 
+import { usePrimaryEnvironmentId } from "../../state/environments";
 import { cn } from "../../lib/utils";
 import { Button } from "../ui/button";
 import { SidebarContent, SidebarGroup, useSidebar } from "../ui/sidebar";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { BotAvatar } from "./BotAvatar";
+import { paCreateBotPermissionAtom } from "./paApi";
 import {
   loadPaBots,
   rememberLastPaBotId,
@@ -28,6 +31,7 @@ const SKELETON_KEYS = ["sk-1", "sk-2", "sk-3"] as const;
 
 export function PaBotsSidebarContent() {
   const gt = useGT();
+  const mayCreate = useAtomValue(paCreateBotPermissionAtom(usePrimaryEnvironmentId()));
   const navigate = useNavigate();
   const rawSearch = useSearch({ strict: false }) as { readonly bot?: unknown };
   const routeBotId = typeof rawSearch.bot === "string" && rawSearch.bot ? rawSearch.bot : null;
@@ -120,6 +124,7 @@ export function PaBotsSidebarContent() {
                     type="button"
                     size="icon-xs"
                     variant="ghost-muted"
+                    disabled={!mayCreate}
                     aria-label={gt("Create bot")}
                     onClick={openCreate}
                   />
@@ -232,9 +237,11 @@ export function PaBotsSidebarContent() {
                 <div className="text-xs font-medium text-sidebar-foreground">
                   <T>No matching bots</T>
                 </div>
-                <p className="text-2xs text-sidebar-muted-foreground">
-                  <T>Select + above to create a bot</T>
-                </p>
+                {mayCreate && (
+                  <p className="text-2xs text-sidebar-muted-foreground">
+                    <T>Select + above to create a bot</T>
+                  </p>
+                )}
               </div>
             </div>
           ) : unpinnedBots.length > 0 ? (

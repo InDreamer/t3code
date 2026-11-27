@@ -1,3 +1,4 @@
+import { useAtomValue } from "@effect/atom-react";
 import type {
   PaAvatarShape,
   PaBotConfig,
@@ -28,6 +29,7 @@ import {
 } from "lucide-react";
 import { useEffect, useState } from "react";
 
+import { usePrimaryEnvironmentId } from "../../state/environments";
 import { useStableCallback } from "~/hooks/useStableCallback";
 import {
   buildPaginationSlots,
@@ -56,7 +58,14 @@ import { Textarea } from "../ui/textarea";
 import { PaNativeSelect } from "./PaNativeSelect";
 import { PA_AVATAR_COLORS, PA_AVATAR_SHAPES } from "@t3tools/client-runtime/pa/avatar";
 import { BotAvatar } from "./BotAvatar";
-import { paApi, paErrorMessage } from "./paApi";
+import {
+  paApi,
+  paErrorMessage,
+  paUpdateMetaPermissionAtom,
+  paSelectModelPermissionAtom,
+  paMutateSchedulePermissionAtom,
+  paPatchConfigPermissionAtom,
+} from "./paApi";
 import {
   findPaModelOption,
   formatPaReasoningLabel,
@@ -343,9 +352,14 @@ function BotSettingsBody({
 }) {
   const gt = useGT();
   const m = useMessages();
-  const configSupported = capabilities?.config.supported === true;
-  const modelsSupported = capabilities?.models.supported === true;
-  const schedulesSupported = capabilities?.schedules.supported === true;
+  const environmentId = usePrimaryEnvironmentId();
+  const canEditMeta = useAtomValue(paUpdateMetaPermissionAtom(environmentId));
+  const canEditConfig = useAtomValue(paPatchConfigPermissionAtom(environmentId));
+  const canSelectModel = useAtomValue(paSelectModelPermissionAtom(environmentId));
+  const canMutateSchedule = useAtomValue(paMutateSchedulePermissionAtom(environmentId));
+  const configSupported = canEditConfig && capabilities?.config.supported === true;
+  const modelsSupported = canSelectModel && capabilities?.models.supported === true;
+  const schedulesSupported = canMutateSchedule && capabilities?.schedules.supported === true;
 
   const [tab, setTab] = useState<SettingsTab>("profile");
   const [loading, setLoading] = useState(configSupported || modelsSupported || schedulesSupported);
@@ -429,7 +443,7 @@ function BotSettingsBody({
     };
   }, [bot.botId, configSupported, modelsSupported, schedulesSupported, gt]);
 
-  const sections = config?.sections ?? [];
+  const sections = configSupported ? (config?.sections ?? []) : [];
   const profileSections = sections.filter((s) => s.kind !== "toggleList");
   const toggleSections = sections.filter(
     (s): s is Extract<PaConfigSection, { kind: "toggleList" }> => s.kind === "toggleList",
@@ -446,12 +460,14 @@ function BotSettingsBody({
     confirmed: { readonly provider: string; readonly model: string } | null = null,
   ) => {
     const nextName = name.trim() || bot.agentRef;
-    const metaPatch = {
-      ...(nextName !== savedMeta.name ? { name: nextName } : {}),
-      ...(avatarColor !== savedMeta.avatarColor ? { avatarColor } : {}),
-      ...(avatarShape !== savedMeta.avatarShape ? { avatarShape } : {}),
-      ...(pinned !== savedMeta.pinned ? { pinned } : {}),
-    };
+    const metaPatch = !canEditMeta
+      ? {}
+      : {
+          ...(nextName !== savedMeta.name ? { name: nextName } : {}),
+          ...(avatarColor !== savedMeta.avatarColor ? { avatarColor } : {}),
+          ...(avatarShape !== savedMeta.avatarShape ? { avatarShape } : {}),
+          ...(pinned !== savedMeta.pinned ? { pinned } : {}),
+        };
     const changedSections = changedPaConfigSections(sections, drafts);
     const currentModel = catalog?.current ?? null;
     const providerField = provider;
@@ -462,6 +478,7 @@ function BotSettingsBody({
     const submittedProvider =
       confirmed?.provider ?? (provider || activeProvider?.id || currentModel?.provider || "");
     const modelChanged =
+      modelsSupported &&
       catalog !== null &&
       submittedModel.length > 0 &&
       (confirmed !== null ||
@@ -471,6 +488,7 @@ function BotSettingsBody({
       ? reasoningEffort
       : "";
     const reasoningChanged =
+      modelsSupported &&
       catalog !== null &&
       validReasoning.length > 0 &&
       validReasoning !== (currentModel?.reasoningEffort ?? "");
@@ -576,6 +594,7 @@ function BotSettingsBody({
     input: Omit<Parameters<typeof paApi.mutateSchedule>[0], "botId">,
     fallback: string,
   ) => {
+    if (!schedulesSupported || scheduleBusy) return false;
     setScheduleBusy(true);
     setError(null);
     let ok = false;
@@ -704,7 +723,7 @@ function BotSettingsBody({
             </div>
           ) : null}
 
-          {pendingConfirm ? (
+          {modelsSupported && pendingConfirm ? (
             <div className="space-y-2 rounded-lg border border-warning/40 bg-warning-surface p-3 text-warning-foreground text-xs">
               <div className="flex items-start gap-2">
                 <AlertTriangleIcon className="mt-0.5 size-4 shrink-0" />
@@ -749,7 +768,12 @@ function BotSettingsBody({
                 <Label htmlFor="pa-edit-name">
                   <T>Name</T>
                 </Label>
-                <Input id="pa-edit-name" value={name} onChange={(e) => setName(e.target.value)} />
+                <Input
+                  disabled={!canEditMeta}
+                  id="pa-edit-name"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                />
               </div>
 
               <div className="flex items-center justify-between rounded-lg border border-border/60 px-3 py-2.5">
@@ -761,7 +785,7 @@ function BotSettingsBody({
                     <T>Show in the pinned bots section</T>
                   </div>
                 </div>
-                <Switch checked={pinned} onCheckedChange={setPinned} />
+                <Switch disabled={!canEditMeta} checked={pinned} onCheckedChange={setPinned} />
               </div>
 
               <div className="space-y-2">
@@ -773,6 +797,7 @@ function BotSettingsBody({
                     <button
                       key={item.value}
                       type="button"
+                      disabled={!canEditMeta}
                       onClick={() => setAvatarShape(item.value)}
                       className={cn(
                         "flex items-center gap-1 rounded-lg border px-2 py-1 text-xs",
@@ -797,6 +822,7 @@ function BotSettingsBody({
                       key={swatch.value}
                       type="button"
                       aria-label={m(swatch.label)}
+                      disabled={!canEditMeta}
                       onClick={() => setAvatarColor(swatch.value)}
                       className={cn(
                         "size-6 rounded-full pointer-coarse:size-8",
@@ -1147,7 +1173,7 @@ function BotSettingsBody({
           <Button
             type="button"
             size="sm"
-            disabled={saving || loading}
+            disabled={saving || loading || !(canEditMeta || configSupported || modelsSupported)}
             onClick={() => void handleSave()}
           >
             {saving ? (

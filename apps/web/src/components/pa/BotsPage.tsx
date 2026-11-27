@@ -1,9 +1,11 @@
+import { useAtomValue } from "@effect/atom-react";
 import { paOfflineInstances, resolveActivePaBot } from "@t3tools/client-runtime/pa/roster";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import { T, useGT, Var } from "gt-react";
 import { BotIcon, Loader2Icon, PlusIcon } from "lucide-react";
 import { useEffect, useState } from "react";
 
+import { usePrimaryEnvironmentId } from "../../state/environments";
 import { isElectron } from "~/env";
 import { Button } from "../ui/button";
 import { SidebarInset } from "../ui/sidebar";
@@ -11,6 +13,7 @@ import { WorkspacePageHeader } from "../WorkspacePageHeader";
 import { BotChatPane } from "./BotChatPane";
 import { BotSettingsSheet } from "./BotSettingsSheet";
 import { CreateBotDialog } from "./CreateBotDialog";
+import { paCreateBotPermissionAtom } from "./paApi";
 import {
   loadPaBots,
   rememberLastPaBotId,
@@ -26,6 +29,7 @@ export interface BotsSearch {
 
 export function BotsPage() {
   const gt = useGT();
+  const mayCreate = useAtomValue(paCreateBotPermissionAtom(usePrimaryEnvironmentId()));
   const search = useSearch({ from: "/_chat/bots" });
   const navigate = useNavigate();
   const { instances, bots, loading, error, lastBotId, createOpen, settingsBotId } =
@@ -86,6 +90,7 @@ export function BotsPage() {
               type="button"
               size="xs"
               variant="outline"
+              disabled={!mayCreate}
               onClick={() => setPaCreateDialogOpen(true)}
             >
               <PlusIcon className="size-3.5" />
@@ -132,7 +137,12 @@ export function BotsPage() {
                     <T>Create a personal agent bot or check the engine connection.</T>
                   </p>
                 </div>
-                <Button type="button" size="sm" onClick={() => setPaCreateDialogOpen(true)}>
+                <Button
+                  type="button"
+                  size="sm"
+                  disabled={!mayCreate}
+                  onClick={() => setPaCreateDialogOpen(true)}
+                >
                   <PlusIcon className="size-4" />
                   <T>Create bot</T>
                 </Button>

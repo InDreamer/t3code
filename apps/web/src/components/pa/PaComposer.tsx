@@ -69,17 +69,16 @@ function isImeKeyDown(event: React.KeyboardEvent): boolean {
 function PaPendingRequestBanner({
   req,
   responding,
-  clarifyAnswerMap,
-  onClarifyAnswerChange,
   onRespond,
 }: {
   readonly req: PaPendingRequest;
   readonly responding: boolean;
-  readonly clarifyAnswerMap: PaClarifyAnswers;
-  readonly onClarifyAnswerChange: (questionId: string, value: PaClarifyAnswer) => void;
-  readonly onRespond: (decision?: string) => void;
+  readonly onRespond: (decision?: string, answers?: PaClarifyAnswers) => void;
 }) {
   const gt = useGT();
+  const [clarifyAnswerMap, setAnswers] = useState<PaClarifyAnswers>({});
+  const onClarifyAnswerChange = (questionId: string, value: PaClarifyAnswer) =>
+    setAnswers((previous) => ({ ...previous, [questionId]: value }));
 
   return (
     <div className="mb-2 space-y-2.5 rounded-2xl border border-border/80 bg-card/95 p-3.5 shadow-sm backdrop-blur-md">
@@ -200,7 +199,7 @@ function PaPendingRequestBanner({
                         req.questions?.length === 1
                       ) {
                         e.preventDefault();
-                        onRespond();
+                        onRespond(undefined, clarifyAnswerMap);
                       }
                     }}
                   />
@@ -209,7 +208,12 @@ function PaPendingRequestBanner({
             );
           })}
           <div className="flex justify-end">
-            <Button type="button" size="xs" disabled={responding} onClick={() => onRespond()}>
+            <Button
+              type="button"
+              size="xs"
+              disabled={responding}
+              onClick={() => onRespond(undefined, clarifyAnswerMap)}
+            >
               <T>Submit answer</T>
             </Button>
           </div>
@@ -232,8 +236,7 @@ export function PaComposer({
   slashCommands,
   openRequests,
   respondingIds,
-  clarifyAnswers,
-  onClarifyAnswerChange,
+  canSelectModel,
   onRespondRequest,
   onRespondSecret,
   onSend,
@@ -263,13 +266,12 @@ export function PaComposer({
   readonly slashCommands: ReadonlyArray<PaSlashCommand>;
   readonly openRequests: ReadonlyArray<PaPendingRequest>;
   readonly respondingIds: ReadonlySet<string>;
-  readonly clarifyAnswers: Readonly<Record<string, PaClarifyAnswers>>;
-  readonly onClarifyAnswerChange: (
-    requestId: string,
-    questionId: string,
-    value: PaClarifyAnswer,
+  readonly canSelectModel: boolean;
+  readonly onRespondRequest: (
+    req: PaPendingRequest,
+    decision?: string,
+    answers?: PaClarifyAnswers,
   ) => void;
-  readonly onRespondRequest: (req: PaPendingRequest, decision?: string) => void;
   /** Resolves `true` once the engine took the answer; typed values never leave the form until then. */
   readonly onRespondSecret: (req: PaPendingRequest, answer: PaSecretAnswer) => Promise<boolean>;
   /** `queued`: the draft waits behind the running turn. */
@@ -478,9 +480,7 @@ export function PaComposer({
                 key={req.requestId}
                 req={req}
                 responding={disabled || respondingIds.has(req.requestId)}
-                clarifyAnswerMap={clarifyAnswers[req.requestId] ?? {}}
-                onClarifyAnswerChange={(qId, val) => onClarifyAnswerChange(req.requestId, qId, val)}
-                onRespond={(decision) => onRespondRequest(req, decision)}
+                onRespond={(decision, answers) => onRespondRequest(req, decision, answers)}
               />
             ),
           )}
@@ -727,7 +727,7 @@ export function PaComposer({
                 </div>
 
                 <div className="flex min-w-0 flex-1 items-center justify-end gap-1.5 overflow-hidden">
-                  {capabilities?.models.supported ? (
+                  {canSelectModel && capabilities?.models.supported ? (
                     <PaModelPicker
                       bot={bot}
                       sessionId={sessionId}

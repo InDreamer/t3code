@@ -1,7 +1,7 @@
 import type { PaPendingRequest } from "@t3tools/contracts";
 import { T, useGT } from "gt-react";
 import { KeyRoundIcon, ShieldCheckIcon } from "lucide-react";
-import { useId, useRef, useState, type FormEvent } from "react";
+import { useId, useLayoutEffect, useRef, useState, type FormEvent } from "react";
 
 import { SecretRequestField } from "../chat/SecretRequestField";
 import { MessageCopyButton } from "../chat/MessageCopyButton";
@@ -32,6 +32,14 @@ export function PaSecretRequestForm({
   const [submitting, setSubmitting] = useState(false);
   // Enter and a click can both submit before a render.
   const inFlight = useRef(false);
+  const mounted = useRef(false);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- a pending credential reply can outlive its form
+  useLayoutEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
   const fields = req.fields ?? [];
   const busy = responding || submitting;
   const canSubmit =
@@ -43,13 +51,12 @@ export function PaSecretRequestForm({
     inFlight.current = true;
     setSubmitting(true);
     // A password field that leaves the page with text in it can prompt to save a login.
-    const typed = values;
     setValues({});
     const accepted = await onAnswer(answer).finally(() => {
       inFlight.current = false;
-      setSubmitting(false);
+      if (mounted.current) setSubmitting(false);
     });
-    if (!accepted && answer.type === "submit") setValues(typed);
+    if (mounted.current && !accepted && answer.type === "submit") setValues(answer.values);
   };
 
   const onSubmit = (event: FormEvent<HTMLFormElement>) => {
@@ -107,7 +114,7 @@ export function PaSecretRequestForm({
               key: field.id,
               label: field.label,
               placeholder: field.placeholder ?? "",
-              secret: field.secret === true,
+              secret: field.secret !== false,
             }}
             // A single input is labelled by the card title.
             label={single ? undefined : field.label}

@@ -175,6 +175,54 @@ it.each(["complete", "switched", "queued", "voice"] as const)(
   },
 );
 
+it.each(["lost reply", "idle snapshot"] as const)(
+  "settles a pending send after a %s",
+  async (scenario) => {
+    using spies = new DisposableStack();
+    const flow = setup(spies);
+    const receipt = Promise.withResolvers<Awaited<ReturnType<typeof paApi.sendMessage>>>();
+    flow.send.mockReturnValueOnce(receipt.promise);
+    await using screen = await render(flow.view("deep"));
+    const idle = {
+      type: "snapshot",
+      running: false,
+      sessionId: "deep",
+      resumeToken: "idle",
+      openRequests: [],
+      snapshotRequired: true,
+    } as const;
+    await act(() => flow.emit(idle));
+    await screen.getByRole("textbox").fill("plan");
+    await userEvent.keyboard("{Enter}");
+    expect(flow.send).toHaveBeenCalledOnce();
+    if (scenario === "lost reply") {
+      await screen.rerender(flow.view("other"));
+      await screen.getByRole("textbox").fill("another draft");
+      await act(async () => {
+        receipt.reject(new Error("lost"));
+        await receipt.promise.catch(() => undefined);
+      });
+      await expect.element(screen.getByRole("textbox")).toHaveValue("another draft");
+      await screen.rerender(flow.view("deep"));
+      await expect.element(screen.getByRole("textbox")).toHaveValue("plan");
+    } else {
+      await act(() => flow.emit({ type: "turn.started", sessionId: "deep", resumeToken: "start" }));
+      flow.read.mockResolvedValue({
+        messages: [
+          { id: "user", rowKind: "message", role: "user", text: "rewritten plan", timestamp: 1 },
+        ],
+      });
+      await act(() => flow.emit(idle));
+      await act(async () => {
+        receipt.resolve({ kind: "turn", sessionId: "deep" });
+        await receipt.promise;
+      });
+      await expect.element(screen.getByText("rewritten plan", { exact: true })).toBeVisible();
+      await expect.element(screen.getByText("plan", { exact: true })).not.toBeInTheDocument();
+    }
+  },
+);
+
 it("settles the live reply when a delivered steer supersedes the outstanding history read", async () => {
   using spies = new DisposableStack();
   const flow = setup(spies);
@@ -273,6 +321,83 @@ it("disables featured commands on an empty read-only conversation", async () => 
   await expect.element(screen.getByRole("button", { name: "/status", exact: true })).toBeDisabled();
 });
 
+it("keeps an operate-only user's model command in the composer", async () => {
+  using spies = new DisposableStack();
+  const flow = setup(spies);
+  spies.use(vi.spyOn(paApi, "listCommands")).mockResolvedValue([
+    {
+      name: "/model",
+      description: "Models",
+      group: "command",
+      featured: true,
+      handling: "client:model-picker",
+      requiredScope: "operate",
+    },
+  ]);
+  await using screen = await render(
+    flow.view("deep", {
+      ...capabilities,
+      commands: { supported: true },
+      models: { supported: true, scope: "session", allowCustom: false },
+    }),
+  );
+  await act(() =>
+    flow.emit({
+      type: "snapshot",
+      sessionId: "deep",
+      running: false,
+      openRequests: [],
+      snapshotRequired: true,
+      resumeToken: "idle",
+    }),
+  );
+  expect(screen.getByRole("button", { name: /^Switch model/ }).elements()).toHaveLength(0);
+  expect(screen.getByRole("button", { name: "/model", exact: true }).elements()).toHaveLength(0);
+  const draft = screen.getByRole("textbox");
+  await draft.fill("/model");
+  await userEvent.keyboard("{Enter}");
+  await expect.element(draft).toHaveValue("/model");
+  expect(flow.send).not.toHaveBeenCalled();
+});
+
+it("drops clarify answers after the request resolves or the session changes", async () => {
+  using spies = new DisposableStack();
+  const flow = setup(spies);
+  await using screen = await render(flow.view("deep"));
+  const open = (sessionId: string) =>
+    act(() =>
+      flow.emit({
+        type: "request.opened",
+        sessionId,
+        resumeToken: "open",
+        request: {
+          kind: "clarify",
+          requestId: "same",
+          title: "Question",
+          detail: "",
+          questions: [{ id: "answer", prompt: "Reply" }],
+        },
+      }),
+    );
+  const answer = screen.getByPlaceholder("Enter your reply…");
+  await open("deep");
+  await answer.fill("first");
+  await act(() =>
+    flow.emit({
+      type: "request.resolved",
+      sessionId: "deep",
+      requestId: "same",
+      resumeToken: "end",
+    }),
+  );
+  await open("deep");
+  await expect.element(answer).toHaveValue("");
+  await answer.fill("second");
+  await screen.rerender(flow.view("other"));
+  await open("other");
+  await expect.element(answer).toHaveValue("");
+});
+
 it("leaves ordinary secret inputs unlimited and applies the PA response limit", async () => {
   using spies = new DisposableStack();
   const flow = setup(spies);
@@ -287,7 +412,7 @@ it("leaves ordinary secret inputs unlimited and applies the PA response limit", 
         kind: "secret",
         title: "API key",
         detail: "",
-        fields: [{ id: "key", label: "API key", secret: true, required: true }],
+        fields: [{ id: "key", label: "API key", required: true }],
       },
     }),
   );
