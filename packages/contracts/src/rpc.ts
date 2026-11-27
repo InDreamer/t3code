@@ -53,9 +53,12 @@ import {
   PaGetMessagesResult,
   PaListBotsResult,
   PaListCommandsResult,
+  PaListSessionsInput,
   PaListSessionsResult,
   PaModelCatalog,
   PaMutateScheduleInput,
+  PaMutateSessionInput,
+  PaMutateSessionResult,
   PaPatchBotConfigInput,
   PaRespondRequestInput,
   PaSchedulesResult,
@@ -63,6 +66,9 @@ import {
   PaSelectBotModelResult,
   PaSendMessageInput,
   PaSendResult,
+  PaSteerSessionInput,
+  PaSteerSessionResult,
+  PaManageQueuedItemInput,
   PaSessionInput,
   PaSessionSummary,
   PaStreamEvent,
@@ -634,9 +640,12 @@ export const WS_METHODS = {
   paListCommands: "pa.listCommands",
   paListSessions: "pa.listSessions",
   paCreateSession: "pa.createSession",
+  paMutateSession: "pa.mutateSession",
   paGetMessages: "pa.getMessages",
   paSendMessage: "pa.sendMessage",
   paInterruptSession: "pa.interruptSession",
+  paSteerSession: "pa.steerSession",
+  paManageQueuedItem: "pa.manageQueuedItem",
   paRespondRequest: "pa.respondRequest",
   paSubscribeSession: "pa.subscribeSession",
   peerLinksList: "peerLinks.list",
@@ -1060,7 +1069,7 @@ const WsPaListCommandsRpc = Rpc.make(WS_METHODS.paListCommands, {
 });
 
 const WsPaListSessionsRpc = Rpc.make(WS_METHODS.paListSessions, {
-  payload: PaBotInput,
+  payload: PaListSessionsInput,
   success: PaListSessionsResult,
   error: PaRpcError,
 });
@@ -1068,6 +1077,12 @@ const WsPaListSessionsRpc = Rpc.make(WS_METHODS.paListSessions, {
 const WsPaCreateSessionRpc = Rpc.make(WS_METHODS.paCreateSession, {
   payload: PaCreateSessionInput,
   success: PaSessionSummary,
+  error: PaRpcError,
+});
+
+const WsPaMutateSessionRpc = Rpc.make(WS_METHODS.paMutateSession, {
+  payload: PaMutateSessionInput,
+  success: PaMutateSessionResult,
   error: PaRpcError,
 });
 
@@ -1085,6 +1100,18 @@ const WsPaSendMessageRpc = Rpc.make(WS_METHODS.paSendMessage, {
 
 const WsPaInterruptSessionRpc = Rpc.make(WS_METHODS.paInterruptSession, {
   payload: PaSessionInput,
+  error: PaRpcError,
+});
+
+/** Hands plain text to the running turn; never re-sends a steer the engine may have taken. */
+const WsPaSteerSessionRpc = Rpc.make(WS_METHODS.paSteerSession, {
+  payload: PaSteerSessionInput,
+  success: PaSteerSessionResult,
+  error: PaRpcError,
+});
+
+const WsPaManageQueuedItemRpc = Rpc.make(WS_METHODS.paManageQueuedItem, {
+  payload: PaManageQueuedItemInput,
   error: PaRpcError,
 });
 
@@ -2666,9 +2693,12 @@ export const WsRpcGroup = RpcGroup.make(
   WsPaListCommandsRpc,
   WsPaListSessionsRpc,
   WsPaCreateSessionRpc,
+  WsPaMutateSessionRpc,
   WsPaGetMessagesRpc,
   WsPaSendMessageRpc,
   WsPaInterruptSessionRpc,
+  WsPaSteerSessionRpc,
+  WsPaManageQueuedItemRpc,
   WsPaRespondRequestRpc,
   WsPaSubscribeSessionRpc,
   WsPeerLinksListRpc,

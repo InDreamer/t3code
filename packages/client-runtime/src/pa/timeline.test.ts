@@ -12,6 +12,8 @@ import {
   nextPaLocalTimestamp,
   paNoticeMessage,
   reducePaStreamEvent,
+  startPaLiveTurnLocally,
+  summarizePaTodos,
   summarizePaWorkGroup,
 } from "./timeline.ts";
 
@@ -364,5 +366,78 @@ describe("PA open requests across turn boundaries", () => {
       blocks: [],
       openRequests: [sessionRequest, request],
     });
+  });
+});
+
+describe("PA session state beside the live turn", () => {
+  const queued = { id: "adm-q", text: "next", status: "queued", canSteer: true } as const;
+  const usage = { contextUsed: 4_000, contextMax: 8_000, contextPercent: 50 };
+  const todos = {
+    revision: 2,
+    items: [
+      { id: "1", text: "Read", status: "completed" },
+      { id: "2", text: "Fix", status: "in_progress" },
+      { id: "3", text: "Ship", status: "pending" },
+      { id: "4", text: "Gold-plate", status: "cancelled" },
+    ],
+  } as const;
+
+  it("keeps the queue, usage and todos across turns, settles and reloads", () => {
+    let state = reduceAll([
+      { type: "turn.started" },
+      { type: "queue.updated", items: [queued] },
+      { type: "usage.updated", usage },
+      { type: "todos.updated", todos },
+      { type: "text.delta", text: "Done", role: "answer" },
+      { type: "turn.completed", status: "complete" },
+    ]);
+    expect(state).toMatchObject({ phase: "settling", queuedItems: [queued], usage, todos });
+    state = clearSettledPaLiveTurn(state, state.settleToken);
+    expect(state).toMatchObject({ phase: "idle", blocks: [], queuedItems: [queued], usage, todos });
+    state = reduceAll([{ type: "turn.started" }], state);
+    expect(state.queuedItems).toEqual([queued]);
+    // A reload snapshot that names none of them keeps them; one that does replaces them.
+    state = reduceAll(
+      [{ type: "snapshot", running: true, openRequests: [], snapshotRequired: true }],
+      state,
+    );
+    expect(state).toMatchObject({ queuedItems: [queued], usage, todos });
+    state = reduceAll(
+      [
+        {
+          type: "snapshot",
+          running: true,
+          openRequests: [],
+          snapshotRequired: false,
+          queuedItems: [],
+          usage: null,
+          todos: null,
+        },
+      ],
+      state,
+    );
+    expect(state).toMatchObject({ queuedItems: [], usage: null, todos: null });
+  });
+
+  it("ignores an older todo revision and keeps session state when a send starts a turn", () => {
+    let state = reduceAll([
+      { type: "todos.updated", todos },
+      { type: "todos.updated", todos: { revision: 1, items: [] } },
+      { type: "queue.updated", items: [queued] },
+    ]);
+    expect(state.todos).toEqual(todos);
+    state = startPaLiveTurnLocally(state, 5_000);
+    expect(state).toMatchObject({ phase: "running", startedAt: 5_000, queuedItems: [queued] });
+    expect(startPaLiveTurnLocally(state, 9_000)).toBe(state);
+  });
+
+  it("summarizes todo progress without counting cancelled items", () => {
+    expect(summarizePaTodos(todos)).toEqual({
+      completed: 1,
+      total: 3,
+      active: { id: "2", text: "Fix", status: "in_progress" },
+    });
+    expect(summarizePaTodos({ revision: 3, items: [] })).toBeNull();
+    expect(summarizePaTodos(null)).toBeNull();
   });
 });

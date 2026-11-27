@@ -69,6 +69,7 @@ export function paSessionEvents(
   const input = (): PaSubscribeSessionInput => ({
     botId: follower.botId,
     sessionId: follower.sessionId,
+    protocolVersion: 2,
     ...(resumeToken !== undefined ? { resumeToken } : {}),
   });
   const events = Stream.unwrap(
@@ -117,9 +118,12 @@ export function createPaEnvironmentCommands<R, E>(
     listCommands: command(WS_METHODS.paListCommands),
     listSessions: command(WS_METHODS.paListSessions),
     createSession: command(WS_METHODS.paCreateSession),
+    mutateSession: command(WS_METHODS.paMutateSession),
     getMessages: command(WS_METHODS.paGetMessages),
     sendMessage: command(WS_METHODS.paSendMessage),
     interruptSession: command(WS_METHODS.paInterruptSession),
+    steerSession: command(WS_METHODS.paSteerSession),
+    manageQueuedItem: command(WS_METHODS.paManageQueuedItem),
     respondRequest: command(WS_METHODS.paRespondRequest),
     /** Streams a session until the returned stop is called or the engine refuses it for good. */
     followSession: (registry: AtomRegistry.AtomRegistry, follower: PaSessionFollower) => {

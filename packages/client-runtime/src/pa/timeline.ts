@@ -1,7 +1,11 @@
 import type {
+  PaContextUsage,
   PaMessage,
   PaPendingRequest,
+  PaQueuedItem,
   PaStreamEvent,
+  PaTodoItem,
+  PaTodoState,
   PaToolCategory,
 } from "@t3tools/contracts";
 
@@ -65,6 +69,10 @@ export interface PaLiveTurnState {
   readonly openRequests: ReadonlyArray<PaPendingRequest>;
   readonly error: string | null;
   readonly nextBlockSeq: number;
+  /** Session state the engine reports, outliving any one turn; never kept optimistically. */
+  readonly queuedItems: ReadonlyArray<PaQueuedItem>;
+  readonly usage: PaContextUsage | null;
+  readonly todos: PaTodoState | null;
 }
 
 export function createInitialPaLiveTurn(sessionId: string | null = null): PaLiveTurnState {
@@ -78,8 +86,17 @@ export function createInitialPaLiveTurn(sessionId: string | null = null): PaLive
     openRequests: [],
     error: null,
     nextBlockSeq: 0,
+    queuedItems: [],
+    usage: null,
+    todos: null,
   };
 }
+
+const sessionState = (state: PaLiveTurnState) => ({
+  queuedItems: state.queuedItems,
+  usage: state.usage,
+  todos: state.todos,
+});
 
 /** Drops a settled turn's live blocks once the stored transcript that replaces them is shown. */
 export function clearSettledPaLiveTurn(
@@ -89,9 +106,43 @@ export function clearSettledPaLiveTurn(
   if (state.phase !== "settling" || state.settleToken !== settleToken) return state;
   return {
     ...createInitialPaLiveTurn(state.sessionId),
+    ...sessionState(state),
     openRequests: state.openRequests,
     error: state.error,
     settleToken: state.settleToken,
+  };
+}
+
+/** A send the engine admitted before its feed reported the turn: show it running now. */
+export function startPaLiveTurnLocally(state: PaLiveTurnState, nowMs: number): PaLiveTurnState {
+  if (state.phase === "running") return state;
+  return {
+    ...createInitialPaLiveTurn(state.sessionId),
+    ...sessionState(state),
+    phase: "running",
+    startedAt: nowMs,
+    openRequests: state.openRequests,
+    settleToken: state.settleToken,
+  };
+}
+
+export interface PaTodoProgress {
+  readonly completed: number;
+  /** Cancelled items are not work left, so they count toward neither side. */
+  readonly total: number;
+  readonly active: PaTodoItem | null;
+}
+
+export function summarizePaTodos(todos: PaTodoState | null): PaTodoProgress | null {
+  if (!todos || todos.items.length === 0) return null;
+  const counted = todos.items.filter((item) => item.status !== "cancelled");
+  return {
+    completed: counted.filter((item) => item.status === "completed").length,
+    total: counted.length,
+    active:
+      todos.items.find((item) => item.status === "in_progress") ??
+      todos.items.find((item) => item.status === "pending") ??
+      null,
   };
 }
 
@@ -511,10 +562,17 @@ export function reducePaStreamEvent(
   nowMs: number,
 ): PaLiveTurnState {
   switch (event.type) {
-    case "snapshot":
+    case "snapshot": {
+      // A field the snapshot leaves out is unchanged since the client's last copy.
+      const reported = {
+        queuedItems: event.queuedItems ?? state.queuedItems,
+        usage: event.usage !== undefined ? event.usage : state.usage,
+        todos: event.todos !== undefined ? event.todos : state.todos,
+      };
       if (event.snapshotRequired) {
         return {
           ...createInitialPaLiveTurn(state.sessionId),
+          ...reported,
           phase: event.running ? "running" : "idle",
           startedAt: event.running ? (state.startedAt ?? nowMs) : null,
           openRequests: event.openRequests,
@@ -522,11 +580,24 @@ export function reducePaStreamEvent(
       }
       return {
         ...state,
+        ...reported,
         phase: event.running ? "running" : state.phase === "settling" ? "settling" : "idle",
         startedAt: event.running ? (state.startedAt ?? nowMs) : state.startedAt,
         openRequests: event.openRequests,
         error: null,
       };
+    }
+
+    case "queue.updated":
+      return { ...state, queuedItems: event.items };
+
+    case "usage.updated":
+      return { ...state, usage: event.usage };
+
+    case "todos.updated":
+      return state.todos !== null && event.todos.revision < state.todos.revision
+        ? state
+        : { ...state, todos: event.todos };
 
     case "turn.started":
       return {

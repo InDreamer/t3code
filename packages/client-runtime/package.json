@@ -391,6 +391,10 @@
       "types": "./src/state/shell.ts",
       "default": "./src/state/shell.ts"
     },
+    "./pa/history": {
+      "types": "./src/pa/history.ts",
+      "default": "./src/pa/history.ts"
+    },
     "./pa/environment": {
       "types": "./src/pa/environment.ts",
       "default": "./src/pa/environment.ts"

@@ -1,4 +1,6 @@
 import * as Schema from "effect/Schema";
+import { ChatAttachmentId, PROVIDER_SEND_TURN_MAX_ATTACHMENTS } from "./chatAttachment.ts";
+import { NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
 
 const PA_SLUG_PATTERN = /^[a-z][a-z0-9_-]{0,63}$/;
 const PA_OPAQUE_REF_PATTERN = /^[^\s\p{Cc}]+$/u;
@@ -73,11 +75,29 @@ export type PaAvatarShape = typeof PaAvatarShape.Type;
 const PaAvatarColor = Schema.String.check(Schema.isPattern(/^#[0-9a-fA-F]{6}$/));
 
 export const PaCapabilities = Schema.Struct({
-  sessions: Schema.Struct({ create: Schema.Boolean, rename: Schema.Boolean }),
+  attachments: Schema.optionalKey(
+    Schema.Struct({
+      images: Schema.Boolean,
+      files: Schema.Boolean,
+      maxImages: Schema.optionalKey(NonNegativeInt),
+      maxFileBytes: Schema.optionalKey(NonNegativeInt),
+    }),
+  ),
+  sessions: Schema.Struct({
+    create: Schema.Boolean,
+    rename: Schema.Boolean,
+    renameExisting: Schema.optionalKey(Schema.Boolean),
+  }),
   execution: Schema.Struct({
     interrupt: Schema.Boolean,
     approvals: Schema.Boolean,
     clarify: Schema.Boolean,
+    /** Masked credential prompts (`secret` requests); absent from servers that predate them. */
+    secrets: Schema.optionalKey(Schema.Boolean),
+    /** Messages sent while a turn runs wait in the engine's queue (`queuedItems`). */
+    queue: Schema.optionalKey(Schema.Boolean),
+    /** Plain text can be handed to the running turn (`pa.steerSession`). */
+    steer: Schema.optionalKey(Schema.Boolean),
   }),
   models: Schema.Struct({
     supported: Schema.Boolean,
@@ -383,9 +403,24 @@ export const PaSessionSummary = Schema.Struct({
 });
 export type PaSessionSummary = typeof PaSessionSummary.Type;
 
+const PaPageCursor = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(2_000));
+const PaRequestKey = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(128));
+
+export const PaListSessionsInput = Schema.Struct({
+  botId: PaBotId,
+  /** Matches a session's title or id, not its messages. */
+  query: Schema.optionalKey(Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(200))),
+  /** The previous page's `nextCursor`, with the same `query`. */
+  cursor: Schema.optionalKey(PaPageCursor),
+  limit: Schema.optionalKey(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 200 }))),
+});
+export type PaListSessionsInput = typeof PaListSessionsInput.Type;
+
 export const PaListSessionsResult = Schema.Struct({
   primarySessionId: Schema.NullOr(Schema.String),
   sessions: Schema.Array(PaSessionSummary),
+  /** Absent or null once there is nothing older to list. */
+  nextCursor: Schema.optionalKey(Schema.NullOr(Schema.String)),
 });
 export type PaListSessionsResult = typeof PaListSessionsResult.Type;
 
@@ -393,8 +428,29 @@ export const PaCreateSessionInput = Schema.Struct({
   botId: PaBotId,
   setPrimary: Schema.optionalKey(Schema.Boolean),
   title: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(200))),
+  /** Idempotency key: a retried create with the same id returns the same session. */
+  requestId: Schema.optionalKey(PaRequestKey),
 });
 export type PaCreateSessionInput = typeof PaCreateSessionInput.Type;
+
+/** Session edits; one member per action so later actions extend the union. */
+export const PaMutateSessionInput = Schema.Union([
+  Schema.Struct({
+    botId: PaBotId,
+    sessionId: PaSessionId,
+    action: Schema.Literal("rename"),
+    /** Idempotency key: a retried edit with the same id is applied once. */
+    requestId: PaRequestKey,
+    title: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(200)),
+  }),
+]);
+export type PaMutateSessionInput = typeof PaMutateSessionInput.Type;
+
+export const PaMutateSessionResult = Schema.Struct({
+  sessionId: Schema.String,
+  title: Schema.optionalKey(Schema.String),
+});
+export type PaMutateSessionResult = typeof PaMutateSessionResult.Type;
 
 export const PaToolCategory = Schema.Literals([
   "terminal",
@@ -417,10 +473,21 @@ export type PaToolCategory = typeof PaToolCategory.Type;
 
 const PaToolArgs = Schema.Record(Schema.String, Schema.Unknown);
 
+export const PaAttachment = Schema.Struct({
+  id: ChatAttachmentId,
+  type: Schema.Literals(["image", "file"]),
+  name: TrimmedNonEmptyString.check(Schema.isMaxLength(255)),
+  mimeType: TrimmedNonEmptyString.check(Schema.isMaxLength(100)),
+  sizeBytes: NonNegativeInt,
+  unavailable: Schema.optionalKey(Schema.Boolean),
+});
+export type PaAttachment = typeof PaAttachment.Type;
+
 export const PaMessage = Schema.Struct({
   id: Schema.String,
   role: Schema.Literals(["user", "assistant", "system", "tool"]),
   text: Schema.String,
+  attachments: Schema.optionalKey(Schema.Array(PaAttachment)),
   reasoning: Schema.optionalKey(Schema.String),
   toolCallId: Schema.optionalKey(Schema.String),
   toolName: Schema.optionalKey(Schema.String),
@@ -432,6 +499,13 @@ export const PaMessage = Schema.Struct({
   rowKind: Schema.Literals(["message", "compaction"]),
   /** Text the agent published before a tool step, not its answer. */
   commentary: Schema.optionalKey(Schema.Boolean),
+  /** The engine's durable row number, when it has one; orders rows across pages. */
+  rowId: Schema.optionalKey(Schema.Number),
+  submissionId: Schema.optionalKey(Schema.String),
+  /** The row was too large to page whole: only the head of its text is here. */
+  truncated: Schema.optionalKey(Schema.Boolean),
+  /** Compaction rows: how many messages the summary replaced. */
+  compactedMessages: Schema.optionalKey(Schema.Number),
 });
 export type PaMessage = typeof PaMessage.Type;
 
@@ -439,37 +513,134 @@ export const PaGetMessagesInput = Schema.Struct({
   botId: PaBotId,
   sessionId: PaSessionId,
   limit: Schema.optionalKey(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 500 }))),
+  /** The previous page's `nextCursor`: reads the page before it. Omitted for the newest page. */
+  cursor: Schema.optionalKey(PaPageCursor),
 });
 export type PaGetMessagesInput = typeof PaGetMessagesInput.Type;
 
-export const PaGetMessagesResult = Schema.Struct({ messages: Schema.Array(PaMessage) });
+/** One page of a transcript, oldest row first, read from the newest end backwards. */
+export const PaGetMessagesResult = Schema.Struct({
+  messages: Schema.Array(PaMessage),
+  /** Reads the page before this one; absent or null at the start of the conversation. */
+  nextCursor: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  /** The rows the cursor covered changed: this is the newest page again and replaces what is shown. */
+  reset: Schema.optionalKey(Schema.Boolean),
+});
+export type PaGetMessagesResult = typeof PaGetMessagesResult.Type;
 
 export const PaSendMessageInput = Schema.Struct({
   botId: PaBotId,
   sessionId: PaSessionId,
-  text: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(64_000)),
+  text: Schema.String.check(Schema.isMaxLength(64_000)),
+  attachments: Schema.optionalKey(
+    Schema.Array(PaAttachment).check(Schema.isMaxLength(PROVIDER_SEND_TURN_MAX_ATTACHMENTS)),
+  ),
   /** Idempotency key: a retried send with the same id is admitted once. */
   inputId: Schema.optionalKey(Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(128))),
+  /** Sent while a turn runs: the engine queues it behind that turn. */
+  queued: Schema.optionalKey(Schema.Boolean),
 });
 export type PaSendMessageInput = typeof PaSendMessageInput.Type;
 
 export const PaSendResult = Schema.Struct({
+  attachments: Schema.optionalKey(Schema.Array(PaAttachment)),
   /** `turn` streams over the session subscription; `output` is a command's immediate result. */
   kind: Schema.Literals(["turn", "output"]),
   sessionId: Schema.String,
   submissionId: Schema.optionalKey(Schema.String),
+  /** The queue item ID when the engine uses a separate transcript submission ID. */
+  admissionId: Schema.optionalKey(Schema.String),
   /** A retried `inputId` whose turn already ended: nothing streams, reload the transcript. */
   settled: Schema.optionalKey(Schema.Boolean),
   output: Schema.optionalKey(Schema.String),
   notice: Schema.optionalKey(Schema.String),
+  /** Waiting behind the running turn: shown from `queuedItems` until its own turn starts. */
+  queued: Schema.optionalKey(Schema.Boolean),
 });
 export type PaSendResult = typeof PaSendResult.Type;
 
+// Queue, steering, usage and todos
+
+/** A message waiting behind the running turn, as the engine still holds it. */
+export const PaQueuedItem = Schema.Struct({
+  attachmentCount: Schema.optionalKey(NonNegativeInt),
+  id: Schema.String,
+  /** The original send's id, when the engine lists it before acknowledging the send. */
+  inputId: Schema.optionalKey(Schema.String),
+  text: Schema.String,
+  /** `steering`: being handed to the running turn. `unknown`: lost across an engine restart; it holds the queue until resolved. */
+  status: Schema.Literals(["queued", "steering", "unknown"]),
+  canSteer: Schema.Boolean,
+  canReplace: Schema.optionalKey(Schema.Boolean),
+});
+export type PaQueuedItem = typeof PaQueuedItem.Type;
+
+/** The session's current context occupancy; never derived from cumulative token totals. */
+export const PaContextUsage = Schema.Struct({
+  contextUsed: Schema.Number,
+  /** Null when the engine does not know the model's window. */
+  contextMax: Schema.NullOr(Schema.Number),
+  contextPercent: Schema.NullOr(Schema.Number),
+  inputTokens: Schema.optionalKey(Schema.Number),
+  outputTokens: Schema.optionalKey(Schema.Number),
+  totalTokens: Schema.optionalKey(Schema.Number),
+  cacheReadTokens: Schema.optionalKey(Schema.Number),
+  compressionCount: Schema.optionalKey(Schema.Number),
+});
+export type PaContextUsage = typeof PaContextUsage.Type;
+
+export const PaTodoItem = Schema.Struct({
+  id: Schema.String,
+  text: Schema.String,
+  status: Schema.Literals(["pending", "in_progress", "completed", "cancelled"]),
+});
+export type PaTodoItem = typeof PaTodoItem.Type;
+
+/** The agent's whole task list; a higher `revision` replaces it, an empty one clears it. */
+export const PaTodoState = Schema.Struct({
+  revision: Schema.Number,
+  items: Schema.Array(PaTodoItem),
+});
+export type PaTodoState = typeof PaTodoState.Type;
+
+export const PaSteerSessionInput = Schema.Struct({
+  botId: PaBotId,
+  sessionId: PaSessionId,
+  text: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(64_000)),
+});
+export type PaSteerSessionInput = typeof PaSteerSessionInput.Type;
+
+export const PaSteerSessionResult = Schema.Struct({
+  /** `notDelivered`: the turn ended before taking it and nothing saw it, so it is safe to send normally. */
+  status: Schema.Literals(["delivered", "notDelivered", "voiceStopped"]),
+});
+export type PaSteerSessionResult = typeof PaSteerSessionResult.Type;
+
+export const PaManageQueuedItemInput = Schema.Struct({
+  botId: PaBotId,
+  sessionId: PaSessionId,
+  itemId: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(200)),
+  /** `resolveUnknown` gives up on a lost turn so the queue behind it runs. */
+  action: Schema.Literals(["cancel", "steer", "resolveUnknown"]),
+});
+export type PaManageQueuedItemInput = typeof PaManageQueuedItemInput.Type;
+
 // Requests
+
+export const PaRequestField = Schema.Struct({
+  id: Schema.String,
+  label: Schema.String,
+  placeholder: Schema.optionalKey(Schema.String),
+  /** Masked while typed. */
+  secret: Schema.optionalKey(Schema.Boolean),
+  required: Schema.optionalKey(Schema.Boolean),
+});
+export type PaRequestField = typeof PaRequestField.Type;
 
 export const PaPendingRequest = Schema.Struct({
   requestId: Schema.String,
-  kind: Schema.Literals(["approval", "clarify"]),
+  /** `secret` asks for credentials (`fields`); answering one needs providers:manage. */
+  kind: Schema.Literals(["approval", "clarify", "secret"]),
   /** Defaults to turn lifetime. Session requests stay open until explicitly resolved. */
   scope: Schema.optionalKey(Schema.Literals(["turn", "session"])),
   title: Schema.String,
@@ -495,6 +666,10 @@ export const PaPendingRequest = Schema.Struct({
       }),
     ),
   ),
+  /** `secret` requests: the values to collect, answered as `values` keyed by field id. */
+  fields: Schema.optionalKey(Schema.Array(PaRequestField)),
+  /** What answering does beyond this turn, such as saving the value to the agent's config. */
+  sideEffectNotice: Schema.optionalKey(Schema.String),
 });
 export type PaPendingRequest = typeof PaPendingRequest.Type;
 
@@ -510,12 +685,22 @@ export const PaRespondRequestInput = Schema.Struct({
   requestId: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(200)),
   decision: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(120))),
   answers: Schema.optionalKey(Schema.Record(Schema.String, PaClarifyAnswer)),
+  /** `secret` requests: one value per field id. Never logged, stored or echoed back. */
+  values: Schema.optionalKey(
+    Schema.Record(
+      Schema.String.check(Schema.isMaxLength(120)),
+      Schema.String.check(Schema.isMaxLength(16_000)),
+    ),
+  ),
+  /** Declines the request without answering it. */
+  skip: Schema.optionalKey(Schema.Boolean),
 });
 export type PaRespondRequestInput = typeof PaRespondRequestInput.Type;
 
 // Streaming
 
 export const PaSubscribeSessionInput = Schema.Struct({
+  protocolVersion: Schema.optionalKey(Schema.Int),
   botId: PaBotId,
   sessionId: PaSessionId,
   /** The last `resumeToken` this client applied; the server replays what followed it if it can. */
@@ -536,7 +721,18 @@ export const PaStreamEvent = Schema.Union([
     openRequests: Schema.Array(PaPendingRequest),
     /** Events were lost since the client's token: reload the transcript. */
     snapshotRequired: Schema.Boolean,
+    /** Absent: unchanged from what the client already has. */
+    queuedItems: Schema.optionalKey(Schema.Array(PaQueuedItem)),
+    usage: Schema.optionalKey(Schema.NullOr(PaContextUsage)),
+    todos: Schema.optionalKey(Schema.NullOr(PaTodoState)),
   }),
+  Schema.Struct({
+    type: Schema.Literal("queue.updated"),
+    ...PaEventBase,
+    items: Schema.Array(PaQueuedItem),
+  }),
+  Schema.Struct({ type: Schema.Literal("usage.updated"), ...PaEventBase, usage: PaContextUsage }),
+  Schema.Struct({ type: Schema.Literal("todos.updated"), ...PaEventBase, todos: PaTodoState }),
   Schema.Struct({
     type: Schema.Literal("session.updated"),
     ...PaEventBase,

@@ -119,8 +119,8 @@ describe("paSessionEvents", () => {
       const events = Array.from(yield* Fiber.join(fiber));
 
       expect(yield* Ref.get(inputs)).toEqual([
-        { botId: "hermes:default", sessionId: "s-1" },
-        { botId: "hermes:default", sessionId: "s-1", resumeToken: "ep:1" },
+        { protocolVersion: 2, botId: "hermes:default", sessionId: "s-1" },
+        { protocolVersion: 2, botId: "hermes:default", sessionId: "s-1", resumeToken: "ep:1" },
       ]);
       expect(events.map((e) => [e.type, e.resumeToken])).toEqual([
         ["snapshot", "ep:0"],
@@ -189,8 +189,8 @@ describe("paSessionEvents", () => {
       const rerun = Array.from(yield* run(1));
 
       expect(yield* Ref.get(inputs)).toEqual([
-        { botId: "hermes:default", sessionId: "s-1" },
-        { botId: "hermes:default", sessionId: "s-1", resumeToken: "ep:1" },
+        { protocolVersion: 2, botId: "hermes:default", sessionId: "s-1" },
+        { protocolVersion: 2, botId: "hermes:default", sessionId: "s-1", resumeToken: "ep:1" },
       ]);
       expect(rerun.map((e) => e.resumeToken)).toEqual(["ep:1"]);
     }),
