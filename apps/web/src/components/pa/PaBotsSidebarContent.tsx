@@ -1,5 +1,13 @@
 import { useNavigate, useSearch } from "@tanstack/react-router";
-import { T, useGT, Var } from "gt-react";
+import {
+  filterPaBots,
+  formatPaRosterTime,
+  groupPaBots,
+  paBotPreview,
+  paOfflineInstances,
+  resolveActivePaBot,
+} from "@t3tools/client-runtime/pa/roster";
+import { T, useGT, useMessages, Var } from "gt-react";
 import { BotIcon, PlusIcon, RefreshCwIcon, SearchIcon, Settings2Icon } from "lucide-react";
 import { useState } from "react";
 
@@ -27,61 +35,18 @@ export function PaBotsSidebarContent() {
   const { instances, bots, loading, refreshing, error, nowMs, lastBotId } = usePaBotsStore();
   const [query, setQuery] = useState("");
 
-  const formatRelativeTime = (ts: number | null): string => {
-    if (!ts) return "";
-    const now = new Date(nowMs);
-    const target = new Date(ts);
-    const oneDay = 24 * 60 * 60 * 1000;
-    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
-    const startOfTarget = new Date(
-      target.getFullYear(),
-      target.getMonth(),
-      target.getDate(),
-    ).getTime();
-    const dayDiff = Math.round((startOfToday - startOfTarget) / oneDay);
+  const m = useMessages();
+  const formatRelativeTime = (ts: number | null): string =>
+    formatPaRosterTime(
+      ts,
+      nowMs,
+      (date) => date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+      m,
+    );
 
-    if (dayDiff === 0) {
-      return target.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-    }
-    if (dayDiff === 1) {
-      return gt("Yesterday");
-    }
-    if (dayDiff > 1 && dayDiff < 7) {
-      const weekdays = [
-        gt("Sun"),
-        gt("Mon"),
-        gt("Tue"),
-        gt("Wed"),
-        gt("Thu"),
-        gt("Fri"),
-        gt("Sat"),
-      ];
-      return weekdays[target.getDay()] ?? "";
-    }
-    return gt("{month}/{day}", { month: target.getMonth() + 1, day: target.getDate() });
-  };
-
-  const q = query.trim().toLowerCase();
-  const filteredBots = !q
-    ? bots
-    : bots.filter(
-        (b) =>
-          b.name.toLowerCase().includes(q) ||
-          b.agentRef.toLowerCase().includes(q) ||
-          b.description.toLowerCase().includes(q) ||
-          (b.lastMessagePreview ?? "").toLowerCase().includes(q),
-      );
-
-  const pinnedBots = filteredBots.filter((b) => b.pinned).slice(0, 6);
-  const pinnedIds = new Set(pinnedBots.map((b) => b.botId));
-  const unpinnedBots = filteredBots.filter((b) => !pinnedIds.has(b.botId));
-
-  const activeBotId =
-    (routeBotId && bots.some((b) => b.botId === routeBotId) ? routeBotId : null) ??
-    (lastBotId && bots.some((b) => b.botId === lastBotId) ? lastBotId : null) ??
-    bots.find((b) => b.isDefault)?.botId ??
-    bots[0]?.botId ??
-    null;
+  const filteredBots = filterPaBots(bots, query);
+  const { pinned: pinnedBots, others: unpinnedBots } = groupPaBots(filteredBots);
+  const activeBotId = resolveActivePaBot(bots, routeBotId, lastBotId)?.botId ?? null;
 
   const selectBot = (botId: string) => {
     rememberLastPaBotId(botId);
@@ -108,7 +73,7 @@ export function PaBotsSidebarContent() {
     setPaCreateDialogOpen(true);
   };
 
-  const offlineInstances = instances.filter((i) => !i.online);
+  const offlineInstances = paOfflineInstances(instances);
 
   return (
     <SidebarContent
@@ -309,9 +274,7 @@ export function PaBotsSidebarContent() {
                         </div>
                         <div className="mt-0.5 flex items-center justify-between gap-1.5">
                           <p className="truncate text-2xs text-sidebar-muted-foreground">
-                            {bot.lastMessagePreview ||
-                              bot.description ||
-                              `${bot.engineLabel} · ${bot.model || bot.agentRef}`}
+                            {paBotPreview(bot)}
                           </p>
                           {bot.unread ? (
                             <span className="inline-block size-2 shrink-0 rounded-full bg-info" />

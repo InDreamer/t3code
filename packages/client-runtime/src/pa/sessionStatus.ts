@@ -1,4 +1,4 @@
-import type { ContextWindowSnapshot } from "@t3tools/client-runtime/state/context-window";
+import type { ContextWindowSnapshot } from "../state/contextWindow.ts";
 import type { PaContextUsage } from "@t3tools/contracts";
 
 /** Nothing worth a meter: no occupancy reported and no window to measure it against. */

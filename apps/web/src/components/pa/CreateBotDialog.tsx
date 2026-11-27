@@ -20,7 +20,13 @@ import { Label } from "../ui/label";
 import { Switch } from "../ui/switch";
 import { Textarea } from "../ui/textarea";
 import { PaNativeSelect } from "./PaNativeSelect";
-import { BotAvatar, PA_AVATAR_COLORS, PA_AVATAR_SHAPES } from "./BotAvatar";
+import {
+  PA_AVATAR_COLORS,
+  PA_AVATAR_SHAPES,
+  PA_DEFAULT_AVATAR,
+} from "@t3tools/client-runtime/pa/avatar";
+import { derivePaAgentSlug, paCreatableInstances } from "@t3tools/client-runtime/pa/roster";
+import { BotAvatar } from "./BotAvatar";
 import { paApi, paErrorMessage } from "./paApi";
 
 export function CreateBotDialog({
@@ -36,14 +42,14 @@ export function CreateBotDialog({
 }) {
   const gt = useGT();
   const m = useMessages();
-  const creatable = instances.filter((i) => i.capabilities.lifecycle.create);
+  const creatable = paCreatableInstances(instances);
   const [selectedInstanceId, setSelectedInstanceId] = useState<string | null>(null);
   const [name, setName] = useState("");
   const [agentRef, setAgentRef] = useState("");
   const [description, setDescription] = useState("");
   const [instructions, setInstructions] = useState("");
-  const [avatarColor, setAvatarColor] = useState<string>(PA_AVATAR_COLORS[1].value);
-  const [avatarShape, setAvatarShape] = useState<PaAvatarShape>("blob");
+  const [avatarColor, setAvatarColor] = useState<string>(PA_DEFAULT_AVATAR.color);
+  const [avatarShape, setAvatarShape] = useState<PaAvatarShape>(PA_DEFAULT_AVATAR.shape);
   const [pinned, setPinned] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -55,20 +61,15 @@ export function CreateBotDialog({
     null;
   const canCreate = activeInstance !== null && activeInstance.online;
 
-  const derivedSlug = (agentRef || name)
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9_-]+/g, "-")
-    .replace(/^[^a-z0-9]+|-+$/g, "")
-    .slice(0, 64);
+  const derivedSlug = derivePaAgentSlug(agentRef, name);
 
   const resetForm = () => {
     setName("");
     setAgentRef("");
     setDescription("");
     setInstructions("");
-    setAvatarColor(PA_AVATAR_COLORS[1].value);
-    setAvatarShape("blob");
+    setAvatarColor(PA_DEFAULT_AVATAR.color);
+    setAvatarShape(PA_DEFAULT_AVATAR.shape);
     setPinned(false);
     setError(null);
   };

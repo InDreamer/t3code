@@ -17,7 +17,8 @@ import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { InputGroup, InputGroupAddon, InputGroupInput } from "../ui/input-group";
 import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
-import { makePaRequestKey, paApi, paErrorMessage } from "./paApi";
+import { makePaRequestKey } from "@t3tools/client-runtime/pa/chat";
+import { paApi, paErrorMessage } from "./paApi";
 
 const SEARCH_DEBOUNCE_MS = 250;
 

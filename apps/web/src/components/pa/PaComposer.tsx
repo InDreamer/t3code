@@ -55,7 +55,7 @@ import type {
   PaSlashCommand,
 } from "@t3tools/contracts";
 import { PROVIDER_SEND_TURN_MAX_FILE_BYTES } from "@t3tools/contracts";
-import { resolvePaComposerSendMode } from "./PaComposer.logic";
+import { resolvePaComposerSendMode } from "@t3tools/client-runtime/pa/composer";
 import { PaModelPicker } from "./PaModelPicker";
 import { PaSecretRequestForm, type PaSecretAnswer } from "./PaSecretRequestForm";
 

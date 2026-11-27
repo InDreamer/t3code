@@ -24,7 +24,7 @@ import {
   normalizeComposerImageFileMimeType,
 } from "../chat/composerAttachmentFiles";
 import type { PreparingComposerImage } from "../chat/preparingComposerImages";
-import { makePaRequestKey } from "./paApi";
+import { makePaRequestKey } from "@t3tools/client-runtime/pa/chat";
 
 type DraftItem =
   | ComposerImageAttachment

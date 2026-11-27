@@ -1,4 +1,4 @@
-import { T, useGT } from "gt-react";
+import { T, useGT, useMessages } from "gt-react";
 import {
   CheckIcon,
   ChevronDownIcon,
@@ -25,7 +25,7 @@ import {
   formatPaReasoningLabel,
   getSelectableReasoningLevels,
   resolvePaReasoningGlyph,
-} from "./paReasoning";
+} from "@t3tools/client-runtime/pa/reasoning";
 
 const SEARCH_THRESHOLD = 8;
 
@@ -315,6 +315,7 @@ function PaReasoningPicker({
   readonly onApplied: (effort: string) => void;
 }) {
   const gt = useGT();
+  const m = useMessages();
   const [open, setOpen] = useState(false);
   const [savingLevel, setSavingLevel] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -322,9 +323,9 @@ function PaReasoningPicker({
   const activeLevel =
     levels.find((level) => level.id.toLowerCase() === (currentEffort ?? "").toLowerCase()) ?? null;
   const triggerLabel = activeLevel
-    ? formatPaReasoningLabel(gt, activeLevel.id, activeLevel.label)
+    ? formatPaReasoningLabel(activeLevel.id, activeLevel.label, m)
     : currentEffort
-      ? formatPaReasoningLabel(gt, currentEffort)
+      ? formatPaReasoningLabel(currentEffort, undefined, m)
       : gt("Reasoning");
   const triggerGlyph = resolvePaReasoningGlyph(activeLevel?.id ?? currentEffort, levels);
 
@@ -403,7 +404,7 @@ function PaReasoningPicker({
               const selected =
                 level.id.toLowerCase() === (activeLevel?.id ?? currentEffort ?? "").toLowerCase();
               const glyph = resolvePaReasoningGlyph(level.id, levels);
-              const label = formatPaReasoningLabel(gt, level.id, level.label);
+              const label = formatPaReasoningLabel(level.id, level.label, m);
               return (
                 <button
                   key={level.id}

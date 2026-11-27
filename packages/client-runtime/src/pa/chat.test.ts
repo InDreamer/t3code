@@ -1,6 +1,6 @@
 import { PaError, type PaSendResult } from "@t3tools/contracts";
 import { describe, expect, it, vi } from "vite-plus/test";
-import { sendPaChatMessage, trackAdmittedPaRow } from "./BotChatPane.logic";
+import { createPaPrimarySessionCreates, sendPaChatMessage, trackAdmittedPaRow } from "./chat.ts";
 
 describe("PA send receipts", () => {
   it("reuses the input id only while the text and uploaded attachment ids match", async () => {
@@ -61,5 +61,24 @@ describe("PA send receipts", () => {
     const queued: PaSendResult = { kind: "turn", sessionId: "a", submissionId: "q", queued: true };
     expect(trackAdmittedPaRow(rows, "a", "optimistic-row", queued, false)).toBe(false);
     expect(rows.has("a")).toBe(false);
+  });
+});
+
+describe("PA primary session creates", () => {
+  it("shares one in-flight create and reuses its key only after a transient failure", async () => {
+    let keys = 0;
+    const ensure = createPaPrimarySessionCreates<string>(() => `key-${++keys}`);
+    const lost = Promise.withResolvers<string>();
+    const create = vi
+      .fn<(requestId: string) => Promise<string>>()
+      .mockReturnValueOnce(lost.promise)
+      .mockRejectedValueOnce(new PaError({ reason: "Forbidden", message: "no" }))
+      .mockResolvedValue("session");
+    const attempts = Promise.allSettled([ensure("bot", create), ensure("bot", create)]);
+    lost.reject(new PaError({ reason: "Unavailable", message: "lost receipt" }));
+    expect((await attempts).map((outcome) => outcome.status)).toEqual(["rejected", "rejected"]);
+    await expect(ensure("bot", create)).rejects.toMatchObject({ reason: "Forbidden" });
+    await expect(ensure("bot", create)).resolves.toBe("session");
+    expect(create.mock.calls.map(([requestId]) => requestId)).toEqual(["key-1", "key-1", "key-2"]);
   });
 });

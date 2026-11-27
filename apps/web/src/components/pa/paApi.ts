@@ -1,7 +1,5 @@
-import {
-  createPaEnvironmentCommands,
-  isPermanentPaFailure,
-} from "@t3tools/client-runtime/pa/environment";
+import { createPaPrimarySessionCreates, makePaRequestKey } from "@t3tools/client-runtime/pa/chat";
+import { createPaEnvironmentCommands } from "@t3tools/client-runtime/pa/environment";
 import {
   runAtomCommand,
   squashAtomCommandFailure,
@@ -56,13 +54,13 @@ function primaryEnvironmentId(): Promise<EnvironmentId> {
 async function call<I, A, E>(
   command: AtomCommand<{ readonly environmentId: EnvironmentId; readonly input: I }, A, E>,
   input: I,
-  environmentId?: EnvironmentId,
+  options?: { readonly environmentId?: EnvironmentId; readonly reportDefect?: boolean },
 ): Promise<A> {
   const result = await runAtomCommand(
     appAtomRegistry,
     command,
-    { environmentId: environmentId ?? (await primaryEnvironmentId()), input },
-    { reportFailure: false },
+    { environmentId: options?.environmentId ?? (await primaryEnvironmentId()), input },
+    { reportFailure: false, reportDefect: options?.reportDefect ?? true },
   );
   if (result._tag === "Success") return result.value;
   throw squashAtomCommandFailure(result);
@@ -73,20 +71,9 @@ export function paErrorMessage(error: unknown, fallback: string): string {
 }
 
 // StrictMode mounts twice; without sharing the in-flight create each mount mints its own session.
-const primarySessionCreates = new Map<
-  string,
-  {
-    requestId: string;
-    inFlight?: Promise<PaSessionSummary>;
-  }
->();
-
-/** An idempotency key: the engine applies a retried request with the same key once. */
-export function makePaRequestKey(prefix: string): string {
-  const bytes = new Uint8Array(16);
-  crypto.getRandomValues(bytes);
-  return `${prefix}-${Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")}`;
-}
+const ensurePrimarySessionCreate = createPaPrimarySessionCreates<PaSessionSummary>(() =>
+  makePaRequestKey("pa-session"),
+);
 
 export const paApi = {
   listBots: () => call(pa.listBots, {}),
@@ -113,29 +100,9 @@ export const paApi = {
   /** Creates the Bot's primary session once, however many mounts ask concurrently. */
   async ensurePrimarySession(botId: string) {
     const environmentId = await primaryEnvironmentId();
-    const key = JSON.stringify([environmentId, botId]);
-    const attempt = primarySessionCreates.get(key) ?? { requestId: makePaRequestKey("pa-session") };
-    if (attempt.inFlight) return attempt.inFlight;
-    primarySessionCreates.set(key, attempt);
-    attempt.inFlight = call(
-      pa.createSession,
-      {
-        botId,
-        setPrimary: true,
-        requestId: attempt.requestId,
-      },
-      environmentId,
+    return ensurePrimarySessionCreate(JSON.stringify([environmentId, botId]), (requestId) =>
+      call(pa.createSession, { botId, setPrimary: true, requestId }, { environmentId }),
     );
-    try {
-      const created = await attempt.inFlight;
-      primarySessionCreates.delete(key);
-      return created;
-    } catch (error) {
-      if (isPermanentPaFailure(error)) primarySessionCreates.delete(key);
-      throw error;
-    } finally {
-      delete attempt.inFlight;
-    }
   },
   /** One transcript page; omit `cursor` for the newest. */
   getMessages: (
@@ -170,7 +137,8 @@ export const paApi = {
     itemId: string,
     action: PaManageQueuedItemInput["action"],
   ) => call(pa.manageQueuedItem, { botId, sessionId, itemId, action }),
-  respondRequest: (input: PaRespondRequestInput) => call(pa.respondRequest, input),
+  respondRequest: (input: PaRespondRequestInput) =>
+    call(pa.respondRequest, input, { reportDefect: false }),
   /** Streams a session over the environment connection; resumes on its own after drops. */
   followSession(
     botId: string,

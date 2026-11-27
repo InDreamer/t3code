@@ -5,7 +5,7 @@ import {
   formatPaReasoningLabel,
   getSelectableReasoningLevels,
   resolvePaReasoningGlyph,
-} from "./paReasoning";
+} from "./reasoning.ts";
 
 const LEVELS = [
   { id: "none", label: "Off" },
@@ -65,9 +65,8 @@ describe("paReasoning", () => {
   });
 
   it("formats known levels cleanly and falls back for custom engine levels", () => {
-    const id = (text: string) => text;
-    expect(formatPaReasoningLabel(id, "none")).toBe("Off");
-    expect(formatPaReasoningLabel(id, "high")).toBe("High");
-    expect(formatPaReasoningLabel(id, "custom-tier", "Custom Tier")).toBe("Custom Tier");
+    expect(formatPaReasoningLabel("none")).toBe("Off");
+    expect(formatPaReasoningLabel("high")).toBe("High");
+    expect(formatPaReasoningLabel("custom-tier", "Custom Tier")).toBe("Custom Tier");
   });
 });

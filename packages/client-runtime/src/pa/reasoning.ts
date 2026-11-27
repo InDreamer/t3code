@@ -1,6 +1,6 @@
 import type { PaModelCatalog, PaModelOption, PaReasoningLevel } from "@t3tools/contracts";
-
-type Translate = (text: string) => string;
+import { mFallback, msg } from "gt-i18n";
+import type { MFunctionType } from "gt-i18n/types";
 
 const MAX_GLYPH_BARS = 5;
 const OFF_LEVEL_IDS = new Set(["none", "off"]);
@@ -56,28 +56,28 @@ export function resolvePaReasoningGlyph(
 }
 
 export function formatPaReasoningLabel(
-  gt: Translate,
   levelId: string,
   fallbackLabel?: string,
+  resolve: MFunctionType = mFallback,
 ): string {
   switch (levelId.toLowerCase()) {
     case "none":
     case "off":
-      return gt("Off");
+      return resolve(msg("Off", { $context: "reasoning effort level" }));
     case "minimal":
-      return gt("Minimal");
+      return resolve(msg("Minimal", { $context: "reasoning effort level" }));
     case "low":
-      return gt("Low");
+      return resolve(msg("Low", { $context: "reasoning effort level" }));
     case "medium":
-      return gt("Medium");
+      return resolve(msg("Medium", { $context: "reasoning effort level" }));
     case "high":
-      return gt("High");
+      return resolve(msg("High", { $context: "reasoning effort level" }));
     case "xhigh":
-      return gt("Extra high");
+      return resolve(msg("Extra high", { $context: "reasoning effort level" }));
     case "max":
-      return gt("Maximum");
+      return resolve(msg("Maximum", { $context: "reasoning effort level" }));
     case "ultra":
-      return gt("Ultra");
+      return resolve(msg("Ultra", { $context: "reasoning effort level" }));
     default:
       return fallbackLabel || levelId;
   }

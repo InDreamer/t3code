@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { resolvePaComposerSendMode } from "./PaComposer.logic";
+import { resolvePaComposerSendMode } from "./composer.ts";
 
 const base = {
   running: true,

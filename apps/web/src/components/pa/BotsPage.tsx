@@ -1,3 +1,4 @@
+import { paOfflineInstances, resolveActivePaBot } from "@t3tools/client-runtime/pa/roster";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import { T, useGT, Var } from "gt-react";
 import { BotIcon, Loader2Icon, PlusIcon } from "lucide-react";
@@ -31,12 +32,7 @@ export function BotsPage() {
     usePaBotsStore();
   const [settingsVersion, setSettingsVersion] = useState(0);
 
-  const activeBot =
-    (search.bot ? bots.find((b) => b.botId === search.bot) : undefined) ??
-    (lastBotId ? bots.find((b) => b.botId === lastBotId) : undefined) ??
-    bots.find((b) => b.isDefault) ??
-    bots[0] ??
-    null;
+  const activeBot = resolveActivePaBot(bots, search.bot, lastBotId);
 
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- remembers the active PA Bot in the module store so switching Code -> Bots restores it
   useEffect(() => {
@@ -56,7 +52,7 @@ export function BotsPage() {
     });
   };
 
-  const offlineInstances = instances.filter((i) => !i.online);
+  const offlineInstances = paOfflineInstances(instances);
   const capabilitiesFor = (instanceId: string | undefined) =>
     instances.find((i) => i.instanceId === instanceId)?.capabilities ?? null;
   const settingsBot = settingsBotId ? (bots.find((b) => b.botId === settingsBotId) ?? null) : null;

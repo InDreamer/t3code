@@ -46,6 +46,7 @@ import {
 } from "../chat/WorkLog";
 import { Button } from "../ui/button";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
+import { formatPaToolVerb, formatPaWorkGroupLabel } from "@t3tools/client-runtime/pa/presentation";
 import {
   describePaToolAction,
   findPaLiveFinalTextIndex,
@@ -54,8 +55,6 @@ import {
   formatPaToolInspectorContent,
   summarizePaWorkGroup,
   type PaLiveTurnState,
-  type PaToolAction,
-  type PaWorkGroupSummary,
   type PaWorkStep,
 } from "@t3tools/client-runtime/pa/timeline";
 import type { EnvironmentId, PaAttachment, PaMessage, PaToolCategory } from "@t3tools/contracts";
@@ -103,68 +102,6 @@ function PaTimestamp({
       <TooltipPopup>{formatChatTimestampTooltip(iso, timestampFormat, m)}</TooltipPopup>
     </Tooltip>
   );
-}
-
-type Translate = ReturnType<typeof useGT>;
-
-/** The verb for what a tool step did, in the reader's language. */
-export function formatPaToolVerb(gt: Translate, action: PaToolAction): string {
-  const pick = (failed: string, active: string, done: string) =>
-    action.phase === "failed" ? failed : action.phase === "active" ? active : done;
-  switch (action.category) {
-    case "terminal":
-      return pick(gt("Command failed"), gt("Running command"), gt("Ran command"));
-    case "file-read":
-      return pick(gt("Read failed"), gt("Reading file"), gt("Read file"));
-    case "file-edit":
-      return pick(gt("Edit failed"), gt("Editing file"), gt("Edited file"));
-    case "web-search":
-      return pick(gt("Search failed"), gt("Searching"), gt("Searched"));
-    case "web-fetch":
-      return pick(gt("Fetch failed"), gt("Reading web page"), gt("Read web page"));
-    case "search":
-      return pick(gt("Lookup failed"), gt("Looking up"), gt("Looked up"));
-    case "memory":
-      return pick(gt("Memory search failed"), gt("Searching memory"), gt("Searched memory"));
-    case "agent":
-      return pick(gt("Delegation failed"), gt("Delegating subtask"), gt("Delegated subtask"));
-    case "todo":
-      return pick(gt("Task update failed"), gt("Updating tasks"), gt("Updated tasks"));
-    case "schedule":
-      return pick(
-        gt("Schedule operation failed"),
-        gt("Managing scheduled tasks"),
-        gt("Updated scheduled tasks"),
-      );
-    case "skill":
-      return pick(gt("Skill failed"), gt("Using skill"), gt("Used skill"));
-    case "code":
-      return pick(gt("Code execution failed"), gt("Running code"), gt("Ran code"));
-    case "vision":
-      return pick(gt("Image analysis failed"), gt("Analyzing image"), gt("Analyzed image"));
-    case "message":
-      return pick(gt("Could not send message"), gt("Sending message"), gt("Sent message"));
-    case "other":
-      return action.phase === "failed"
-        ? gt("{tool} failed", { tool: action.toolName })
-        : action.toolName;
-  }
-}
-
-function formatPaWorkGroupLabel(gt: Translate, summary: PaWorkGroupSummary): string {
-  switch (summary.kind) {
-    case "reasoning":
-      return gt("Reasoning details");
-    case "tool": {
-      const verb = formatPaToolVerb(gt, summary.action);
-      const detail = summary.action.target ? `${verb} ${summary.action.target}` : verb;
-      return summary.afterReasoning ? gt("Reasoned · {detail}", { detail }) : detail;
-    }
-    case "tools":
-      return summary.afterReasoning
-        ? gt("Reasoned and used {count} tools", { count: summary.count })
-        : gt("Used {count} tools", { count: summary.count });
-  }
 }
 
 function PaToolIcon({
@@ -483,6 +420,7 @@ const PaWorkStepRow = memo(function PaWorkStepRow({
   readonly defaultExpanded?: boolean;
 }) {
   const gt = useGT();
+  const messages = useMessages();
   const [expanded, setExpanded] = useState(defaultExpanded);
 
   if (step.kind === "reasoning") {
@@ -568,7 +506,7 @@ const PaWorkStepRow = memo(function PaWorkStepRow({
   const action = describePaToolAction(step);
   const active = action.phase === "active";
   const failed = action.phase === "failed";
-  const verb = formatPaToolVerb(gt, action);
+  const verb = formatPaToolVerb(action, messages);
   const target = action.target;
   const duration = formatPaDurationMs(step.durationMs);
   const inspector = formatPaToolInspectorContent(step);
@@ -710,7 +648,7 @@ export const PaWorkGroupRow = memo(function PaWorkGroupRow({
   readonly steps: ReadonlyArray<PaWorkStep>;
   readonly timestamp?: number | null;
 }) {
-  const gt = useGT();
+  const messages = useMessages();
   const [expanded, setExpanded] = useState(false);
 
   // A single reasoning-only block behaves like T3 Code's expandable Thought row directly.
@@ -749,7 +687,7 @@ export const PaWorkGroupRow = memo(function PaWorkGroupRow({
         }
         label={
           <span className="flex min-w-0 items-center gap-1.5">
-            <span className="truncate">{formatPaWorkGroupLabel(gt, summary)}</span>
+            <span className="truncate">{formatPaWorkGroupLabel(summary, messages)}</span>
             <ChevronRightIcon
               aria-hidden
               className={cn(
@@ -846,6 +784,7 @@ function PaLiveWorkGroup({
   readonly statusText: string | null;
 }) {
   const gt = useGT();
+  const messages = useMessages();
   const [expanded, setExpanded] = useState(false);
 
   const activeTool = [...steps]
@@ -918,7 +857,7 @@ function PaLiveWorkGroup({
                 shimmer={false}
                 label={
                   <span className="inline-flex min-w-0 max-w-full items-baseline gap-1.5">
-                    <span className="shrink-0">{formatPaToolVerb(gt, toolAction)}</span>
+                    <span className="shrink-0">{formatPaToolVerb(toolAction, messages)}</span>
                     {toolAction.target ? (
                       <span className="min-w-0 truncate font-mono text-xs text-muted-foreground">
                         {toolAction.target}

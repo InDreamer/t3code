@@ -21,7 +21,10 @@ import { ThreadDetailsContext } from "../chat/ThreadDetailsUsage";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
-import { hasPaContextUsage, paContextWindowSnapshot } from "./paSessionStatus.logic";
+import {
+  hasPaContextUsage,
+  paContextWindowSnapshot,
+} from "@t3tools/client-runtime/pa/session-status";
 
 const STATUS_CARD =
   "mb-2 min-w-0 rounded-2xl border border-border/80 bg-card/95 shadow-sm backdrop-blur-md";

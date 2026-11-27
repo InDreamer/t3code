@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { hasPaContextUsage, paContextWindowSnapshot } from "./paSessionStatus.logic";
+import { hasPaContextUsage, paContextWindowSnapshot } from "./sessionStatus.ts";
 
 describe("PA context usage", () => {
   it("measures occupancy against the window and never against cumulative totals", () => {

@@ -31,12 +31,17 @@ import { useEffect, useState } from "react";
 import { useStableCallback } from "~/hooks/useStableCallback";
 import {
   buildPaginationSlots,
+  changedPaConfigSections,
+  parseSafePaConsoleUrl,
   filterToggleItems,
+  findPaMinEnabledViolation,
   modelConfirmationForDraft,
+  paConfigDrafts,
   paginateItems,
+  rebasePaConfigDrafts,
   TOGGLE_PAGE_SIZE,
   type ToggleFilterMode,
-} from "./BotSettingsSheet.logic";
+} from "@t3tools/client-runtime/pa/settings";
 import { cn } from "../../lib/utils";
 import { EffortGlyph } from "../chat/EffortGlyph";
 import { Badge } from "../ui/badge";
@@ -49,75 +54,19 @@ import { Sheet, SheetDescription, SheetHeader, SheetPopup, SheetTitle } from "..
 import { Switch } from "../ui/switch";
 import { Textarea } from "../ui/textarea";
 import { PaNativeSelect } from "./PaNativeSelect";
-import { BotAvatar, PA_AVATAR_COLORS, PA_AVATAR_SHAPES } from "./BotAvatar";
+import { PA_AVATAR_COLORS, PA_AVATAR_SHAPES } from "@t3tools/client-runtime/pa/avatar";
+import { BotAvatar } from "./BotAvatar";
 import { paApi, paErrorMessage } from "./paApi";
 import {
   findPaModelOption,
   formatPaReasoningLabel,
   getSelectableReasoningLevels,
   resolvePaReasoningGlyph,
-} from "./paReasoning";
+} from "@t3tools/client-runtime/pa/reasoning";
 
 type SettingsTab = "profile" | "model" | "toggles" | "schedules";
 
 const TOGGLE_FILTER_THRESHOLD = 8;
-
-function initialSectionValue(section: PaConfigSection): PaConfigSectionValue {
-  switch (section.kind) {
-    case "document":
-      return { kind: "document", text: section.text };
-    case "toggleList":
-      return {
-        kind: "toggleList",
-        enabled: section.items.filter((item) => item.enabled).map((item) => item.id),
-      };
-    case "options":
-      return {
-        kind: "options",
-        values: Object.fromEntries(section.fields.map((field) => [field.id, field.value])),
-      };
-  }
-}
-
-function sameSectionValue(a: PaConfigSectionValue, b: PaConfigSectionValue): boolean {
-  if (a.kind === "toggleList" && b.kind === "toggleList") {
-    const left = [...a.enabled].sort();
-    const right = [...b.enabled].sort();
-    return left.length === right.length && left.every((id, i) => id === right[i]);
-  }
-  return JSON.stringify(a) === JSON.stringify(b);
-}
-
-function draftsFor(config: PaBotConfig): Record<string, PaConfigSectionValue> {
-  return Object.fromEntries(config.sections.map((s) => [s.id, initialSectionValue(s)]));
-}
-
-/**
- * Moves drafts onto the config a section save returned. The saved section takes its stored value
- * unless it was edited again meanwhile; any other section the user has not edited here follows
- * the new config too, so a stale copy cannot overwrite another device's change on the next save.
- */
-function rebaseDrafts(
-  drafts: Record<string, PaConfigSectionValue>,
-  previous: PaBotConfig | null,
-  next: PaBotConfig,
-  savedId: string,
-  submitted: PaConfigSectionValue,
-): Record<string, PaConfigSectionValue> {
-  const rebased = { ...drafts };
-  for (const section of next.sections) {
-    const draft = drafts[section.id];
-    const before = previous?.sections.find((entry) => entry.id === section.id);
-    const untouched =
-      section.id === savedId
-        ? draft === undefined || sameSectionValue(draft, submitted)
-        : draft === undefined ||
-          before === undefined ||
-          sameSectionValue(draft, initialSectionValue(before));
-    if (untouched) rebased[section.id] = initialSectionValue(section);
-  }
-  return rebased;
-}
 
 function ToggleListSection({
   section,
@@ -422,6 +371,7 @@ function BotSettingsBody({
   });
 
   const [config, setConfig] = useState<PaBotConfig | null>(null);
+  const nativeConsoleUrl = parseSafePaConsoleUrl(config?.nativeConsoleUrl);
   const [drafts, setDrafts] = useState<Record<string, PaConfigSectionValue>>({});
   const [catalog, setCatalog] = useState<PaModelCatalog | null>(null);
   const [provider, setProvider] = useState("");
@@ -445,7 +395,7 @@ function BotSettingsBody({
         paApi.getBotConfig(bot.botId).then((loaded) => {
           if (cancelled) return;
           setConfig(loaded);
-          setDrafts(draftsFor(loaded));
+          setDrafts(paConfigDrafts(loaded));
         }),
       );
     }
@@ -502,10 +452,7 @@ function BotSettingsBody({
       ...(avatarShape !== savedMeta.avatarShape ? { avatarShape } : {}),
       ...(pinned !== savedMeta.pinned ? { pinned } : {}),
     };
-    const changedSections = sections.filter((section) => {
-      const draft = drafts[section.id];
-      return draft !== undefined && !sameSectionValue(draft, initialSectionValue(section));
-    });
+    const changedSections = changedPaConfigSections(sections, drafts);
     const currentModel = catalog?.current ?? null;
     const providerField = provider;
     const modelField = model;
@@ -541,22 +488,15 @@ function BotSettingsBody({
       setError(gt("Select a model provider"));
       return;
     }
-    for (const section of changedSections) {
-      const draft = drafts[section.id];
-      if (
-        section.kind === "toggleList" &&
-        section.minEnabled !== undefined &&
-        draft?.kind === "toggleList" &&
-        draft.enabled.length < section.minEnabled
-      ) {
-        setError(
-          gt("Enable at least {count} items in {section}", {
-            section: section.label,
-            count: section.minEnabled,
-          }),
-        );
-        return;
-      }
+    const belowMinimum = findPaMinEnabledViolation(changedSections, drafts);
+    if (belowMinimum) {
+      setError(
+        gt("Enable at least {count} items in {section}", {
+          section: belowMinimum.label,
+          count: belowMinimum.minEnabled ?? 0,
+        }),
+      );
+      return;
     }
 
     setSaving(true);
@@ -580,7 +520,9 @@ function BotSettingsBody({
         setConfig(nextConfig);
         const previous = baseline;
         baseline = nextConfig;
-        setDrafts((prev) => rebaseDrafts(prev, previous, nextConfig, section.id, submitted));
+        setDrafts((prev) =>
+          rebasePaConfigDrafts(prev, previous, nextConfig, section.id, submitted),
+        );
         onSaved();
       }
       if ((modelChanged || reasoningChanged) && catalog) {
@@ -709,11 +651,11 @@ function BotSettingsBody({
                 </span>
               </SheetDescription>
             </div>
-            {config?.nativeConsoleUrl ? (
+            {nativeConsoleUrl ? (
               <Button
                 size="xs"
                 variant="ghost"
-                render={<a href={config.nativeConsoleUrl} target="_blank" rel="noreferrer" />}
+                render={<a href={nativeConsoleUrl} target="_blank" rel="noreferrer" />}
               >
                 <ExternalLinkIcon className="size-3.5" />
                 <T>Advanced settings</T>
@@ -1013,7 +955,7 @@ function BotSettingsBody({
                         >
                           <EffortGlyph count={glyph.count} filled={glyph.filled} size="xs" />
                           <span className="truncate">
-                            {formatPaReasoningLabel(gt, level.id, level.label)}
+                            {formatPaReasoningLabel(level.id, level.label, m)}
                           </span>
                         </button>
                       );

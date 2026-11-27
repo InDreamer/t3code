@@ -407,6 +407,38 @@
       "types": "./src/pa/timeline.ts",
       "default": "./src/pa/timeline.ts"
     },
+    "./pa/avatar": {
+      "types": "./src/pa/avatar.ts",
+      "default": "./src/pa/avatar.ts"
+    },
+    "./pa/chat": {
+      "types": "./src/pa/chat.ts",
+      "default": "./src/pa/chat.ts"
+    },
+    "./pa/composer": {
+      "types": "./src/pa/composer.ts",
+      "default": "./src/pa/composer.ts"
+    },
+    "./pa/presentation": {
+      "types": "./src/pa/presentation.ts",
+      "default": "./src/pa/presentation.ts"
+    },
+    "./pa/reasoning": {
+      "types": "./src/pa/reasoning.ts",
+      "default": "./src/pa/reasoning.ts"
+    },
+    "./pa/roster": {
+      "types": "./src/pa/roster.ts",
+      "default": "./src/pa/roster.ts"
+    },
+    "./pa/session-status": {
+      "types": "./src/pa/sessionStatus.ts",
+      "default": "./src/pa/sessionStatus.ts"
+    },
+    "./pa/settings": {
+      "types": "./src/pa/settings.ts",
+      "default": "./src/pa/settings.ts"
+    },
     "./state/issue-trackers": {
       "types": "./src/state/issueTrackers.ts",
       "default": "./src/state/issueTrackers.ts"

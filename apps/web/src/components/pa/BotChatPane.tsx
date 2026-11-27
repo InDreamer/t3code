@@ -1,4 +1,4 @@
-import { T, useGT } from "gt-react";
+import { T, useGT, useMessages } from "gt-react";
 import { Loader2Icon, Settings2Icon } from "lucide-react";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
@@ -29,7 +29,6 @@ import {
   buildPaTimelineItems,
   clearSettledPaLiveTurn,
   createInitialPaLiveTurn,
-  findActivePaToolAction,
   mergePaMessagesByTime,
   nextPaLocalTimestamp,
   paNoticeMessage,
@@ -49,15 +48,25 @@ import type {
   PaSlashCommand,
   PaStreamEvent,
 } from "@t3tools/contracts";
-import { sendPaChatMessage, trackAdmittedPaRow } from "./BotChatPane.logic";
+import {
+  createPaLocalMessage,
+  makePaRequestKey,
+  paLiveTurnScrollSignature,
+  selectPaQuickCommands,
+  sendPaChatMessage,
+  trackAdmittedPaRow,
+} from "@t3tools/client-runtime/pa/chat";
+import {
+  formatPaSessionSource,
+  summarizePaLiveActivity,
+} from "@t3tools/client-runtime/pa/presentation";
 import { BotAvatar } from "./BotAvatar";
-import { makePaRequestKey, paApi, paErrorMessage, paSendPermissionAtom } from "./paApi";
+import { paApi, paErrorMessage, paSendPermissionAtom } from "./paApi";
 import { PaComposer, type PaClarifyAnswers } from "./PaComposer";
 import type { PaSecretAnswer } from "./PaSecretRequestForm";
 import { PaSessionPicker } from "./PaSessionPicker";
 import { PaContextUsageButton, PaQueueBar, PaTodoProgressBar } from "./PaSessionStatus";
 import {
-  formatPaToolVerb,
   PaAssistantMessageRow,
   PaCompactionRow,
   PaLiveTurnView,
@@ -69,48 +78,12 @@ import {
 const pendingSessionCreates = new Map<string, { title: string; id: string }>();
 
 const isAuthorizationError = Schema.is(EnvironmentAuthorizationError);
-const QUICK_COMMAND_COUNT = 3;
 const NO_SLASH_COMMANDS: ReadonlyArray<PaSlashCommand> = [];
 const SCROLL_NEAR_BOTTOM_PX = 96;
 const EMPTY_TRANSCRIPT: PaTranscriptWindow = { messages: [], olderCursor: null };
 
-let localMessageSeq = 0;
-
-function createLocalMessage(role: PaMessage["role"], text: string, timestamp: number): PaMessage {
-  localMessageSeq += 1;
-  return {
-    id: `local-${role}-${localMessageSeq}`,
-    role,
-    text,
-    timestamp,
-    rowKind: "message",
-  };
-}
-
 function makeInputId(): string {
-  if (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function") {
-    const bytes = new Uint8Array(16);
-    crypto.getRandomValues(bytes);
-    const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
-    return `pa-${hex}`;
-  }
-  localMessageSeq += 1;
-  return `pa-input-${Date.now()}-${localMessageSeq}`;
-}
-
-function liveTurnScrollSignature(turn: PaLiveTurnState): number {
-  let score = turn.blocks.length * 10 + turn.openRequests.length * 100;
-  for (const block of turn.blocks) {
-    if (block.kind === "text") {
-      score += block.text.length;
-    } else {
-      score += block.steps.length * 20;
-      for (const step of block.steps) {
-        score += step.text.length + (step.toolResult?.length ?? 0);
-      }
-    }
-  }
-  return score;
+  return makePaRequestKey("pa");
 }
 
 export function BotChatPane({
@@ -131,6 +104,7 @@ export function BotChatPane({
   readonly onActivity: () => void;
 }) {
   const gt = useGT();
+  const m = useMessages();
   const [sessions, setSessions] = useState<ReadonlyArray<PaSessionSummary>>([]);
   const [fallbackSessionId, setFallbackSessionId] = useState<string | null>(null);
   const activeSessionId = selectedSessionId ?? fallbackSessionId;
@@ -334,25 +308,7 @@ export function BotChatPane({
     },
   );
 
-  const formatSourceLabel = (source: string): string => {
-    switch (source.toLowerCase()) {
-      case "gui":
-        return gt("T3 Web");
-      case "feishu":
-        return gt("Feishu");
-      case "telegram":
-        return gt("Telegram");
-      case "cron":
-        return gt("Scheduled task");
-      case "cli":
-      case "tui":
-        return gt("Terminal");
-      case "local":
-        return gt("Local");
-      default:
-        return source;
-    }
-  };
+  const formatSourceLabel = (source: string): string => formatPaSessionSource(source, m);
 
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- tracks mount so a late session create cannot navigate after this Bot's pane is gone
   useEffect(() => {
@@ -635,7 +591,7 @@ export function BotChatPane({
   const timelineItems = buildPaTimelineItems(mergedMessages);
   const hasLiveTurn = liveTurn.phase !== "idle" || liveTurn.blocks.length > 0;
 
-  const scrollTargetScore = mergedMessages.length * 1000 + liveTurnScrollSignature(liveTurn);
+  const scrollTargetScore = mergedMessages.length * 1000 + paLiveTurnScrollSignature(liveTurn);
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- anchors the viewport to the latest message while the user is following at the bottom
   useEffect(() => {
     if (scrollTargetScore > 0 && isNearBottomRef.current) {
@@ -792,17 +748,7 @@ export function BotChatPane({
   };
 
   const activeSession = sessions.find((s) => s.sessionId === activeSessionId) ?? null;
-  // Everyday engine commands that answer at once, offered on an empty conversation.
-  const quickCommands = slashCommands
-    .filter(
-      (cmd) =>
-        cmd.featured === true &&
-        cmd.group === "command" &&
-        cmd.requiredScope === "operate" &&
-        (cmd.handling === "engine" || cmd.handling === "client:model-picker"),
-    )
-    .slice(0, QUICK_COMMAND_COUNT)
-    .map((cmd) => cmd.name);
+  const quickCommands = selectPaQuickCommands(slashCommands);
 
   const switchSession = (nextSessionId: string) => {
     setSessionsOpen(false);
@@ -905,7 +851,7 @@ export function BotChatPane({
 
     // A local row until a reload shows it stored; only an admitted turn is ever stored. A queued
     // send gets none: the queue bar shows it once the engine lists it.
-    const optimisticMsg = createLocalMessage("user", text, localTimestampNow());
+    const optimisticMsg = createPaLocalMessage("user", text, localTimestampNow());
     if (!queued && !attachments.length) appendLocalMessage(sessionId, optimisticMsg);
     const completedBeforeSend = settleTokensRef.current.get(sessionId);
     try {
@@ -1001,7 +947,7 @@ export function BotChatPane({
           void loadTranscript(sessionId, false, settleTokensRef.current.get(sessionId));
         } else if (res.status === "delivered") {
           // Stored with the running turn: a local row until that turn's reload shows it.
-          const row = createLocalMessage("user", text, localTimestampNow());
+          const row = createPaLocalMessage("user", text, localTimestampNow());
           appendLocalMessage(sessionId, row);
           const pending = pendingUserRowsRef.current.get(sessionId) ?? new Map<string, boolean>();
           pending.set(row.id, false);
@@ -1122,13 +1068,11 @@ export function BotChatPane({
       }));
       ok = true;
     } catch (err) {
-      // Only the engine's own refusal is shown: a transport error could quote the request.
       updateLiveTurn(sessionId, (prev) => ({
         ...prev,
-        error: isAuthorizationError(err)
-          ? gt("You need permission to manage providers to answer this request.")
-          : paErrorReason(err) !== null
-            ? paErrorMessage(err, gt("Could not submit credentials"))
+        error:
+          isAuthorizationError(err) || paErrorReason(err) === "Forbidden"
+            ? gt("You need permission to manage providers to answer this request.")
             : gt("Could not submit credentials"),
       }));
     }
@@ -1140,22 +1084,7 @@ export function BotChatPane({
     return ok;
   };
 
-  let scrollToEndSummary: string | null = null;
-  if (openRequests.length > 0) {
-    scrollToEndSummary = gt("Waiting for your approval");
-  } else if (running) {
-    const lastBlock = liveTurn.blocks[liveTurn.blocks.length - 1];
-    if (lastBlock?.kind === "text" && lastBlock.text.length > 0) {
-      scrollToEndSummary = gt("Streaming");
-    } else if (lastBlock?.kind === "work-group") {
-      const activeTool = findActivePaToolAction(liveTurn);
-      scrollToEndSummary = activeTool
-        ? formatPaToolVerb(gt, activeTool)
-        : liveTurn.statusText || gt("Thinking");
-    } else {
-      scrollToEndSummary = liveTurn.statusText || gt("Thinking");
-    }
-  }
+  const scrollToEndSummary = summarizePaLiveActivity(liveTurn, m);
 
   return (
     <div className="relative flex min-h-0 w-full min-w-0 flex-1 flex-col overflow-x-hidden bg-background">
