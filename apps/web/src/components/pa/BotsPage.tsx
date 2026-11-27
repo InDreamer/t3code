@@ -1,7 +1,7 @@
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import { T, useGT, Var } from "gt-react";
 import { BotIcon, Loader2Icon, PlusIcon } from "lucide-react";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 
 import { isElectron } from "~/env";
 import { Button } from "../ui/button";
@@ -29,6 +29,7 @@ export function BotsPage() {
   const navigate = useNavigate();
   const { instances, bots, loading, error, lastBotId, createOpen, settingsBotId } =
     usePaBotsStore();
+  const [settingsVersion, setSettingsVersion] = useState(0);
 
   const activeBot =
     (search.bot ? bots.find((b) => b.botId === search.bot) : undefined) ??
@@ -68,6 +69,7 @@ export function BotsPage() {
           bot={activeBot}
           capabilities={capabilitiesFor(activeBot.instanceId)}
           selectedSessionId={search.bot === activeBot.botId ? (search.session ?? null) : null}
+          settingsVersion={settingsVersion}
           onSelectSession={(sessionId) => selectBot(activeBot.botId, sessionId)}
           onOpenSettings={() => setPaSettingsBotId(activeBot.botId)}
           onActivity={() => void loadPaBots(true)}
@@ -162,6 +164,7 @@ export function BotsPage() {
           if (!open) setPaSettingsBotId(null);
         }}
         onSaved={() => {
+          setSettingsVersion((prev) => prev + 1);
           void loadPaBots(true);
         }}
       />

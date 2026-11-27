@@ -3,8 +3,10 @@ import type {
   PaConfigSection,
   PaMessage,
   PaModelCatalog,
+  PaModelOption,
   PaModelProvider,
   PaPendingRequest,
+  PaReasoningLevel,
   PaSchedule,
   PaSlashCommand,
   PaToolCategory,
@@ -96,7 +98,43 @@ export interface HermesModelOptionsResult {
     readonly is_user_defined?: boolean;
     readonly source?: string;
     readonly models?: ReadonlyArray<string>;
+    readonly capabilities?: Readonly<
+      Record<
+        string,
+        {
+          readonly reasoning?: boolean;
+          readonly can_disable_reasoning?: boolean | null;
+        }
+      >
+    >;
   }>;
+}
+
+export interface HermesReasoningConfigResult {
+  readonly value?: string | boolean | null;
+}
+
+const HERMES_REASONING_LEVELS: ReadonlyArray<PaReasoningLevel> = [
+  { id: "none", label: "Off" },
+  { id: "minimal", label: "Minimal" },
+  { id: "low", label: "Low" },
+  { id: "medium", label: "Medium" },
+  { id: "high", label: "High" },
+  { id: "xhigh", label: "Extra High" },
+  { id: "max", label: "Max" },
+  { id: "ultra", label: "Ultra" },
+];
+
+const HERMES_REASONING_EFFORT_SET: ReadonlySet<string> = new Set(
+  HERMES_REASONING_LEVELS.map((level) => level.id),
+);
+
+export function normalizeHermesReasoningEffort(value: unknown): string | undefined {
+  if (value === false) return "none";
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "false" || normalized === "disabled" || normalized === "off") return "none";
+  return HERMES_REASONING_EFFORT_SET.has(normalized) ? normalized : undefined;
 }
 
 export function normalizeHermesTimestamp(value: number | string | null | undefined): number | null {
@@ -773,6 +811,7 @@ const isAutoDetectedSource = (source: string | undefined) =>
 export function normalizeModelCatalog(
   options: HermesModelOptionsResult,
   description: HermesProfileDescription,
+  reasoning?: HermesReasoningConfigResult,
 ): PaModelCatalog {
   const rows = options.providers ?? [];
   const isPrimary = (row: (typeof rows)[number]) =>
@@ -789,26 +828,44 @@ export function normalizeModelCatalog(
           : isAutoDetectedSource(row.source)
             ? "detected"
             : undefined;
+    const capabilities = row.capabilities;
     return {
       id: row.slug,
       label: row.name,
       tier,
       ...(badge ? { badge } : {}),
       isCurrent: row.is_current === true,
-      models: (row.models ?? []).map((id) => ({ id })),
+      models: (row.models ?? []).map((id): PaModelOption => {
+        const cap = capabilities?.[id];
+        return {
+          id,
+          ...(typeof cap?.reasoning === "boolean" ? { reasoning: cap.reasoning } : {}),
+          ...(typeof cap?.can_disable_reasoning === "boolean"
+            ? { canDisableReasoning: cap.can_disable_reasoning }
+            : {}),
+        };
+      }),
       rank: row.is_current ? 0 : row.is_user_defined ? 1 : tier === "primary" ? 2 : 3,
     };
   });
   const currentProvider =
     nonEmptyString(description.model?.provider) ?? rows.find((row) => row.is_current)?.slug ?? null;
   const currentModel = nonEmptyString(description.model?.default);
+  const reasoningEffort = reasoning ? normalizeHermesReasoningEffort(reasoning.value) : undefined;
   return {
     scope: "agent",
     allowCustom: true,
-    current: currentModel ? { provider: currentProvider, model: currentModel } : null,
+    current: currentModel
+      ? {
+          provider: currentProvider,
+          model: currentModel,
+          ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
+        }
+      : null,
     providers: providers
       .sort((a, b) => a.rank - b.rank)
       .map(({ rank: _rank, ...provider }) => provider),
+    reasoningLevels: HERMES_REASONING_LEVELS,
   };
 }
 

@@ -28,6 +28,7 @@ import { useEffect, useState } from "react";
 import { useStableCallback } from "~/hooks/useStableCallback";
 import { modelConfirmationForDraft } from "./BotSettingsSheet.logic";
 import { cn } from "../../lib/utils";
+import { EffortGlyph } from "../chat/EffortGlyph";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
@@ -39,6 +40,12 @@ import { Switch } from "../ui/switch";
 import { Textarea } from "../ui/textarea";
 import { BotAvatar, PA_AVATAR_COLORS, PA_AVATAR_SHAPES } from "./BotAvatar";
 import { paApi, paErrorMessage } from "./paApi";
+import {
+  findPaModelOption,
+  formatPaReasoningLabel,
+  getSelectableReasoningLevels,
+  resolvePaReasoningGlyph,
+} from "./paReasoning";
 
 type SettingsTab = "profile" | "model" | "toggles" | "schedules";
 
@@ -285,6 +292,7 @@ function BotSettingsBody({
   const [catalog, setCatalog] = useState<PaModelCatalog | null>(null);
   const [provider, setProvider] = useState("");
   const [model, setModel] = useState("");
+  const [reasoningEffort, setReasoningEffort] = useState("");
   const getModelDraft = useStableCallback(() => ({ provider, model }));
 
   const [schedules, setSchedules] = useState<ReadonlyArray<PaSchedule>>([]);
@@ -313,6 +321,7 @@ function BotSettingsBody({
           setCatalog(loaded);
           setProvider(loaded.current?.provider ?? "");
           setModel(loaded.current?.model ?? "");
+          setReasoningEffort(loaded.current?.reasoningEffort ?? "");
         }),
       );
     }
@@ -344,6 +353,9 @@ function BotSettingsBody({
     catalog?.providers.find((p) => p.id === provider) ??
     catalog?.providers.find((p) => p.isCurrent) ??
     null;
+  const selectedProviderId = provider || activeProvider?.id || catalog?.current?.provider || null;
+  const selectedModelOption = findPaModelOption(catalog, selectedProviderId, model || null);
+  const reasoningLevels = getSelectableReasoningLevels(catalog, selectedProviderId, model || null);
 
   const handleSave = async (
     confirmed: { readonly provider: string; readonly model: string } | null = null,
@@ -362,6 +374,7 @@ function BotSettingsBody({
     const currentModel = catalog?.current ?? null;
     const providerField = provider;
     const modelField = model;
+    const reasoningField = reasoningEffort;
     const submittedModel = confirmed?.model ?? model.trim();
     // "Follow default" still pins a concrete provider: the engine cannot pin a model without one.
     const submittedProvider =
@@ -372,8 +385,20 @@ function BotSettingsBody({
       (confirmed !== null ||
         submittedModel !== currentModel?.model ||
         (provider !== "" && provider !== currentModel?.provider));
+    const validReasoning = reasoningLevels.some((level) => level.id === reasoningEffort)
+      ? reasoningEffort
+      : "";
+    const reasoningChanged =
+      catalog !== null &&
+      validReasoning.length > 0 &&
+      validReasoning !== (currentModel?.reasoningEffort ?? "");
 
-    if (Object.keys(metaPatch).length === 0 && changedSections.length === 0 && !modelChanged) {
+    if (
+      Object.keys(metaPatch).length === 0 &&
+      changedSections.length === 0 &&
+      !modelChanged &&
+      !reasoningChanged
+    ) {
       setSavedNotice(gt("没有需要保存的修改"));
       return;
     }
@@ -423,11 +448,11 @@ function BotSettingsBody({
         setDrafts((prev) => rebaseDrafts(prev, previous, nextConfig, section.id, submitted));
         onSaved();
       }
-      if (modelChanged && catalog) {
+      if ((modelChanged || reasoningChanged) && catalog) {
         const result = await paApi.selectBotModel({
           botId: bot.botId,
-          provider: submittedProvider,
-          model: submittedModel,
+          ...(modelChanged ? { provider: submittedProvider, model: submittedModel } : {}),
+          ...(reasoningChanged ? { reasoningEffort: validReasoning } : {}),
           ...(confirmed ? { confirm: true } : {}),
         });
         if (result.status === "confirmRequired") {
@@ -438,23 +463,36 @@ function BotSettingsBody({
               { provider: submittedProvider, model: submittedModel, message: result.message },
             ),
           );
+          setSaving(false);
           return;
         }
-        setCatalog((prev) => (prev ? { ...prev, current: result.current } : prev));
-        // "Follow default" is no longer offered once a provider is pinned: show the saved pick,
-        // unless the fields were changed while saving.
-        setProvider((current) =>
-          current === providerField ? (result.current.provider ?? "") : current,
-        );
-        setModel((current) => (current === modelField ? result.current.model : current));
+        const nextCurrent = {
+          ...(catalog.current?.reasoningEffort !== undefined
+            ? { reasoningEffort: catalog.current.reasoningEffort }
+            : {}),
+          ...result.current,
+        };
+        setCatalog((prev) => (prev ? { ...prev, current: nextCurrent } : prev));
+        if (modelChanged) {
+          // "Follow default" is no longer offered once a provider is pinned: show the saved pick,
+          // unless the fields were changed while saving.
+          setProvider((current) =>
+            current === providerField ? (nextCurrent.provider ?? "") : current,
+          );
+          setModel((current) => (current === modelField ? nextCurrent.model : current));
+        }
+        if (reasoningChanged && nextCurrent.reasoningEffort !== undefined) {
+          setReasoningEffort((current) =>
+            current === reasoningField ? (nextCurrent.reasoningEffort ?? "") : current,
+          );
+        }
         onSaved();
       }
       setSavedNotice(gt("已保存"));
     } catch (err) {
       setError(paErrorMessage(err, gt("保存失败")));
-    } finally {
-      setSaving(false);
     }
+    setSaving(false);
   };
 
   const mutateSchedule = async (
@@ -463,15 +501,15 @@ function BotSettingsBody({
   ) => {
     setScheduleBusy(true);
     setError(null);
+    let ok = false;
     try {
       setSchedules(await paApi.mutateSchedule({ botId: bot.botId, ...input }));
-      return true;
+      ok = true;
     } catch (err) {
       setError(paErrorMessage(err, fallback));
-      return false;
-    } finally {
-      setScheduleBusy(false);
     }
+    setScheduleBusy(false);
+    return ok;
   };
 
   const handleAddSchedule = async (e: React.FormEvent) => {
@@ -804,6 +842,48 @@ function BotSettingsBody({
                   </div>
                 )}
               </div>
+
+              {reasoningLevels.length > 0 ? (
+                <div className="space-y-1.5">
+                  <Label>
+                    <T>推理等级</T>
+                  </Label>
+                  <div
+                    role="radiogroup"
+                    aria-label={gt("推理等级")}
+                    className="grid grid-cols-4 gap-1.5"
+                  >
+                    {reasoningLevels.map((level) => {
+                      const selected = level.id.toLowerCase() === reasoningEffort.toLowerCase();
+                      const glyph = resolvePaReasoningGlyph(level.id, reasoningLevels);
+                      return (
+                        <button
+                          key={level.id}
+                          type="button"
+                          role="radio"
+                          aria-checked={selected}
+                          onClick={() => setReasoningEffort(level.id)}
+                          className={cn(
+                            "flex items-center justify-center gap-1.5 rounded-lg border px-2 py-1.5 text-xs transition-colors",
+                            selected
+                              ? "border-primary bg-primary/10 font-medium text-foreground"
+                              : "border-border/60 text-muted-foreground hover:bg-muted/40 hover:text-foreground",
+                          )}
+                        >
+                          <EffortGlyph count={glyph.count} filled={glyph.filled} size="xs" />
+                          <span className="truncate">
+                            {formatPaReasoningLabel(gt, level.id, level.label)}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              ) : selectedModelOption?.reasoning === false ? (
+                <p className="text-2xs text-muted-foreground">
+                  <T>当前模型不支持调节推理等级</T>
+                </p>
+              ) : null}
             </div>
           ) : null}
 

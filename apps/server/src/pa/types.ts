@@ -96,8 +96,9 @@ export interface PaEngineInstance {
       agentRef: string,
       input: {
         readonly sessionId?: string | undefined;
-        readonly provider: string;
-        readonly model: string;
+        readonly provider?: string | undefined;
+        readonly model?: string | undefined;
+        readonly reasoningEffort?: string | undefined;
         readonly confirm: boolean;
       },
     ) => Promise<PaSelectBotModelResult>;

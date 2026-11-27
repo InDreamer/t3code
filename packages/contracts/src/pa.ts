@@ -137,6 +137,13 @@ export const PaSessionInput = Schema.Struct({ botId: PaBotId, sessionId: PaSessi
 
 // Models
 
+export const PaModelOption = Schema.Struct({
+  id: Schema.String,
+  reasoning: Schema.optionalKey(Schema.Boolean),
+  canDisableReasoning: Schema.optionalKey(Schema.Boolean),
+});
+export type PaModelOption = typeof PaModelOption.Type;
+
 export const PaModelProvider = Schema.Struct({
   id: Schema.String,
   label: Schema.String,
@@ -144,13 +151,20 @@ export const PaModelProvider = Schema.Struct({
   tier: Schema.Literals(["primary", "detected"]),
   badge: Schema.optionalKey(Schema.Literals(["current", "custom", "detected"])),
   isCurrent: Schema.Boolean,
-  models: Schema.Array(Schema.Struct({ id: Schema.String })),
+  models: Schema.Array(PaModelOption),
 });
 export type PaModelProvider = typeof PaModelProvider.Type;
+
+export const PaReasoningLevel = Schema.Struct({
+  id: Schema.String,
+  label: Schema.String,
+});
+export type PaReasoningLevel = typeof PaReasoningLevel.Type;
 
 const PaModelSelection = Schema.Struct({
   provider: Schema.NullOr(Schema.String),
   model: Schema.String,
+  reasoningEffort: Schema.optionalKey(Schema.NullOr(Schema.String)),
 });
 
 export const PaModelCatalog = Schema.Struct({
@@ -158,6 +172,8 @@ export const PaModelCatalog = Schema.Struct({
   allowCustom: Schema.Boolean,
   current: Schema.NullOr(PaModelSelection),
   providers: Schema.Array(PaModelProvider),
+  /** Reasoning effort levels this engine offers (ascending); absent when unsupported. */
+  reasoningLevels: Schema.optionalKey(Schema.Array(PaReasoningLevel)),
 });
 export type PaModelCatalog = typeof PaModelCatalog.Type;
 
@@ -170,8 +186,11 @@ export type PaGetBotModelsInput = typeof PaGetBotModelsInput.Type;
 export const PaSelectBotModelInput = Schema.Struct({
   botId: PaBotId,
   sessionId: Schema.optionalKey(PaSessionId),
-  provider: Schema.String.check(Schema.isMaxLength(120)),
-  model: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(200)),
+  provider: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(120))),
+  model: Schema.optionalKey(Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(200))),
+  reasoningEffort: Schema.optionalKey(
+    Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(64)),
+  ),
   /** Set after the engine answered `confirmRequired` and the user accepted. */
   confirm: Schema.optionalKey(Schema.Boolean),
 });
@@ -523,6 +542,7 @@ export const PaStreamEvent = Schema.Union([
     ...PaEventBase,
     title: Schema.optionalKey(Schema.String),
     model: Schema.optionalKey(Schema.String),
+    reasoningEffort: Schema.optionalKey(Schema.String),
   }),
   Schema.Struct({
     type: Schema.Literal("turn.started"),

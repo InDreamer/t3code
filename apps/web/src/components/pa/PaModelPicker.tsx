@@ -10,11 +10,22 @@ import { useEffect, useRef, useState } from "react";
 
 import { useStableCallback } from "~/hooks/useStableCallback";
 import { cn } from "../../lib/utils";
+import { EffortGlyph } from "../chat/EffortGlyph";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
-import type { PaBotSummary, PaModelCatalog, PaModelProvider } from "@t3tools/contracts";
+import type {
+  PaBotSummary,
+  PaModelCatalog,
+  PaModelProvider,
+  PaReasoningLevel,
+} from "@t3tools/contracts";
 import { paApi, paErrorMessage } from "./paApi";
+import {
+  formatPaReasoningLabel,
+  getSelectableReasoningLevels,
+  resolvePaReasoningGlyph,
+} from "./paReasoning";
 
 const SEARCH_THRESHOLD = 8;
 
@@ -52,7 +63,7 @@ function PaModelPickerContent({
   readonly query: string;
   readonly onQueryChange: (value: string) => void;
   readonly onLoaded: (catalog: PaModelCatalog) => void;
-  readonly onApplied: (model: string) => void;
+  readonly onApplied: (current: NonNullable<PaModelCatalog["current"]>) => void;
 }) {
   const gt = useGT();
   const [loading, setLoading] = useState(true);
@@ -111,26 +122,33 @@ function PaModelPickerContent({
     if (savingKey) return;
     setSavingKey(`${provider}/${model}`);
     setError(null);
-    try {
-      const result = await paApi.selectBotModel({
+    const result = await paApi
+      .selectBotModel({
         botId: bot.botId,
-        ...(catalog?.scope === "session" && sessionId ? { sessionId } : {}),
+        ...(sessionId ? { sessionId } : {}),
         provider,
         model,
         ...(confirm ? { confirm: true } : {}),
+      })
+      .catch((err) => {
+        setError(paErrorMessage(err, gt("切换模型失败")));
+        return null;
       });
-      if (result.status === "confirmRequired") {
-        setConfirm({ provider, model, message: result.message });
-        return;
-      }
-      setConfirm(null);
-      if (catalog) onLoaded({ ...catalog, current: result.current });
-      onApplied(model);
-    } catch (err) {
-      setError(paErrorMessage(err, gt("切换模型失败")));
-    } finally {
-      setSavingKey(null);
+    setSavingKey(null);
+    if (!result) return;
+    if (result.status === "confirmRequired") {
+      setConfirm({ provider, model, message: result.message });
+      return;
     }
+    setConfirm(null);
+    const mergedCurrent = {
+      ...(catalog?.current?.reasoningEffort !== undefined
+        ? { reasoningEffort: catalog.current.reasoningEffort }
+        : {}),
+      ...result.current,
+    };
+    if (catalog) onLoaded({ ...catalog, current: mergedCurrent });
+    onApplied(mergedCurrent);
   };
 
   const renderGroup = (option: PaModelProvider) => (
@@ -282,6 +300,140 @@ function PaModelPickerContent({
   );
 }
 
+function PaReasoningPicker({
+  botId,
+  sessionId,
+  levels,
+  currentEffort,
+  onApplied,
+}: {
+  readonly botId: string;
+  readonly sessionId: string | null;
+  readonly levels: ReadonlyArray<PaReasoningLevel>;
+  readonly currentEffort: string | null;
+  readonly onApplied: (effort: string) => void;
+}) {
+  const gt = useGT();
+  const [open, setOpen] = useState(false);
+  const [savingLevel, setSavingLevel] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const activeLevel =
+    levels.find((level) => level.id.toLowerCase() === (currentEffort ?? "").toLowerCase()) ?? null;
+  const triggerLabel = activeLevel
+    ? formatPaReasoningLabel(gt, activeLevel.id, activeLevel.label)
+    : currentEffort
+      ? formatPaReasoningLabel(gt, currentEffort)
+      : gt("推理");
+  const triggerGlyph = resolvePaReasoningGlyph(activeLevel?.id ?? currentEffort, levels);
+
+  const pickEffort = async (level: PaReasoningLevel) => {
+    if (savingLevel) return;
+    if (level.id.toLowerCase() === (currentEffort ?? "").toLowerCase()) {
+      setOpen(false);
+      return;
+    }
+    setSavingLevel(level.id);
+    setError(null);
+    const result = await paApi
+      .selectBotModel({
+        botId,
+        ...(sessionId ? { sessionId } : {}),
+        reasoningEffort: level.id,
+      })
+      .catch((err) => {
+        setError(paErrorMessage(err, gt("切换推理等级失败")));
+        return null;
+      });
+    setSavingLevel(null);
+    if (!result || result.status !== "applied") return;
+    onApplied(result.current.reasoningEffort ?? level.id);
+    setOpen(false);
+  };
+
+  return (
+    <Popover
+      open={open}
+      onOpenChange={(next) => {
+        setOpen(next);
+        if (!next) setError(null);
+      }}
+    >
+      <PopoverTrigger
+        render={
+          <Button
+            type="button"
+            size="xs"
+            variant="ghost-muted"
+            className="shrink-0"
+            aria-label={gt("推理等级：{level}", { level: triggerLabel })}
+          >
+            <EffortGlyph count={triggerGlyph.count} filled={triggerGlyph.filled} size="xs" />
+            <span className="truncate">{triggerLabel}</span>
+            <ChevronDownIcon className="size-3 opacity-70" />
+          </Button>
+        }
+      />
+      <PopoverPopup
+        side="top"
+        align="end"
+        padding="compact"
+        className="w-56 max-w-[calc(100vw-1.5rem)]"
+      >
+        <div className="flex flex-col gap-1.5">
+          <div className="flex items-center justify-between gap-2 px-2 py-0.5">
+            <span className="text-xs font-medium text-muted-foreground">
+              <T>推理等级</T>
+            </span>
+          </div>
+
+          {error ? (
+            <div className="rounded-lg border border-destructive/30 bg-destructive/8 px-2.5 py-2 text-xs break-words text-destructive">
+              {error}
+            </div>
+          ) : null}
+
+          <div role="radiogroup" aria-label={gt("推理等级")} className="flex flex-col gap-0.5">
+            {levels.map((level) => {
+              const selected =
+                level.id.toLowerCase() === (activeLevel?.id ?? currentEffort ?? "").toLowerCase();
+              const glyph = resolvePaReasoningGlyph(level.id, levels);
+              const label = formatPaReasoningLabel(gt, level.id, level.label);
+              return (
+                <button
+                  key={level.id}
+                  type="button"
+                  role="radio"
+                  aria-checked={selected}
+                  disabled={savingLevel !== null}
+                  onClick={() => void pickEffort(level)}
+                  className={cn(
+                    "flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs transition-colors disabled:opacity-64",
+                    selected ? "bg-accent text-accent-foreground" : "hover:bg-muted/60",
+                  )}
+                >
+                  <EffortGlyph count={glyph.count} filled={glyph.filled} size="xs" />
+                  <span className="min-w-0 flex-1 truncate font-medium">{label}</span>
+                  <span className="shrink-0 font-mono text-2xs text-muted-foreground">
+                    {level.id}
+                  </span>
+                  {savingLevel === level.id ? (
+                    <Loader2Icon className="size-3.5 shrink-0 animate-spin" />
+                  ) : selected ? (
+                    <CheckIcon className="size-3.5 shrink-0" />
+                  ) : (
+                    <span className="size-3.5 shrink-0" aria-hidden />
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      </PopoverPopup>
+    </Popover>
+  );
+}
+
 export function PaModelPicker({
   bot,
   sessionId,
@@ -289,6 +441,9 @@ export function PaModelPicker({
   onOpenChange,
   query,
   onQueryChange,
+  liveReasoningEffort,
+  refreshVersion = 0,
+  onReasoningChanged,
   onModelChanged,
 }: {
   readonly bot: PaBotSummary;
@@ -297,6 +452,9 @@ export function PaModelPicker({
   readonly onOpenChange: (open: boolean) => void;
   readonly query: string;
   readonly onQueryChange: (value: string) => void;
+  readonly liveReasoningEffort?: string | null | undefined;
+  readonly refreshVersion?: number | undefined;
+  readonly onReasoningChanged?: ((effort: string) => void) | undefined;
   readonly onModelChanged: () => void;
 }) {
   const gt = useGT();
@@ -309,44 +467,104 @@ export function PaModelPicker({
     readonly base: string | null;
     readonly model: string;
   } | null>(null);
+  const [appliedEffort, setAppliedEffort] = useState<{
+    readonly base: string | null;
+    readonly effort: string;
+  } | null>(null);
+  const [localRefreshTick, setLocalRefreshTick] = useState(0);
+
+  const preloadRequestRef = useRef(0);
+  const preloadKey = `${bot.botId}\u0000${sessionId ?? ""}\u0000${bot.model ?? ""}\u0000${refreshVersion}\u0000${localRefreshTick}`;
+
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- loads the bot's model catalog and reasoning effort for the active session so the composer toolbar stays in sync
+  useEffect(() => {
+    if (!preloadKey) return;
+    const request = ++preloadRequestRef.current;
+    paApi
+      .getBotModels(bot.botId, sessionId ?? undefined)
+      .then((catalog) => {
+        if (preloadRequestRef.current !== request) return;
+        setCached({ botId: bot.botId, catalog });
+      })
+      .catch(() => undefined);
+    return () => {
+      preloadRequestRef.current += 1;
+    };
+  }, [bot.botId, sessionId, preloadKey]);
+
+  const catalog = cached?.botId === bot.botId ? cached.catalog : null;
   const label = applied && applied.base === bot.model ? applied.model : bot.model || bot.agentRef;
+  const currentProvider = catalog?.current?.provider ?? bot.provider;
+  const currentModel =
+    applied && applied.base === bot.model ? applied.model : (catalog?.current?.model ?? bot.model);
+  const serverEffort = liveReasoningEffort ?? catalog?.current?.reasoningEffort ?? null;
+  const currentEffort =
+    appliedEffort && appliedEffort.base === serverEffort ? appliedEffort.effort : serverEffort;
+  const reasoningLevels = getSelectableReasoningLevels(catalog, currentProvider, currentModel);
 
   return (
-    <Popover open={open} onOpenChange={(next) => onOpenChange(next)}>
-      <PopoverTrigger
-        render={
-          <Button
-            type="button"
-            size="xs"
-            variant="ghost-muted"
-            className="min-w-0 max-w-44 shrink sm:max-w-56"
-            aria-label={gt("切换模型：{model}", { model: label })}
-          >
-            <span className="min-w-0 truncate">{label}</span>
-            <ChevronDownIcon className="size-3 opacity-70" />
-          </Button>
-        }
-      />
-      <PopoverPopup
-        side="top"
-        align="end"
-        padding="compact"
-        className="w-72 max-w-[calc(100vw-1.5rem)]"
-      >
-        <PaModelPickerContent
-          bot={bot}
+    <div className="flex min-w-0 items-center gap-0.5">
+      <Popover open={open} onOpenChange={(next) => onOpenChange(next)}>
+        <PopoverTrigger
+          render={
+            <Button
+              type="button"
+              size="xs"
+              variant="ghost-muted"
+              className="min-w-0 max-w-36 shrink sm:max-w-52"
+              aria-label={gt("切换模型：{model}", { model: label })}
+            >
+              <span className="min-w-0 truncate">{label}</span>
+              <ChevronDownIcon className="size-3 opacity-70" />
+            </Button>
+          }
+        />
+        <PopoverPopup
+          side="top"
+          align="end"
+          padding="compact"
+          className="w-72 max-w-[calc(100vw-1.5rem)]"
+        >
+          <PaModelPickerContent
+            bot={bot}
+            sessionId={sessionId}
+            cached={catalog}
+            query={query}
+            onQueryChange={onQueryChange}
+            onLoaded={(nextCatalog) => setCached({ botId: bot.botId, catalog: nextCatalog })}
+            onApplied={(current) => {
+              setApplied({ base: bot.model, model: current.model });
+              onModelChanged();
+              setLocalRefreshTick((prev) => prev + 1);
+              onOpenChange(false);
+            }}
+          />
+        </PopoverPopup>
+      </Popover>
+
+      {reasoningLevels.length > 0 ? (
+        <PaReasoningPicker
+          botId={bot.botId}
           sessionId={sessionId}
-          cached={cached?.botId === bot.botId ? cached.catalog : null}
-          query={query}
-          onQueryChange={onQueryChange}
-          onLoaded={(catalog) => setCached({ botId: bot.botId, catalog })}
-          onApplied={(model) => {
-            setApplied({ base: bot.model, model });
-            onModelChanged();
-            onOpenChange(false);
+          levels={reasoningLevels}
+          currentEffort={currentEffort}
+          onApplied={(effort) => {
+            setAppliedEffort({ base: serverEffort, effort });
+            onReasoningChanged?.(effort);
+            setCached((prev) =>
+              prev && prev.botId === bot.botId && prev.catalog.current
+                ? {
+                    botId: prev.botId,
+                    catalog: {
+                      ...prev.catalog,
+                      current: { ...prev.catalog.current, reasoningEffort: effort },
+                    },
+                  }
+                : prev,
+            );
           }}
         />
-      </PopoverPopup>
-    </Popover>
+      ) : null}
+    </div>
   );
 }

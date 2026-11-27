@@ -212,6 +212,9 @@ export function PaComposer({
   onModelPickerOpenChange,
   modelQuery,
   onModelQueryChange,
+  liveReasoningEffort,
+  modelRefreshVersion,
+  onReasoningChanged,
   onModelChanged,
 }: {
   readonly bot: PaBotSummary;
@@ -240,6 +243,9 @@ export function PaComposer({
   readonly onModelPickerOpenChange: (open: boolean) => void;
   readonly modelQuery: string;
   readonly onModelQueryChange: (value: string) => void;
+  readonly liveReasoningEffort?: string | null | undefined;
+  readonly modelRefreshVersion?: number | undefined;
+  readonly onReasoningChanged?: ((effort: string) => void) | undefined;
   readonly onModelChanged: () => void;
 }) {
   const gt = useGT();
@@ -517,6 +523,9 @@ export function PaComposer({
                     onOpenChange={onModelPickerOpenChange}
                     query={modelQuery}
                     onQueryChange={onModelQueryChange}
+                    liveReasoningEffort={liveReasoningEffort}
+                    refreshVersion={modelRefreshVersion}
+                    onReasoningChanged={onReasoningChanged}
                     onModelChanged={onModelChanged}
                   />
                 ) : null}

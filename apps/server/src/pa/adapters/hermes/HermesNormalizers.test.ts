@@ -276,6 +276,55 @@ describe("Hermes sessions, profiles and models", () => {
     expect(onlyDetected.providers[0]?.tier).toBe("primary");
     expect(onlyDetected.current).toBeNull();
   });
+
+  it("carries per-model reasoning capabilities and active reasoning effort", () => {
+    const catalog = normalizeModelCatalog(
+      {
+        providers: [
+          {
+            slug: "openai",
+            name: "OpenAI",
+            is_current: true,
+            models: ["gpt-5.4", "gpt-4o-mini", "gpt-6-astra"],
+            capabilities: {
+              "gpt-5.4": { reasoning: true, can_disable_reasoning: true },
+              "gpt-4o-mini": { reasoning: false },
+              "gpt-6-astra": { reasoning: true, can_disable_reasoning: false },
+            },
+          },
+        ],
+      },
+      { model: { default: "gpt-5.4", provider: "openai" } },
+      { value: "HIGH" },
+    );
+    expect(catalog.current).toEqual({
+      provider: "openai",
+      model: "gpt-5.4",
+      reasoningEffort: "high",
+    });
+    expect(catalog.reasoningLevels?.map((level) => level.id)).toEqual([
+      "none",
+      "minimal",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+      "ultra",
+    ]);
+    expect(catalog.providers[0]?.models).toEqual([
+      { id: "gpt-5.4", reasoning: true, canDisableReasoning: true },
+      { id: "gpt-4o-mini", reasoning: false },
+      { id: "gpt-6-astra", reasoning: true, canDisableReasoning: false },
+    ]);
+
+    const disabled = normalizeModelCatalog(
+      { providers: [] },
+      { model: { default: "gpt-5.4", provider: "openai" } },
+      { value: false },
+    );
+    expect(disabled.current?.reasoningEffort).toBe("none");
+  });
 });
 
 describe("Hermes prompts and config", () => {

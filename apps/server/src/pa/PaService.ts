@@ -304,6 +304,7 @@ export function makePaService(options: {
         sessionId: input.sessionId,
         provider: input.provider,
         model: input.model,
+        reasoningEffort: input.reasoningEffort,
         confirm: input.confirm === true,
       }),
     );

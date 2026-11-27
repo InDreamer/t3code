@@ -245,6 +245,83 @@ describe("HermesPaAdapter profile routing", () => {
     ).toEqual({ status: "applied", current: { provider: "anthropic", model: "expensive-opus" } });
   });
 
+  it("reads and updates reasoning effort without re-triggering model confirmation", async () => {
+    const defaultConn = new FakeHermesConnection("default");
+    const feedbotConn = new FakeHermesConnection("feedbot");
+    defaultConn.onMethod("profiles.describe", () => ({
+      name: "feedbot",
+      model: { default: "expensive-opus", provider: "anthropic" },
+    }));
+    defaultConn.onMethod("profiles.configure", (p) =>
+      p.model === "expensive-opus" && !p.confirm_expensive_model
+        ? { ok: false, confirm_required: true, confirm_message: "Expensive model confirmation" }
+        : { ok: true, applied: { model: true } },
+    );
+    feedbotConn.onMethod("model.options", () => ({
+      providers: [
+        {
+          slug: "anthropic",
+          name: "Anthropic",
+          is_current: true,
+          models: ["expensive-opus"],
+          capabilities: {
+            "expensive-opus": { reasoning: true, can_disable_reasoning: true },
+          },
+        },
+      ],
+    }));
+    feedbotConn.onMethod("config.get", (p) =>
+      p.key === "reasoning" ? { value: "medium", display: "show" } : {},
+    );
+    feedbotConn.onMethod("config.set", (p) => ({ key: p.key, value: p.value }));
+
+    const { adapter } = makeAdapter({ default: defaultConn, feedbot: feedbotConn });
+
+    const catalog = await adapter.models.getCatalog("feedbot", "sess-1");
+    expect(catalog.current).toEqual({
+      provider: "anthropic",
+      model: "expensive-opus",
+      reasoningEffort: "medium",
+    });
+    expect(feedbotConn.callsOf("config.get")[0]?.params).toEqual({
+      key: "reasoning",
+      session_id: "sess-1",
+    });
+
+    // Reasoning-only change skips `profiles.configure` so an already-selected expensive model never re-prompts.
+    const updated = await adapter.models.select("feedbot", {
+      sessionId: "sess-1",
+      reasoningEffort: "xhigh",
+      confirm: false,
+    });
+    expect(updated).toEqual({
+      status: "applied",
+      current: {
+        provider: "anthropic",
+        model: "expensive-opus",
+        reasoningEffort: "xhigh",
+      },
+    });
+    expect(defaultConn.callsOf("profiles.configure")).toEqual([]);
+    expect(feedbotConn.callsOf("config.set")[0]?.params).toEqual({
+      key: "reasoning",
+      value: "xhigh",
+      scope: "global",
+      session_id: "sess-1",
+    });
+
+    // Invalid reasoning effort fails before touching `profiles.configure`.
+    await expect(
+      adapter.models.select("feedbot", {
+        provider: "anthropic",
+        model: "expensive-opus",
+        reasoningEffort: "turbo",
+        confirm: true,
+      }),
+    ).rejects.toMatchObject({ reason: "Invalid" });
+    expect(defaultConn.callsOf("profiles.configure")).toEqual([]);
+  });
+
   it("patches config sections as Hermes profile fields", async () => {
     const defaultConn = new FakeHermesConnection("default");
     const feedbotConn = new FakeHermesConnection("feedbot");

@@ -101,6 +101,7 @@ export function BotChatPane({
   bot,
   capabilities,
   selectedSessionId,
+  settingsVersion = 0,
   onSelectSession,
   onOpenSettings,
   onActivity,
@@ -108,6 +109,7 @@ export function BotChatPane({
   readonly bot: PaBotSummary;
   readonly capabilities: PaCapabilities | null;
   readonly selectedSessionId: string | null;
+  readonly settingsVersion?: number;
   readonly onSelectSession: (sessionId: string) => void;
   readonly onOpenSettings: () => void;
   readonly onActivity: () => void;
@@ -191,6 +193,12 @@ export function BotChatPane({
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [modelPicker, setModelPicker] = useState({ open: false, query: "" });
+  const [sessionReasoning, setSessionReasoning] = useState<{
+    readonly sessionId: string;
+    readonly effort: string;
+    readonly settingsVersion: number;
+  } | null>(null);
+  const getSettingsVersion = useStableCallback(() => settingsVersion);
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const composerOverlayRef = useRef<HTMLDivElement | null>(null);
   const [composerHeight, setComposerHeight] = useState(116);
@@ -345,7 +353,9 @@ export function BotChatPane({
           targetId = created.sessionId;
           setSessions((prev) => [created, ...prev]);
         }
-        targetId ??= sessionRes.sessions[0]?.sessionId ?? null;
+        if (!targetId) {
+          targetId = sessionRes.sessions[0]?.sessionId ?? null;
+        }
         if (!targetId) return;
 
         activeSessionIdRef.current = targetId;
@@ -401,7 +411,9 @@ export function BotChatPane({
         nextId = created.sessionId;
         nextSessions = [created, ...remaining.map((item) => ({ ...item, isPrimary: false }))];
       }
-      nextId ??= remaining[0]?.sessionId ?? null;
+      if (!nextId) {
+        nextId = remaining[0]?.sessionId ?? null;
+      }
       setSessions(nextSessions);
       if (!nextId) {
         // Nowhere to move and no way to start a conversation: say so instead of going blank.
@@ -478,17 +490,26 @@ export function BotChatPane({
           }
           break;
         case "session.updated":
-          setSessions((prev) =>
-            prev.map((item) =>
-              item.sessionId === sessionId
-                ? {
-                    ...item,
-                    ...(event.title ? { title: event.title } : {}),
-                    ...(event.model ? { model: event.model } : {}),
-                  }
-                : item,
-            ),
-          );
+          if (event.title || event.model) {
+            setSessions((prev) =>
+              prev.map((item) =>
+                item.sessionId === sessionId
+                  ? {
+                      ...item,
+                      ...(event.title ? { title: event.title } : {}),
+                      ...(event.model ? { model: event.model } : {}),
+                    }
+                  : item,
+              ),
+            );
+          }
+          if (event.reasoningEffort) {
+            setSessionReasoning({
+              sessionId,
+              effort: event.reasoningEffort,
+              settingsVersion: getSettingsVersion(),
+            });
+          }
           return;
         case "turn.completed":
         case "error": {
@@ -548,6 +569,7 @@ export function BotChatPane({
     bot.botId,
     activeSessionId,
     appendLocalMessage,
+    getSettingsVersion,
     gt,
     loadTranscript,
     localTimestampNow,
@@ -733,9 +755,8 @@ export function BotChatPane({
         ...prev,
         error: paErrorMessage(err, gt("发送失败")),
       }));
-    } finally {
-      setSending(false);
     }
+    setSending(false);
   };
 
   const handleInterrupt = async () => {
@@ -775,13 +796,12 @@ export function BotChatPane({
         ...prev,
         error: paErrorMessage(err, gt("响应请求失败")),
       }));
-    } finally {
-      setRespondingIds((prev) => {
-        const next = new Set(prev);
-        next.delete(req.requestId);
-        return next;
-      });
     }
+    setRespondingIds((prev) => {
+      const next = new Set(prev);
+      next.delete(req.requestId);
+      return next;
+    });
   };
 
   let scrollToEndSummary: string | null = null;
@@ -1044,6 +1064,17 @@ export function BotChatPane({
             }
             modelQuery={modelPicker.query}
             onModelQueryChange={(query) => setModelPicker((prev) => ({ ...prev, query }))}
+            liveReasoningEffort={
+              sessionReasoning?.sessionId === activeSessionId &&
+              sessionReasoning.settingsVersion === settingsVersion
+                ? sessionReasoning.effort
+                : null
+            }
+            modelRefreshVersion={settingsVersion}
+            onReasoningChanged={(effort) => {
+              if (!activeSessionId) return;
+              setSessionReasoning({ sessionId: activeSessionId, effort, settingsVersion });
+            }}
             onModelChanged={onActivity}
           />
         </div>

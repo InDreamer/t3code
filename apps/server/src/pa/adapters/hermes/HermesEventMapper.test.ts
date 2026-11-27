@@ -154,6 +154,14 @@ describe("HermesEventMapper", () => {
     expect(map("notice", { message: "Saved" })).toEqual([
       { type: "notice", sessionId: "s-1", message: "Saved", persistent: true },
     ]);
+    expect(map("session.info", { model: "gpt-5.4", reasoning_effort: "xhigh" })).toEqual([
+      {
+        type: "session.updated",
+        sessionId: "s-1",
+        model: "gpt-5.4",
+        reasoningEffort: "xhigh",
+      },
+    ]);
   });
 });
 

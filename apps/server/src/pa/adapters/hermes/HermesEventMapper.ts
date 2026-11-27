@@ -225,16 +225,19 @@ export class HermesEventMapper {
           return { type: "request.resolved", sessionId, requestId } as const;
         });
       case "session.title":
-      case "session.updated": {
+      case "session.updated":
+      case "session.info": {
         const title = stringField(p.title);
         const model = stringField(p.model);
-        if (!title && !model) return [];
+        const reasoningEffort = stringField(p.reasoning_effort);
+        if (!title && !model && !reasoningEffort) return [];
         return [
           {
             type: "session.updated",
             sessionId,
             ...(title ? { title } : {}),
             ...(model ? { model } : {}),
+            ...(reasoningEffort ? { reasoningEffort } : {}),
           },
         ];
       }

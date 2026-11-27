@@ -40,6 +40,7 @@ import {
   hermesRequiredScope,
   mergeSessionRows,
   normalizeCronJobs,
+  normalizeHermesReasoningEffort,
   normalizeModelCatalog,
   normalizePendingRequest,
   normalizeProfileConfig,
@@ -49,6 +50,7 @@ import {
   type HermesModelOptionsResult,
   type HermesProfileDescription,
   type HermesProfileRow,
+  type HermesReasoningConfigResult,
   type HermesSessionRow,
   type HermesTrackedRequest,
   type HermesTranscriptRow,
@@ -1038,51 +1040,110 @@ export class HermesPaAdapter implements PaEngineInstance {
   }
 
   readonly models = {
-    getCatalog: (profile: string) =>
+    getCatalog: (profile: string, sessionId?: string) =>
       withPaErrors(async () => {
         assertProfile(profile);
         const [defaultConn, profileConn] = await Promise.all([
           this.pool.getConnection("default"),
           this.pool.getConnection(profile),
         ]);
-        // `model.options` must run on the profile's own socket to avoid `profile_mismatch`.
-        const [description, options] = await Promise.all([
+        const tracked = sessionId
+          ? this.sessionStates.get(this.sessionKey(profile, sessionId))
+          : undefined;
+        const canonicalSessionId = tracked?.canonicalSessionId ?? sessionId;
+        // `model.options` and `config.get` must run on the profile's own socket to avoid `profile_mismatch`.
+        const [description, options, reasoning] = await Promise.all([
           defaultConn.call<HermesProfileDescription>("profiles.describe", { name: profile }),
           profileConn
             .call<HermesModelOptionsResult>("model.options", { explicit_only: true })
             .catch((): HermesModelOptionsResult => ({ providers: [] })),
+          profileConn
+            .call<HermesReasoningConfigResult>("config.get", {
+              key: "reasoning",
+              ...(canonicalSessionId ? { session_id: canonicalSessionId } : {}),
+            })
+            .catch(() => null),
         ]);
-        return normalizeModelCatalog(options, description);
+        return normalizeModelCatalog(options, description, reasoning ?? undefined);
       }),
     select: (
       profile: string,
-      input: { readonly provider: string; readonly model: string; readonly confirm: boolean },
+      input: {
+        readonly sessionId?: string | undefined;
+        readonly provider?: string | undefined;
+        readonly model?: string | undefined;
+        readonly reasoningEffort?: string | undefined;
+        readonly confirm: boolean;
+      },
     ) =>
       withPaErrors(async () => {
         assertProfile(profile);
-        const provider = input.provider.trim();
-        // `profiles.configure` silently skips a model pin without its provider.
-        if (!provider) throw invalid("Choose a provider for this model");
-        const res = await this.configure(profile, {
-          model: input.model,
-          provider,
-          ...(input.confirm ? { confirm_expensive_model: true } : {}),
-        });
-        if (res.confirm_required) {
-          return {
-            status: "confirmRequired" as const,
-            message: res.confirm_message ?? "Confirm before switching to this model.",
-          };
+        const hasModel = input.model !== undefined;
+        const hasReasoning = input.reasoningEffort !== undefined;
+        if (!hasModel && !hasReasoning) {
+          throw invalid("Choose a model or reasoning effort");
         }
-        if (res.applied?.model !== true) {
-          throw new PaError({
-            reason: "Upstream",
-            message: res.error || "Hermes did not save the model change",
+        if (input.provider !== undefined && !hasModel) {
+          throw invalid("Choose a model for this provider");
+        }
+        const normalizedEffort = hasReasoning
+          ? normalizeHermesReasoningEffort(input.reasoningEffort)
+          : undefined;
+        if (hasReasoning && !normalizedEffort) {
+          throw invalid(`Unsupported reasoning effort "${input.reasoningEffort}"`);
+        }
+        const provider = input.provider?.trim() ?? "";
+        // `profiles.configure` silently skips a model pin without its provider.
+        if (hasModel && !provider) throw invalid("Choose a provider for this model");
+        if (hasModel) {
+          const res = await this.configure(profile, {
+            model: input.model,
+            provider,
+            ...(input.confirm ? { confirm_expensive_model: true } : {}),
           });
+          if (res.confirm_required) {
+            return {
+              status: "confirmRequired" as const,
+              message: res.confirm_message ?? "Confirm before switching to this model.",
+            };
+          }
+          if (res.applied?.model !== true) {
+            throw new PaError({
+              reason: "Upstream",
+              message: res.error || "Hermes did not save the model change",
+            });
+          }
+        }
+        if (normalizedEffort !== undefined) {
+          const profileConn = await this.pool.getConnection(profile);
+          const tracked = input.sessionId
+            ? this.sessionStates.get(this.sessionKey(profile, input.sessionId))
+            : undefined;
+          const canonicalSessionId = tracked?.canonicalSessionId ?? input.sessionId;
+          await profileConn.call("config.set", {
+            key: "reasoning",
+            value: normalizedEffort,
+            scope: "global",
+            ...(canonicalSessionId ? { session_id: canonicalSessionId } : {}),
+          });
+        }
+        let resolvedProvider: string | null = hasModel ? provider : null;
+        let resolvedModel = hasModel ? input.model! : "";
+        if (!hasModel) {
+          const defaultConn = await this.pool.getConnection("default");
+          const description = await defaultConn
+            .call<HermesProfileDescription>("profiles.describe", { name: profile })
+            .catch(() => null);
+          resolvedProvider = description?.model?.provider || null;
+          resolvedModel = description?.model?.default || "";
         }
         return {
           status: "applied" as const,
-          current: { provider, model: input.model },
+          current: {
+            provider: resolvedProvider,
+            model: resolvedModel,
+            ...(normalizedEffort !== undefined ? { reasoningEffort: normalizedEffort } : {}),
+          },
         };
       }),
   };
