@@ -2904,7 +2904,11 @@ const layerWorkflowRpcTest = Layer.mergeAll(
   Layer.mock(ServerBrowser.ServerBrowser)({}),
 );
 
-const paTags = [WS_METHODS.paSendMessage, WS_METHODS.paMutateSchedule] as const;
+const paTags = [
+  WS_METHODS.paSendMessage,
+  WS_METHODS.paMutateSchedule,
+  WS_METHODS.paRespondRequest,
+] as const;
 const paRpcs = WsRpcGroup.omit(
   ...[...WsRpcGroup.requests.keys()].filter(
     (
@@ -2942,6 +2946,13 @@ const makePaClient = Effect.fn("test.makePaClient")(function* (
         Effect.sync(() => {
           calls.push(`schedule:${input.action}`);
           return [];
+        }),
+      // The engine's record of what it opened: `r-secret` is a credential prompt.
+      requiredScopeForRequest: (input) =>
+        Effect.succeed(input.requestId === "r-secret" ? ("manage" as const) : ("operate" as const)),
+      respondRequest: (input) =>
+        Effect.sync(() => {
+          calls.push(`respond:${input.requestId}`);
         }),
     }),
   );
@@ -3005,6 +3016,34 @@ it.effect("a PA schedule change needs both providers:manage and orchestration:op
     );
     yield* both[WS_METHODS.paMutateSchedule](pause);
     assert.deepEqual(calls, ["schedule:pause"]);
+  }).pipe(Effect.provide(layerWorkflowRpcTest), Effect.scoped),
+);
+
+it.effect("answering a PA credential prompt needs providers:manage, whatever the client says", () =>
+  Effect.gen(function* () {
+    const calls: Array<string> = [];
+    const answer = (requestId: string) => ({
+      botId: "hermes:default",
+      sessionId: "s-1",
+      requestId,
+      values: { password: "hunter2" },
+    });
+    const operator = yield* makePaClient([AuthOrchestrationOperateScope], calls);
+    const refused = yield* operator[WS_METHODS.paRespondRequest](answer("r-secret")).pipe(
+      Effect.flip,
+    );
+    assert.strictEqual(refused._tag, "EnvironmentAuthorizationError");
+    assert.deepEqual(calls, []);
+    const { values: _credential, ...approval } = answer("r-approval");
+    yield* operator[WS_METHODS.paRespondRequest]({ ...approval, decision: "once" });
+    assert.deepEqual(calls, ["respond:r-approval"]);
+
+    const manager = yield* makePaClient(
+      [AuthOrchestrationOperateScope, AuthProvidersManageScope],
+      calls,
+    );
+    yield* manager[WS_METHODS.paRespondRequest](answer("r-secret"));
+    assert.deepEqual(calls.at(-1), "respond:r-secret");
   }).pipe(Effect.provide(layerWorkflowRpcTest), Effect.scoped),
 );
 

@@ -2805,10 +2805,10 @@ export const layerWsRpc = (
         [WS_METHODS.paCreateBot]: (input) => pa.createBot(input),
         [WS_METHODS.paListCommands]: ({ botId }) =>
           pa.listCommands(botId).pipe(Effect.map((commands) => ({ commands }))),
-        [WS_METHODS.paListSessions]: ({ botId }) => pa.listSessions(botId),
+        [WS_METHODS.paListSessions]: (input) => pa.listSessions(input),
         [WS_METHODS.paCreateSession]: (input) => pa.createSession(input),
-        [WS_METHODS.paGetMessages]: (input) =>
-          pa.getMessages(input).pipe(Effect.map((messages) => ({ messages }))),
+        [WS_METHODS.paMutateSession]: (input) => pa.mutateSession(input),
+        [WS_METHODS.paGetMessages]: (input) => pa.getMessages(input),
         [WS_METHODS.paSendMessage]: Effect.fnUntraced(function* (input) {
           // The engine decides which of its commands change the agent; those need manage scope.
           const scope = yield* pa.requiredScopeForMessage(input.botId, input.text);
@@ -2818,7 +2818,16 @@ export const layerWsRpc = (
           return yield* pa.sendMessage(input);
         }),
         [WS_METHODS.paInterruptSession]: (input) => pa.interruptSession(input),
-        [WS_METHODS.paRespondRequest]: (input) => pa.respondRequest(input),
+        [WS_METHODS.paSteerSession]: (input) => pa.steerSession(input),
+        [WS_METHODS.paManageQueuedItem]: (input) => pa.manageQueuedItem(input),
+        [WS_METHODS.paRespondRequest]: Effect.fnUntraced(function* (input) {
+          // A credential prompt's kind comes from the engine's own record, never from the client.
+          const scope = yield* pa.requiredScopeForRequest(input);
+          if (scope === "manage" && !currentSession.scopes.includes(AuthProvidersManageScope)) {
+            return yield* rpcAuthorizationError(AuthProvidersManageScope);
+          }
+          return yield* pa.respondRequest(input);
+        }),
         [WS_METHODS.paSubscribeSession]: (input) => pa.subscribeSession(input),
         [WS_METHODS.peerLinksList]: (_input) =>
           peerLinks.list.pipe(Effect.map((links) => ({ links }))),

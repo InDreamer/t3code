@@ -1,14 +1,21 @@
+// @effect-diagnostics nodeBuiltinImport:off -- opaque reference keys never retain transcript paths.
+import * as NodeCrypto from "node:crypto";
 import type {
+  PaAttachment,
   PaBotConfig,
   PaConfigSection,
+  PaContextUsage,
   PaMessage,
   PaModelCatalog,
   PaModelOption,
   PaModelProvider,
   PaPendingRequest,
+  PaQueuedItem,
   PaReasoningLevel,
   PaSchedule,
   PaSlashCommand,
+  PaTodoItem,
+  PaTodoState,
   PaToolCategory,
 } from "@t3tools/contracts";
 
@@ -58,6 +65,7 @@ export interface HermesTranscriptRow {
   readonly text?: string | null;
   readonly content?: unknown;
   readonly timestamp?: number | null;
+  readonly submission_id?: string;
   readonly row_id?: number | null;
   readonly name?: string | null;
   readonly context?: string | null;
@@ -73,6 +81,10 @@ export interface HermesTranscriptRow {
   readonly display_commentary?: ReadonlyArray<unknown> | null;
   readonly display_content?: string | null;
   readonly display_reasoning?: string | null;
+  /** `session.transcript` compaction rows: how many messages the handoff summarized. */
+  readonly compacted_messages?: number | null;
+  /** `session.transcript`: a row too large for a page keeps only the head of its text. */
+  readonly truncated?: boolean | null;
 }
 
 export interface HermesProfileDescription {
@@ -164,6 +176,99 @@ export function extractTranscriptText(row: HermesTranscriptRow): string {
   return "";
 }
 
+function refName(ref: string) {
+  return ref.split(/[\\/]/).at(-1)?.trim().slice(0, 255).trimEnd() || "attachment";
+}
+
+// Ingress moves an image into a digest directory but preserves its random staging basename.
+export function hermesAttachmentKey(type: PaAttachment["type"], ref: string) {
+  const value = type === "image" ? refName(ref) : ref;
+  return (
+    "external-" +
+    NodeCrypto.createHash("sha256")
+      .update(type + "\0" + value)
+      .digest("hex")
+  );
+}
+
+const mediaReference =
+  /^[ \t]*(?:@(image|file):(?:`([^`\n]+)`|"([^"\n]+)"|'([^'\n]+)'|([^\s]+))|\[Image attached at: ([^\n\]]+)\]|\[(?:image|screenshot)\])[ \t]*$/gim;
+
+function transcriptMedia(text: string, rowId: string, content?: unknown) {
+  const attachments: PaAttachment[] = [];
+  const named = new Set<string>();
+  let placeholders = 0;
+  const withoutVisionNotes = text
+    .replace(/(?:@image:)?data:image\/[\w.+-]+;base64,[a-z0-9+/=]+/gi, "[image]")
+    .replace(
+      /\[The user (?:sent|attached) an image[\s\S]*?image_url: ([^\n]+?)(?: ~)?\](?=\s|$)/g,
+      (_note, ref: string) => "[Image attached at: " + ref + "]",
+    );
+  let projected = withoutVisionNotes;
+  if (/^@file:/im.test(projected)) {
+    const boundary = projected.search(/\n\n--- (?:Attached Context|Context Warnings) ---\n/);
+    if (boundary !== -1) {
+      // Native-image routing appends its image hints after expanding the file references.
+      const hints =
+        projected
+          .slice(boundary)
+          .match(
+            /(?:\n(?:\[Image attached at: [^\n\]]+\]|@image:[^\n]+))+(?:\n\[(?:image|screenshot)\])*\s*$/i,
+          )?.[0] ?? "";
+      projected = projected.slice(0, boundary) + hints;
+    }
+  }
+  const clean = projected.replace(
+    mediaReference,
+    (
+      _match,
+      kind: string | undefined,
+      backtick: string | undefined,
+      double: string | undefined,
+      single: string | undefined,
+      bare: string | undefined,
+      hint: string | undefined,
+    ) => {
+      const ref = backtick ?? double ?? single ?? bare ?? hint;
+      if (!ref) {
+        placeholders++;
+        return "";
+      }
+      const type = kind?.toLowerCase() === "file" ? "file" : "image";
+      const id = hermesAttachmentKey(type, ref);
+      if (!named.has(id)) {
+        named.add(id);
+        attachments.push({
+          id,
+          type,
+          name: refName(ref),
+          mimeType: type === "image" ? "image/*" : "application/octet-stream",
+          sizeBytes: 0,
+          unavailable: true,
+        });
+      }
+      return "";
+    },
+  );
+  const blocks = Array.isArray(content) ? content : [content];
+  const images = blocks.filter(
+    (part) =>
+      part && typeof part === "object" && ["image", "image_url", "input_image"].includes(part.type),
+  ).length;
+  const namedImages = attachments.filter((item) => item.type === "image").length;
+  for (let i = namedImages; i < Math.max(placeholders, images); i++) {
+    attachments.push({
+      id: rowId + "-image-" + i,
+      type: "image",
+      name: "Image",
+      mimeType: "image/*",
+      sizeBytes: 0,
+      unavailable: true,
+    });
+  }
+  return { text: attachments.length ? clean.trim() : text, attachments };
+}
+
 /** Maps Hermes tool names onto the shared categories clients pick icons and verbs from. */
 export function classifyHermesTool(toolName: string): PaToolCategory {
   const lower = toolName.toLowerCase();
@@ -235,8 +340,49 @@ function nonEmptyString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim().length > 0 ? value : undefined;
 }
 
-export function normalizeTranscriptRows(rows: ReadonlyArray<HermesTranscriptRow>): PaMessage[] {
+/** FNV-1a: a short, stable digest for a row Hermes gave no `row_id`. */
+function contentDigest(value: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < value.length; i += 1) {
+    hash ^= value.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+/**
+ * A timestamp can repeat across pages. Scope anonymous rows to the page that supplied them.
+ */
+function transcriptRowId(
+  row: HermesTranscriptRow,
+  role: string,
+  text: string,
+  seen: Map<string, number>,
+  cursor: string,
+  submissionId: string | undefined,
+): string {
+  if (typeof row.row_id === "number" && Number.isFinite(row.row_id)) return `row-${row.row_id}`;
+  const base = `h-${contentDigest(
+    JSON.stringify([
+      role,
+      submissionId ?? cursor,
+      row.timestamp ?? null,
+      row.tool_call_id ?? null,
+      row.name ?? null,
+      text,
+    ]),
+  )}`;
+  const occurrence = seen.get(base) ?? 0;
+  seen.set(base, occurrence + 1);
+  return occurrence === 0 ? base : `${base}-${occurrence}`;
+}
+
+export function normalizeTranscriptRows(
+  rows: ReadonlyArray<HermesTranscriptRow>,
+  cursor = "",
+): PaMessage[] {
   const result: PaMessage[] = [];
+  const seenDigests = new Map<string, number>();
   for (let index = 0; index < rows.length; index += 1) {
     const row = rows[index]!;
     if (row.display_kind === "hidden") continue;
@@ -263,9 +409,18 @@ export function normalizeTranscriptRows(rows: ReadonlyArray<HermesTranscriptRow>
     const toolCallId = nonEmptyString(row.tool_call_id);
     const toolName = nonEmptyString(row.name);
     const toolFailed = row.is_error === true || row.display_metadata?.is_error === true;
-    const id =
-      row.row_id !== null && row.row_id !== undefined ? `row-${row.row_id}` : `idx-${index}`;
+    const submissionId =
+      nonEmptyString(row.submission_id) ?? nonEmptyString(row.display_metadata?.submission_id);
+    const id = transcriptRowId(row, rawRole, text, seenDigests, cursor, submissionId);
+    const media = role === "user" ? transcriptMedia(text, id, row.content) : undefined;
     const timestamp = normalizeHermesTimestamp(row.timestamp);
+    const rowId =
+      typeof row.row_id === "number" && Number.isFinite(row.row_id) ? row.row_id : undefined;
+    const isCompaction = row.row_kind === "compaction";
+    const compactedMessages =
+      isCompaction && typeof row.compacted_messages === "number" && row.compacted_messages > 0
+        ? row.compacted_messages
+        : undefined;
 
     const commentary =
       role === "assistant" && Array.isArray(row.display_commentary)
@@ -289,12 +444,21 @@ export function normalizeTranscriptRows(rows: ReadonlyArray<HermesTranscriptRow>
           timestamp,
           rowKind: "message",
           commentary: true,
+          ...(rowId !== undefined ? { rowId } : {}),
         });
         pendingReasoning = undefined;
       }
     }
 
-    if (!text && !pendingReasoning && !toolName && !toolContext && row.row_kind !== "compaction") {
+    if (
+      !text &&
+      !media?.attachments.length &&
+      !(role === "user" && submissionId) &&
+      !pendingReasoning &&
+      !toolName &&
+      !toolContext &&
+      !isCompaction
+    ) {
       continue;
     }
     const toolArgs =
@@ -302,7 +466,9 @@ export function normalizeTranscriptRows(rows: ReadonlyArray<HermesTranscriptRow>
     result.push({
       id,
       role,
-      text,
+      text: media?.text ?? text,
+      ...(role === "user" && submissionId ? { submissionId } : {}),
+      ...(media?.attachments.length ? { attachments: media.attachments } : {}),
       ...(pendingReasoning ? { reasoning: pendingReasoning } : {}),
       ...(toolCallId ? { toolCallId } : {}),
       ...(toolName ? { toolName, toolCategory: classifyHermesTool(toolName) } : {}),
@@ -310,7 +476,10 @@ export function normalizeTranscriptRows(rows: ReadonlyArray<HermesTranscriptRow>
       ...(toolArgs ? { toolArgs } : {}),
       ...(toolFailed ? { toolFailed } : {}),
       timestamp,
-      rowKind: row.row_kind === "compaction" ? "compaction" : "message",
+      rowKind: isCompaction ? "compaction" : "message",
+      ...(rowId !== undefined ? { rowId } : {}),
+      ...(row.truncated === true ? { truncated: true } : {}),
+      ...(compactedMessages !== undefined ? { compactedMessages } : {}),
     });
   }
   return result;
@@ -618,6 +787,8 @@ export interface HermesTrackedRequest {
   readonly request: PaPendingRequest;
   /** `canonical` prompts answer over `*.respond` RPCs; `server_request` ones over the JSON-RPC reply. */
   readonly channel: "canonical" | "server_request";
+  /** The Hermes request method (`sudo`, `vault.save_login`, ...), which decides the answer's shape. */
+  readonly method: string;
   readonly executionGeneration?: number | undefined;
   /** Answers another viewer already locked on a resumed batch clarify (`params.answers`). */
   readonly lockedAnswers?: Readonly<Record<string, string>> | undefined;
@@ -673,6 +844,7 @@ export function normalizePendingRequest(
   if (!requestId) return null;
   const routing = {
     channel,
+    method,
     executionGeneration,
     ...(channel === "server_request" ? { lockedAnswers: extractLockedAnswers(params) } : {}),
   };
@@ -694,6 +866,10 @@ export function normalizePendingRequest(
         options: buildApprovalOptions(params),
       },
     };
+  }
+  const secret = channel === "server_request" ? secretPrompt(method, params) : null;
+  if (secret) {
+    return { ...routing, request: { requestId, ...scope, kind: "secret", ...secret } };
   }
   if (method !== "clarify") return null;
   // Server requests carry `questions: [{qid, question, choices, multi_select}]`; canonical
@@ -737,6 +913,129 @@ export function normalizePendingRequest(
   };
 }
 
+/** The field a one-value credential prompt answers with; `vault.save_login` has two. */
+export const HERMES_SECRET_FIELD = {
+  password: "password",
+  value: "value",
+  code: "code",
+  identifier: "identifier",
+} as const;
+
+type SecretPromptShape = Pick<
+  PaPendingRequest,
+  "title" | "detail" | "command" | "fields" | "sideEffectNotice"
+>;
+
+/**
+ * Hermes's masked one-string prompts (`tui_gateway/contracts/server_requests.py`), answered
+ * `{value}` where `""` declines. Other server requests (`theme.*`, `preview.*`, `window.read`,
+ * `tour`, `setup_beat`, ...) belong to Hermes Desktop: they stay unanswered here, because the
+ * first viewer to answer settles them for every viewer.
+ */
+function secretPrompt(
+  method: string,
+  params: Record<string, unknown> | undefined,
+): SecretPromptShape | null {
+  switch (method) {
+    case "sudo": {
+      const command = nonEmptyString(params?.command);
+      return {
+        title: "Administrator password needed",
+        detail: "The agent needs your sudo password to run this command.",
+        ...(command ? { command } : {}),
+        fields: [
+          {
+            id: HERMES_SECRET_FIELD.password,
+            label: "Sudo password",
+            secret: true,
+            required: true,
+          },
+        ],
+      };
+    }
+    case "secret": {
+      const envVar = nonEmptyString(params?.env_var)?.trim();
+      return {
+        title: envVar ? `${envVar} needed` : "Secret needed",
+        detail:
+          nonEmptyString(params?.prompt) ?? "The agent needs a secret value to finish setting up.",
+        fields: [
+          {
+            id: HERMES_SECRET_FIELD.value,
+            label: envVar ?? "Secret",
+            secret: true,
+            required: true,
+          },
+        ],
+        sideEffectNotice: envVar
+          ? `Saved as ${envVar} in this agent's environment file (.env). The model never sees it.`
+          : "Saved in this agent's environment file (.env). The model never sees it.",
+      };
+    }
+    case "vault.unlock_prompt": {
+      const name =
+        nonEmptyString(params?.display_name)?.trim() ?? nonEmptyString(params?.backend)?.trim();
+      return {
+        title: name ? `Unlock ${name}` : "Unlock password manager",
+        detail:
+          "The agent needs your master password to use this password manager in this session.",
+        fields: [
+          {
+            id: HERMES_SECRET_FIELD.password,
+            label: "Master password",
+            secret: true,
+            required: true,
+          },
+        ],
+        sideEffectNotice: "It stays unlocked until this session closes.",
+      };
+    }
+    case "vault.code": {
+      const site = nonEmptyString(params?.site)?.trim();
+      const hint = nonEmptyString(params?.hint)?.trim();
+      return {
+        title: site ? `Verification code for ${site}` : "Verification code needed",
+        detail: hint ?? "Enter the one-time code sent to your device.",
+        fields: [
+          {
+            id: HERMES_SECRET_FIELD.code,
+            label: "Code",
+            required: true,
+          },
+        ],
+      };
+    }
+    case "vault.save_login": {
+      const site =
+        nonEmptyString(params?.site)?.trim() ?? nonEmptyString(params?.origin)?.trim() ?? null;
+      const origin = nonEmptyString(params?.origin)?.trim();
+      return {
+        title: site ? `Save a login for ${site}` : "Save a login",
+        detail:
+          origin && origin !== site
+            ? `The agent is about to sign in to ${origin}.`
+            : "The agent is about to sign in to this site.",
+        fields: [
+          {
+            id: HERMES_SECRET_FIELD.identifier,
+            label: "Username or email",
+            required: true,
+          },
+          {
+            id: HERMES_SECRET_FIELD.password,
+            label: "Password",
+            secret: true,
+            required: true,
+          },
+        ],
+        sideEffectNotice: "Saved to your password manager.",
+      };
+    }
+    default:
+      return null;
+  }
+}
+
 function sessionRowId(row: HermesSessionRow): string {
   return String(row.session_id ?? row.id ?? "");
 }
@@ -745,6 +1044,13 @@ function withoutNullish<T extends object>(row: T): Partial<T> {
   return Object.fromEntries(
     Object.entries(row).filter(([, value]) => value !== null && value !== undefined),
   ) as Partial<T>;
+}
+
+/** `session.list` filters only stored rows by `query`; live rows get the same title-or-id test. */
+export function sessionRowMatches(row: HermesSessionRow, query: string): boolean {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return true;
+  return [sessionRowId(row), row.title ?? ""].some((field) => field.toLowerCase().includes(needle));
 }
 
 export function mergeSessionRows(
@@ -959,4 +1265,159 @@ export function normalizeProfileConfig(
     });
   }
   return { sections };
+}
+
+/** `session_contract.py::PendingAdmission`, as `session.resume.pending` and `session.info.pending` list it. */
+export interface HermesPendingAdmission {
+  readonly admission_id?: string;
+  readonly input_id?: string;
+  readonly status?: string;
+  readonly execution_generation?: number | null;
+  readonly text?: string;
+  readonly controls?: ReadonlyArray<string> | null;
+  /** Handed to the running turn (`prompt.steer_queued`): listed `started` until that turn settles it. */
+  readonly steering?: boolean | null;
+}
+
+/**
+ * The messages still waiting, oldest first. The `started` row is the running turn itself and is
+ * not listed; `steering` and `unknown` rows stay so a viewer never loses one that may come back.
+ */
+export function normalizeHermesQueue(pending: unknown): PaQueuedItem[] {
+  if (!Array.isArray(pending)) return [];
+  const items: PaQueuedItem[] = [];
+  for (const raw of pending as ReadonlyArray<HermesPendingAdmission>) {
+    if (!raw || typeof raw !== "object") continue;
+    const id = nonEmptyString(raw.admission_id);
+    if (!id) continue;
+    const inputId = nonEmptyString(raw.input_id);
+    const identity = inputId ? { id, inputId } : { id };
+    const media = transcriptMedia(typeof raw.text === "string" ? raw.text : "", id);
+    const text = media.text;
+    const count = media.attachments.length;
+    const controls = Array.isArray(raw.controls) ? raw.controls : [];
+    if (raw.steering === true) {
+      items.push({
+        ...identity,
+        text,
+        status: "steering",
+        canSteer: false,
+        ...(count ? { attachmentCount: count } : {}),
+      });
+    } else if (raw.status === "queued") {
+      items.push({
+        ...identity,
+        text,
+        status: "queued",
+        canSteer: count === 0 && controls.includes("steer"),
+        ...(count ? { attachmentCount: count } : {}),
+        ...(controls.includes("replace") ? { canReplace: true } : {}),
+      });
+    } else if (raw.status === "unknown") {
+      items.push({
+        ...identity,
+        text,
+        status: "unknown",
+        canSteer: false,
+        ...(count ? { attachmentCount: count } : {}),
+      });
+    }
+  }
+  return items;
+}
+
+/** The admission the running turn executes, from the same pending list. */
+export function hermesRunningAdmissionId(pending: unknown): string | null {
+  if (!Array.isArray(pending)) return null;
+  for (const raw of pending as ReadonlyArray<HermesPendingAdmission>) {
+    if (raw && raw.status === "started" && raw.steering !== true) {
+      return nonEmptyString(raw.admission_id) ?? null;
+    }
+  }
+  return null;
+}
+
+const finiteCount = (value: unknown) =>
+  typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+
+/**
+ * Hermes reports usage two ways: `common.py::Usage` (`context_used`/`context_max`, the status
+ * bar) nested as `usage` or bare, and `session.usage`'s flat counters (`context_tokens`/
+ * `context_length`). Occupancy comes only from the context figures: `total`/`total_tokens` are
+ * the session's cumulative spend, which a window percentage must never be computed from.
+ */
+export function normalizeHermesUsage(raw: unknown): PaContextUsage | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const record = raw as Record<string, unknown>;
+  if (record.usage && typeof record.usage === "object" && !Array.isArray(record.usage)) {
+    const nested = normalizeHermesUsage(record.usage);
+    if (nested !== null) return nested;
+  }
+  const tuiShape =
+    "context_used" in record || "context_max" in record || "input" in record || "total" in record;
+  const used = finiteCount(tuiShape ? record.context_used : record.context_tokens);
+  const maxRaw = finiteCount(tuiShape ? record.context_max : record.context_length);
+  const max = maxRaw !== undefined && maxRaw > 0 ? maxRaw : null;
+  const inputTokens = finiteCount(tuiShape ? record.input : record.input_tokens);
+  const outputTokens = finiteCount(tuiShape ? record.output : record.output_tokens);
+  const totalTokens = finiteCount(tuiShape ? record.total : record.total_tokens);
+  const cacheReadTokens = finiteCount(tuiShape ? record.cache_read : record.cache_read_tokens);
+  const compressionCount = finiteCount(tuiShape ? record.compressions : record.compression_count);
+  if (used === undefined && inputTokens === undefined && totalTokens === undefined) return null;
+  const contextUsed = used ?? 0;
+  const reported = finiteCount(record.context_percent);
+  const contextPercent =
+    max === null
+      ? null
+      : reported !== undefined && tuiShape
+        ? Math.min(100, reported)
+        : Math.max(0, Math.min(100, Math.round((contextUsed / max) * 100)));
+  return {
+    contextUsed,
+    contextMax: max,
+    contextPercent,
+    ...(inputTokens !== undefined ? { inputTokens } : {}),
+    ...(outputTokens !== undefined ? { outputTokens } : {}),
+    ...(totalTokens !== undefined ? { totalTokens } : {}),
+    ...(cacheReadTokens !== undefined ? { cacheReadTokens } : {}),
+    ...(compressionCount !== undefined ? { compressionCount } : {}),
+  };
+}
+
+const TODO_STATUSES: ReadonlySet<string> = new Set([
+  "pending",
+  "in_progress",
+  "completed",
+  "cancelled",
+]);
+
+/**
+ * `tool_progress._normalize_todo_state`: `{todos: [{id, content, status, parent?}], revision}`.
+ * Revision 0 with no items is Hermes's "no plan yet" and reads as none; an empty list at a later
+ * revision is a real clear.
+ */
+export function normalizeHermesTodoState(raw: unknown): PaTodoState | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const record = raw as Record<string, unknown>;
+  if (!Array.isArray(record.todos)) return null;
+  const revisionRaw = Number(record.revision ?? 0);
+  const revision = Number.isFinite(revisionRaw) ? Math.max(0, Math.trunc(revisionRaw)) : 0;
+  const items: PaTodoItem[] = [];
+  for (const [index, entry] of record.todos.entries()) {
+    if (!entry || typeof entry !== "object") continue;
+    const item = entry as Record<string, unknown>;
+    const text =
+      nonEmptyString(item.content) ?? nonEmptyString(item.text) ?? nonEmptyString(item.title);
+    if (!text) continue;
+    const status = String(item.status ?? "pending")
+      .trim()
+      .toLowerCase();
+    items.push({
+      id: nonEmptyString(typeof item.id === "number" ? String(item.id) : item.id) ?? `#${index}`,
+      text,
+      status: (TODO_STATUSES.has(status) ? status : "pending") as PaTodoItem["status"],
+    });
+  }
+  if (items.length === 0 && revision === 0) return null;
+  return { revision, items };
 }

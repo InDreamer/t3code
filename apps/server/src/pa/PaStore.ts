@@ -5,9 +5,19 @@ import * as NodeFS from "node:fs";
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodePath from "node:path";
 
+import * as Schema from "effect/Schema";
 import type { PaAvatarShape } from "@t3tools/contracts";
 
+const RenameAttempt = Schema.Struct({
+  sessionId: Schema.String,
+  requestId: Schema.String,
+  title: Schema.String,
+  expectedRevision: Schema.Int,
+});
+const isRenameHistory = Schema.is(Schema.Array(RenameAttempt));
+
 export interface PaBotLocalMeta {
+  readonly renameAttempts?: ReadonlyArray<typeof RenameAttempt.Type>;
   readonly displayName?: string | undefined;
   readonly avatarColor?: string | undefined;
   readonly avatarShape?: PaAvatarShape | undefined;
@@ -73,6 +83,7 @@ function sanitizeBotMeta(raw: unknown): { meta: PaBotLocalMeta; clean: boolean }
     else clean = false;
   };
   const isString = (value: unknown) => typeof value === "string";
+  keep("renameAttempts", isRenameHistory);
   keep("displayName", isString);
   keep("avatarColor", isString);
   keep("avatarShape", (value) => typeof value === "string" && AVATAR_SHAPES.has(value));
@@ -169,6 +180,14 @@ export class PaStore {
 
   getBotMeta(botId: string): PaBotLocalMeta {
     return this.load().bots[botId] ?? {};
+  }
+
+  rememberRename(botId: string, attempt: typeof RenameAttempt.Type) {
+    const previous = this.getBotMeta(botId).renameAttempts ?? [];
+    const retained = previous.filter(
+      (item) => item.sessionId !== attempt.sessionId || item.requestId !== attempt.requestId,
+    );
+    this.updateBotMeta(botId, { renameAttempts: [...retained.slice(-255), attempt] });
   }
 
   updateBotMeta(botId: string, patch: Partial<PaBotLocalMeta>): PaBotLocalMeta {

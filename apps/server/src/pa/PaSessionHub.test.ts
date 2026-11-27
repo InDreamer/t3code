@@ -447,3 +447,66 @@ describe("PaSessionHub", () => {
     },
   );
 });
+
+describe("PaSessionHub session state", () => {
+  it("fills an attachment-only queue row when the send receipt follows its event", async () => {
+    const { hub, emit } = makeHub();
+    const first = listen();
+    await hub.attach(first.listener);
+    emit({
+      type: "queue.updated",
+      sessionId: "s-1",
+      items: [{ id: "queued", text: "", status: "queued", canSteer: true }],
+    });
+    hub.describeQueuedAttachments("queued", "", 2);
+    const second = listen();
+    await hub.attach(second.listener);
+    expect(second.events[0]).toMatchObject({
+      queuedItems: [{ id: "queued", attachmentCount: 2, canSteer: false }],
+    });
+  });
+  it("hands a newly attached viewer the latest queue, usage and todo plan", async () => {
+    const { hub, emit } = makeHub();
+    const first = listen();
+    await hub.attach(first.listener);
+    expect(first.events[0]).toMatchObject({ queuedItems: [], usage: null, todos: null });
+
+    const item = { id: "adm-q", text: "next", status: "queued", canSteer: true } as const;
+    const usage = { contextUsed: 10, contextMax: 100, contextPercent: 10 };
+    emit({ type: "queue.updated", sessionId: "s-1", items: [item] });
+    emit({ type: "usage.updated", sessionId: "s-1", usage });
+    emit({ type: "usage.updated", sessionId: "s-1", usage: { ...usage, contextUsed: 20 } });
+    emit({
+      type: "todos.updated",
+      sessionId: "s-1",
+      todos: { revision: 3, items: [{ id: "1", text: "Plan", status: "in_progress" }] },
+    });
+    emit({ type: "todos.updated", sessionId: "s-1", todos: { revision: 2, items: [] } });
+
+    const second = listen();
+    await hub.attach(second.listener);
+    expect(second.events[0]).toMatchObject({
+      type: "snapshot",
+      queuedItems: [item],
+      usage: { contextUsed: 20 },
+      todos: { revision: 3, items: [{ id: "1" }] },
+    });
+
+    // A mid-feed snapshot that omits them (a replay gap) keeps what the hub knows.
+    emit({
+      type: "snapshot",
+      sessionId: "s-1",
+      running: true,
+      openRequests: [],
+      snapshotRequired: true,
+    });
+    emit({ type: "queue.updated", sessionId: "s-1", items: [] });
+    const third = listen();
+    await hub.attach(third.listener);
+    expect(third.events[0]).toMatchObject({
+      queuedItems: [],
+      usage: { contextUsed: 20 },
+      todos: { revision: 3 },
+    });
+  });
+});

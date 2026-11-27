@@ -6,7 +6,12 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 
 import { resolveAttachmentRelativePath } from "../attachmentPaths.ts";
-import { parseAttachmentFileExtension, resolveAttachmentPathById } from "../attachmentStore.ts";
+import {
+  PA_ATTACHMENT_SEGMENT,
+  parseThreadSegmentFromAttachmentId,
+  parseAttachmentFileExtension,
+  resolveAttachmentPathById,
+} from "../attachmentStore.ts";
 import * as ServerConfig from "../config.ts";
 import * as DeviceService from "../device/DeviceService.ts";
 import * as PreviewManager from "../preview/Manager.ts";
@@ -107,6 +112,8 @@ export const layer = Layer.effect(
         return Effect.forEach(
           attachmentIds,
           (attachmentId) => {
+            if (parseThreadSegmentFromAttachmentId(attachmentId) === PA_ATTACHMENT_SEGMENT)
+              return Effect.void;
             const extension = parseAttachmentFileExtension(attachmentId);
             const path =
               resolveAttachmentPathById({

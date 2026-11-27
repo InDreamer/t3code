@@ -109,6 +109,36 @@ describe("HermesGatewayClient", () => {
     conn.close();
   });
 
+  it("keeps the admission a frame is stamped with, from the envelope or its payload", () => {
+    // `SessionAuthority._settle_cancelled` stamps a cancelled queued row's completion with its own id.
+    const cancelled = parseHermesGatewayFrame({
+      jsonrpc: "2.0",
+      method: "event",
+      params: {
+        type: "message.complete",
+        session_id: "s-1",
+        seq: 9,
+        authority_epoch: 2,
+        admission_id: "adm-queued",
+        payload: { text: "", admission_id: "adm-queued", outcome: "cancelled" },
+      },
+    });
+    expect(cancelled).toMatchObject({
+      kind: "event",
+      frame: { event: "message.complete", admission_id: "adm-queued" },
+    });
+    const fromPayload = parseHermesGatewayFrame({
+      event: "message.complete",
+      payload: { admission_id: "adm-2" },
+    });
+    expect(fromPayload).toMatchObject({ kind: "event", frame: { admission_id: "adm-2" } });
+    const unstamped = parseHermesGatewayFrame({
+      method: "event",
+      params: { type: "message.delta", payload: { text: "x" } },
+    });
+    expect(unstamped).toMatchObject({ kind: "event", frame: { admission_id: undefined } });
+  });
+
   it("never answers an unclaimed server request: Hermes settles on the first viewer response", () => {
     const socket = new FakeSocket();
     const conn = new LiveHermesRpcConnection("default", socket, { enablePing: false });

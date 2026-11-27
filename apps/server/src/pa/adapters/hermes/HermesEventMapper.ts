@@ -2,6 +2,10 @@ import type { PaAdapterEvent } from "../../types.ts";
 import type { HermesRpcEventFrame } from "./HermesGatewayClient.ts";
 import {
   classifyHermesTool,
+  hermesRunningAdmissionId,
+  normalizeHermesQueue,
+  normalizeHermesTodoState,
+  normalizeHermesUsage,
   normalizePendingRequest,
   type HermesTrackedRequest,
 } from "./HermesNormalizers.ts";
@@ -60,6 +64,13 @@ export function hermesResolvedRequestIds(frame: HermesRpcEventFrame): ReadonlyAr
 const stringField = (value: unknown) =>
   typeof value === "string" && value.length > 0 ? value : undefined;
 
+/** What `session.resume` says is current, so live frames are judged against it. */
+export interface HermesMapperBaseline {
+  readonly pending?: unknown;
+  readonly usage?: unknown;
+  readonly todoRevision?: number | undefined;
+}
+
 /**
  * Turns one Hermes session feed into neutral stream events. Hermes re-sends overlapping
  * `message.delta` ranges (`offset`) and reclassifies streamed text as commentary after the
@@ -77,6 +88,12 @@ export class HermesEventMapper {
   private readonly commentarySegments = new Set<string>();
   private reasoningStreamed = false;
   private interimSerial = 0;
+  /** The admission the streaming turn runs; another admission's completion must not end it. */
+  private activeAdmissionId: string | null = null;
+  private usageKey: string | null = null;
+  private queuedIds = new Set<string>();
+  private queueKey: string | null = null;
+  private todoRevision = -1;
 
   constructor(sessionId: string, hooks: HermesEventMapperHooks) {
     this.sessionId = sessionId;
@@ -100,8 +117,22 @@ export class HermesEventMapper {
     };
   }
 
+  /** Seeds the running admission, queue and todo watermark from a resume snapshot. */
+  adoptBaseline(baseline: HermesMapperBaseline): void {
+    if (baseline.usage !== undefined)
+      this.usageKey = JSON.stringify(normalizeHermesUsage(baseline.usage));
+    if (baseline.pending !== undefined) {
+      this.activeAdmissionId = hermesRunningAdmissionId(baseline.pending);
+      const items = normalizeHermesQueue(baseline.pending);
+      this.queuedIds = new Set(items.map((item) => item.id));
+      this.queueKey = JSON.stringify(items);
+    }
+    if (baseline.todoRevision !== undefined) this.todoRevision = baseline.todoRevision;
+  }
+
   /** Ends the current turn: the next delta starts fresh segment, offset and reasoning state. */
   private endTurn(): void {
+    this.activeAdmissionId = null;
     this.turnId = null;
     this.turnSerial += 1;
     this.segment = 0;
@@ -120,16 +151,28 @@ export class HermesEventMapper {
     return id;
   }
 
+  private usageEvents(raw: unknown): PaAdapterEvent[] {
+    const usage = normalizeHermesUsage(raw);
+    if (!usage) return [];
+    const key = JSON.stringify(usage);
+    if (key === this.usageKey) return [];
+    this.usageKey = key;
+    return [{ type: "usage.updated", sessionId: this.sessionId, usage }];
+  }
+
   map(frame: HermesRpcEventFrame): ReadonlyArray<PaAdapterEvent> {
     if (typeof frame.execution_generation === "number") {
       this.hooks.onGeneration(frame.execution_generation);
     }
     const p = frame.payload ?? {};
     const sessionId = this.sessionId;
+    const admissionId = frame.admission_id ?? stringField(p.admission_id);
     switch (frame.event) {
       case "message.start":
+        if (admissionId !== undefined) this.activeAdmissionId = admissionId;
         return [this.startTurn(stringField(p.turn_id))];
       case "message.delta":
+        if (this.activeAdmissionId === null && admissionId) this.activeAdmissionId = admissionId;
         return this.mapDelta(p);
       case "message.interim": {
         const text = typeof p.text === "string" ? p.text : "";
@@ -181,17 +224,27 @@ export class HermesEventMapper {
       case "tool.progress":
         return [this.mapTool(frame.event, p)];
       case "message.complete": {
+        // `SessionAuthority._settle_cancelled` completes a cancelled or steered queued row under
+        // its own admission id, with an `outcome` but no turn `status`: the turn streaming ahead
+        // of it is still running.
+        if (
+          admissionId !== undefined &&
+          admissionId !== this.activeAdmissionId &&
+          (this.activeAdmissionId !== null || this.queuedIds.has(admissionId))
+        )
+          return [];
         const text = typeof p.text === "string" ? p.text : "";
         const error = stringField(p.error);
         this.endTurn();
         return [
+          ...this.usageEvents(p.usage),
           {
             type: "turn.completed",
             sessionId,
             status:
               p.status === "error"
                 ? "error"
-                : p.status === "interrupted"
+                : p.status === "interrupted" || p.outcome === "cancelled"
                   ? "interrupted"
                   : "complete",
             ...(text ? { text } : {}),
@@ -227,19 +280,48 @@ export class HermesEventMapper {
       case "session.title":
       case "session.updated":
       case "session.info": {
+        const events: PaAdapterEvent[] = [];
+        if (typeof p.execution_generation === "number") {
+          this.hooks.onGeneration(p.execution_generation);
+        }
         const title = stringField(p.title);
         const model = stringField(p.model);
         const reasoningEffort = stringField(p.reasoning_effort);
-        if (!title && !model && !reasoningEffort) return [];
-        return [
-          {
+        if (title || model || reasoningEffort) {
+          events.push({
             type: "session.updated",
             sessionId,
             ...(title ? { title } : {}),
             ...(model ? { model } : {}),
             ...(reasoningEffort ? { reasoningEffort } : {}),
-          },
-        ];
+          });
+        }
+        if (Array.isArray(p.pending)) {
+          // `_publish_pending` re-sends the whole list on every claim and settle: report changes only.
+          this.activeAdmissionId = hermesRunningAdmissionId(p.pending) ?? this.activeAdmissionId;
+          const items = normalizeHermesQueue(p.pending);
+          const key = JSON.stringify(items);
+          if (key !== this.queueKey) {
+            this.queuedIds = new Set(items.map((item) => item.id));
+            this.queueKey = key;
+            events.push({ type: "queue.updated", sessionId, items });
+          }
+        }
+        events.push(...this.usageEvents(p.usage));
+        return events;
+      }
+      case "session.usage": {
+        return this.usageEvents(p);
+      }
+      case "todo.updated": {
+        const todos = normalizeHermesTodoState(p) ?? {
+          revision: Math.max(0, Number(p.revision) || 0),
+          items: [],
+        };
+        // Whole-list snapshots: an older revision replayed after a newer one is stale.
+        if (todos.revision < this.todoRevision) return [];
+        this.todoRevision = todos.revision;
+        return [{ type: "todos.updated", sessionId, todos }];
       }
       case "notice": {
         const message = String(p.message ?? p.text ?? "");

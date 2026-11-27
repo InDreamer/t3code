@@ -1,7 +1,14 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeCrypto from "node:crypto";
 
-import { PaError, type PaPendingRequest, type PaStreamEvent } from "@t3tools/contracts";
+import {
+  PaError,
+  type PaContextUsage,
+  type PaPendingRequest,
+  type PaQueuedItem,
+  type PaStreamEvent,
+  type PaTodoState,
+} from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
 import type { PaAdapterEvent, PaSessionSubscriber } from "./types.ts";
@@ -75,6 +82,10 @@ export class PaSessionHub {
   private readonly listeners = new Set<PaHubListener>();
   private running = false;
   private openRequests: ReadonlyArray<PaPendingRequest> = [];
+  /** The latest of each, never the history: a reconnecting viewer only needs what is current. */
+  private queuedItems: ReadonlyArray<PaQueuedItem> = [];
+  private usage: PaContextUsage | null = null;
+  private todos: PaTodoState | null = null;
   private release: (() => void) | null = null;
   private lingerTimer: unknown = null;
   private reconnectTimer: unknown = null;
@@ -110,8 +121,7 @@ export class PaSessionHub {
           if (this.disposed || ended) return;
           if (initial && event.type === "snapshot") {
             initial = false;
-            this.running = event.running;
-            this.openRequests = event.openRequests;
+            this.applySnapshot(event);
             return;
           }
           this.publish(event);
@@ -197,8 +207,18 @@ export class PaSessionHub {
     if (this.buffer.length > this.options.capacity) this.buffer.shift();
     switch (stamped.type) {
       case "snapshot":
-        this.running = stamped.running;
-        this.openRequests = stamped.openRequests;
+        this.applySnapshot(stamped);
+        break;
+      case "queue.updated":
+        this.queuedItems = stamped.items;
+        break;
+      case "usage.updated":
+        this.usage = stamped.usage;
+        break;
+      case "todos.updated":
+        if (this.todos === null || stamped.todos.revision >= this.todos.revision) {
+          this.todos = stamped.todos;
+        }
         break;
       case "turn.started":
       case "turn.completed":
@@ -221,10 +241,46 @@ export class PaSessionHub {
     for (const listener of this.listeners) listener.onEvent(stamped);
   }
 
+  /** A snapshot that leaves a field out keeps the hub's last value for it. */
+  private applySnapshot(snapshot: Extract<PaAdapterEvent, { type: "snapshot" }>): void {
+    this.running = snapshot.running;
+    this.openRequests = snapshot.openRequests;
+    if (snapshot.queuedItems !== undefined) this.queuedItems = snapshot.queuedItems;
+    if (snapshot.usage !== undefined) this.usage = snapshot.usage;
+    if (snapshot.todos !== undefined) this.todos = snapshot.todos;
+  }
+
   /** An answered prompt, published at once so no viewer (or later snapshot) still offers it. */
   resolveRequest(requestId: string): void {
     if (this.disposed || !this.openRequests.some((r) => r.requestId === requestId)) return;
     this.publish({ type: "request.resolved", sessionId: this.sessionId, requestId });
+  }
+
+  openRequestKind(requestId: string): PaPendingRequest["kind"] | null {
+    return this.openRequests.find((r) => r.requestId === requestId)?.kind ?? null;
+  }
+
+  /** A session edit made through T3, for viewers whose engine feed does not report it. */
+  publishSessionUpdated(update: { readonly title: string }): void {
+    if (this.disposed) return;
+    this.publish({ type: "session.updated", sessionId: this.sessionId, title: update.title });
+  }
+
+  describeQueuedAttachments(id: string, text: string, attachmentCount: number): void {
+    // The gateway may publish its queue before it answers the submitting client.
+    const queued = this.queuedItems.find((item) => item.id === id);
+    if (
+      !queued ||
+      (queued.text === text && queued.attachmentCount === attachmentCount && !queued.canSteer)
+    )
+      return;
+    this.publish({
+      type: "queue.updated",
+      sessionId: this.sessionId,
+      items: this.queuedItems.map((item) =>
+        item.id === id ? { ...item, text, attachmentCount, canSteer: false } : item,
+      ),
+    });
   }
 
   /** For output the engine never streams or stores, such as a command's immediate result. */
@@ -267,6 +323,9 @@ export class PaSessionHub {
       running: this.running,
       openRequests: this.openRequests,
       snapshotRequired: resumeToken !== undefined && replay === null,
+      queuedItems: this.queuedItems,
+      usage: this.usage,
+      todos: this.todos,
     });
     for (const event of replay ?? []) listener.onEvent(event);
     this.listeners.add(listener);

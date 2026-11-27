@@ -4,17 +4,109 @@ import {
   classifyHermesTool,
   extractTranscriptText,
   hermesRequiredScope,
+  hermesRunningAdmissionId,
   mergeSessionRows,
+  normalizeHermesQueue,
   normalizeHermesTimestamp,
+  normalizeHermesTodoState,
+  normalizeHermesUsage,
   normalizeModelCatalog,
   normalizePendingRequest,
   normalizeProfileConfig,
   normalizeProfileRow,
   normalizeSlashCatalog,
   normalizeTranscriptRows,
+  sessionRowMatches,
 } from "./HermesNormalizers.ts";
 
 describe("Hermes transcripts", () => {
+  it("preserves inline references as prose and distinguishes anonymous rows on different pages", () => {
+    for (const text of ["Take a [screenshot] of the error", "Check @file:README.md"]) {
+      expect(normalizeTranscriptRows([{ role: "user", text }])[0]).toMatchObject({ text });
+      expect(
+        normalizeHermesQueue([
+          { admission_id: "q", status: "queued", text, controls: ["steer"] },
+        ])[0],
+      ).toMatchObject({ text, canSteer: true });
+    }
+    expect(
+      normalizeTranscriptRows([{ role: "user", text: '@file:"dir/   "' }])[0]?.attachments?.[0]
+        ?.name,
+    ).toBe("attachment");
+    const row = { role: "assistant", text: "OK" };
+    expect(normalizeTranscriptRows([row], "older")[0]?.id).not.toBe(
+      normalizeTranscriptRows([row])[0]?.id,
+    );
+  });
+
+  it("retains user rows carrying a display metadata submission receipt without a media marker", () => {
+    expect(
+      normalizeTranscriptRows([
+        { role: "user", row_id: 17, text: "", display_metadata: { submission_id: "received" } },
+      ]),
+    ).toMatchObject([{ role: "user", rowId: 17, submissionId: "received" }]);
+  });
+
+  it("keeps external references inert and preserves row ids across pagination", () => {
+    const row = {
+      role: "user",
+      text: 'compare\n@file:"/host/private/one two.pdf"\n@image:/private/photo.png\n[image]',
+      timestamp: 17,
+    };
+    const [message] = normalizeTranscriptRows([row]);
+    expect(message?.text).toBe("compare");
+    expect(
+      message?.attachments?.map(({ type, name, unavailable }) => [type, name, unavailable]),
+    ).toEqual([
+      ["file", "one two.pdf", true],
+      ["image", "photo.png", true],
+    ]);
+    expect(JSON.stringify(message)).not.toContain("/private/");
+    expect(normalizeTranscriptRows([{ role: "assistant", text: "before" }, row])[1]).toEqual(
+      message,
+    );
+    const [imageOnly] = normalizeTranscriptRows([
+      {
+        role: "user",
+        row_id: 4,
+        content: [{ type: "image_url", image_url: { url: "data:image/png;base64,private" } }],
+      },
+    ]);
+    expect(imageOnly).toMatchObject({
+      id: "row-4",
+      text: "",
+      attachments: [{ type: "image", unavailable: true }],
+    });
+    expect(JSON.stringify(imageOnly)).not.toContain("base64");
+    const [mixed] = normalizeTranscriptRows([
+      {
+        role: "user",
+        text: "compare\n@file:/private/q.pdf\n\n--- Attached Context ---\n\nexpanded\n\n[Image attached at: /private/photo.png]\n[image]",
+      },
+    ]);
+    expect(mixed?.text).toBe("compare");
+    expect(mixed?.attachments?.map((item) => item.name)).toEqual(["q.pdf", "photo.png"]);
+    const [projected] = normalizeTranscriptRows([
+      {
+        role: "user",
+        text: 'compare\n@file:/private/q.pdf\n\n--- Attached Context ---\n\nexpanded\n\n@image:"/private/photo.png"',
+      },
+    ]);
+    expect(projected?.attachments).toEqual(mixed?.attachments);
+    expect(
+      normalizeHermesQueue([
+        {
+          admission_id: "q",
+          input_id: "send",
+          status: "queued",
+          text: "@file:/private/q.pdf",
+          controls: ["steer"],
+        },
+      ]),
+    ).toEqual([
+      { id: "q", inputId: "send", status: "queued", text: "", attachmentCount: 1, canSteer: false },
+    ]);
+  });
   it("normalizes timestamps, text parts, tool rows and reasoning", () => {
     expect(normalizeHermesTimestamp(1795613800.5)).toBe(1795613800500);
     expect(normalizeHermesTimestamp(1795613800500)).toBe(1795613800500);
@@ -79,6 +171,46 @@ describe("Hermes transcripts", () => {
     expect(messages[1]?.reasoning).toBeUndefined();
     expect(messages[2]?.reasoning).toBeUndefined();
     expect(messages[1]?.timestamp).toBe(1700000000000);
+  });
+
+  it("keeps paged rows' ids stable without a row_id and carries compaction details", () => {
+    const page = [
+      { role: "user", text: "same", timestamp: 1700000000 },
+      { role: "user", text: "same", timestamp: 1700000000 },
+      { role: "assistant", text: "head", truncated: true },
+      {
+        role: "system",
+        text: "Summary",
+        row_kind: "compaction",
+        compacted_messages: 12,
+        row_id: 9,
+      },
+    ];
+    const first = normalizeTranscriptRows(page);
+    // The same rows read again (or on another page) get the same ids, and duplicates stay apart.
+    expect(normalizeTranscriptRows(page).map((m) => m.id)).toEqual(first.map((m) => m.id));
+    expect(new Set(first.map((m) => m.id)).size).toBe(4);
+    expect(first.slice(0, 3).every((m) => m.id.startsWith("h-"))).toBe(true);
+    expect(normalizeTranscriptRows(page.slice(2))[0]?.id).toBe(first[2]?.id);
+    expect(first[2]).toMatchObject({ truncated: true });
+    expect(first[2]?.rowId).toBeUndefined();
+    expect(first[3]).toMatchObject({
+      id: "row-9",
+      rowId: 9,
+      rowKind: "compaction",
+      compactedMessages: 12,
+    });
+  });
+
+  it("keeps timestamp twins on separate pages and stable submissions across pages", () => {
+    const row = { role: "assistant", text: "OK", timestamp: 1700000000 };
+    expect(normalizeTranscriptRows([row])[0]?.id).not.toBe(
+      normalizeTranscriptRows([row], "older")[0]?.id,
+    );
+    const submitted = { ...row, role: "user", submission_id: "submit-1" };
+    expect(normalizeTranscriptRows([submitted])[0]?.id).toBe(
+      normalizeTranscriptRows([submitted], "older")[0]?.id,
+    );
   });
 
   it("classifies tools into neutral categories", () => {
@@ -231,6 +363,14 @@ describe("Hermes sessions, profiles and models", () => {
     expect(sessions[1]).toMatchObject({ lastActivityAt: 1700000100000 });
   });
 
+  it("matches a live session by title or id, as the stored search does", () => {
+    const row = { session_id: "20261127_abc", title: "Trip Plan" };
+    expect(sessionRowMatches(row, "trip")).toBe(true);
+    expect(sessionRowMatches(row, "ABC")).toBe(true);
+    expect(sessionRowMatches(row, "groceries")).toBe(false);
+    expect(sessionRowMatches({ id: "s-1", title: null }, "s-1")).toBe(true);
+  });
+
   it("leaves the default profile unnamed so the engine label can stand in", () => {
     expect(normalizeProfileRow({ name: "default", is_default: true })).toMatchObject({
       agentRef: "default",
@@ -373,7 +513,55 @@ describe("Hermes prompts and config", () => {
       { id: "q1", prompt: "Why?" },
     ]);
     expect(batch?.lockedAnswers).toEqual({ q0: "prod" });
-    expect(normalizePendingRequest("x", "sudo", {}, "server_request")).toBeNull();
+  });
+
+  it("opens Hermes's masked prompts as secret requests and ignores Desktop-only ones", () => {
+    const sudo = normalizePendingRequest(
+      "srq-s",
+      "sudo",
+      { command: "apt install jq" },
+      "server_request",
+    );
+    expect(sudo).toMatchObject({ method: "sudo", channel: "server_request" });
+    expect(sudo?.request).toMatchObject({
+      kind: "secret",
+      scope: "session",
+      command: "apt install jq",
+      fields: [{ id: "password", secret: true, required: true }],
+    });
+    const secret = normalizePendingRequest(
+      "srq-k",
+      "secret",
+      { env_var: "TAVILY_API_KEY", prompt: "Paste the key" },
+      "server_request",
+    );
+    expect(secret?.request).toMatchObject({
+      kind: "secret",
+      title: "TAVILY_API_KEY needed",
+      detail: "Paste the key",
+      fields: [{ id: "value", label: "TAVILY_API_KEY", secret: true }],
+      sideEffectNotice: expect.stringContaining(".env"),
+    });
+    const code = normalizePendingRequest("srq-c", "vault.code", {}, "server_request");
+    expect(code?.request.fields).toEqual([{ id: "code", label: "Code", required: true }]);
+    const login = normalizePendingRequest(
+      "srq-l",
+      "vault.save_login",
+      { origin: "https://github.com", site: "github.com" },
+      "server_request",
+    );
+    expect(login?.request.fields?.map((field) => [field.id, field.secret ?? false])).toEqual([
+      ["identifier", false],
+      ["password", true],
+    ]);
+    expect(
+      normalizePendingRequest("srq-u", "vault.unlock_prompt", {}, "server_request")?.request.kind,
+    ).toBe("secret");
+    // Only the server-request channel carries these; Desktop's bridges stay unanswered here.
+    expect(normalizePendingRequest("x", "sudo", {}, "canonical")).toBeNull();
+    for (const method of ["theme.set", "preview.open", "window.read", "tour", "setup_beat"]) {
+      expect(normalizePendingRequest("x", method, {}, "server_request")).toBeNull();
+    }
   });
 
   it("describes a profile as generic config sections", () => {
@@ -402,5 +590,107 @@ describe("Hermes prompts and config", () => {
     ]);
     const toolsets = config.sections.find((s) => s.id === "toolsets");
     expect(toolsets?.kind === "toggleList" && toolsets.minEnabled).toBe(1);
+  });
+});
+
+describe("Hermes queue, usage and todos", () => {
+  const pending = [
+    { admission_id: "adm-run", status: "started", text: "first", controls: [] },
+    { admission_id: "adm-steer", status: "started", steering: true, text: "nudge" },
+    { admission_id: "adm-q1", status: "queued", text: "next", controls: ["steer", "replace"] },
+    { admission_id: "adm-q2", status: "queued", text: "with file", controls: [] },
+    { admission_id: "adm-lost", status: "unknown", text: "lost" },
+    { admission_id: "adm-done", status: "terminal", text: "done" },
+  ];
+
+  it("lists what still waits, never the running admission, and only offers the verbs Hermes serves", () => {
+    expect(normalizeHermesQueue(pending)).toEqual([
+      { id: "adm-steer", text: "nudge", status: "steering", canSteer: false },
+      { id: "adm-q1", text: "next", status: "queued", canSteer: true, canReplace: true },
+      { id: "adm-q2", text: "with file", status: "queued", canSteer: false },
+      { id: "adm-lost", text: "lost", status: "unknown", canSteer: false },
+    ]);
+    expect(hermesRunningAdmissionId(pending)).toBe("adm-run");
+    expect(normalizeHermesQueue(undefined)).toEqual([]);
+    expect(hermesRunningAdmissionId([{ admission_id: "a", status: "queued" }])).toBeNull();
+  });
+
+  it("reads context occupancy from the context figures, never from cumulative totals", () => {
+    // `session_usage.py::tui_usage` shape, as `message.complete.usage` and `info.usage` carry it.
+    expect(
+      normalizeHermesUsage({
+        input: 90_000,
+        output: 4_000,
+        total: 94_000,
+        context_used: 12_000,
+        context_max: 200_000,
+        context_percent: 6,
+        cache_read: 3_000,
+        compressions: 1,
+      }),
+    ).toEqual({
+      contextUsed: 12_000,
+      contextMax: 200_000,
+      contextPercent: 6,
+      inputTokens: 90_000,
+      outputTokens: 4_000,
+      totalTokens: 94_000,
+      cacheReadTokens: 3_000,
+      compressionCount: 1,
+    });
+    // `session.usage` carries both views; the nested status-bar one wins.
+    expect(
+      normalizeHermesUsage({
+        usage: { input: 10, total: 10, context_used: 5_000, context_max: 10_000 },
+        context_tokens: 1,
+        context_length: 2,
+      }),
+    ).toMatchObject({ contextUsed: 5_000, contextMax: 10_000, contextPercent: 50 });
+    // Only the deprecated flat counters.
+    expect(
+      normalizeHermesUsage({
+        input_tokens: 400_000,
+        total_tokens: 420_000,
+        context_tokens: 30_000,
+        context_length: 120_000,
+        compression_count: 2,
+      }),
+    ).toMatchObject({ contextUsed: 30_000, contextMax: 120_000, contextPercent: 25 });
+    // No window known: no percentage, whatever the session has spent.
+    expect(normalizeHermesUsage({ input: 50_000, total: 900_000 })).toMatchObject({
+      contextUsed: 0,
+      contextMax: null,
+      contextPercent: null,
+      totalTokens: 900_000,
+    });
+    expect(normalizeHermesUsage(null)).toBeNull();
+    expect(normalizeHermesUsage({ model: "x" })).toBeNull();
+  });
+
+  it("normalizes todo snapshots and treats an unused revision-0 store as no plan", () => {
+    expect(
+      normalizeHermesTodoState({
+        revision: 3,
+        todos: [
+          { id: "1", content: "Read the code", status: "completed" },
+          { id: 2, content: "Write the fix", status: "IN_PROGRESS" },
+          { id: "3", content: "Ship", status: "someday" },
+          { id: "4", content: "" },
+        ],
+      }),
+    ).toEqual({
+      revision: 3,
+      items: [
+        { id: "1", text: "Read the code", status: "completed" },
+        { id: "2", text: "Write the fix", status: "in_progress" },
+        { id: "3", text: "Ship", status: "pending" },
+      ],
+    });
+    expect(normalizeHermesTodoState({ revision: 0, todos: [] })).toBeNull();
+    expect(normalizeHermesTodoState({ revision: 4, todos: [] })).toEqual({
+      revision: 4,
+      items: [],
+    });
+    expect(normalizeHermesTodoState({ todos: "nope" })).toBeNull();
   });
 });

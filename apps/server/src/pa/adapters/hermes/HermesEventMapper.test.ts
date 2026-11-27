@@ -23,6 +23,7 @@ function makeMapper() {
   const map = (event: string, payload: Record<string, unknown> = {}, extra = {}) =>
     mapper.map({ event, session_id: "s-1", payload, ...extra });
   return {
+    mapper,
     map,
     opened,
     resolved,
@@ -201,4 +202,162 @@ describe("HermesEventMapper turn boundaries", () => {
       ["answer", "Fresh", "turn-2:0"],
     ]);
   });
+});
+
+describe("HermesEventMapper queue, usage and todos", () => {
+  it("does not end the streaming turn when a queued admission is cancelled or steered", () => {
+    const { map, turnBoundaries } = makeMapper();
+    map("message.start", { turn_id: "t1" }, { admission_id: "adm-run" });
+    map("message.delta", { text: "Working", offset: 0 }, { admission_id: "adm-run" });
+    const boundaries = turnBoundaries();
+    // `_settle_cancelled`: stamped with the cancelled row's own id, an `outcome` and no `status`.
+    expect(
+      map(
+        "message.complete",
+        { text: "", content: "", admission_id: "adm-queued", outcome: "cancelled" },
+        { admission_id: "adm-queued" },
+      ),
+    ).toEqual([]);
+    expect(turnBoundaries()).toBe(boundaries);
+    expect(texts(map("message.delta", { text: " on", offset: 7 }))).toEqual([
+      ["answer", " on", "t1:0"],
+    ]);
+    expect(
+      map(
+        "message.complete",
+        { text: "Working on", status: "complete", admission_id: "adm-run" },
+        { admission_id: "adm-run" },
+      ),
+    ).toEqual([
+      { type: "turn.completed", sessionId: "s-1", status: "complete", text: "Working on" },
+    ]);
+  });
+
+  it("settles an interruption without a known active admission, except for an identified queue item", () => {
+    const { mapper, map } = makeMapper();
+    mapper.adoptBaseline({ pending: [{ admission_id: "queued", status: "queued" }] });
+    expect(map("message.complete", { outcome: "cancelled", admission_id: "queued" })).toEqual([]);
+    for (const payload of [{ admission_id: "running" }, {}]) {
+      map("message.start");
+      expect(map("message.complete", { outcome: "cancelled", ...payload })).toMatchObject([
+        { type: "turn.completed", status: "interrupted" },
+      ]);
+    }
+  });
+
+  it("knows the running admission from a resume baseline when it missed message.start", () => {
+    const { mapper, map } = makeMapper();
+    mapper.adoptBaseline({
+      pending: [
+        { admission_id: "adm-run", status: "started" },
+        { admission_id: "adm-q", status: "queued", text: "later", controls: ["steer"] },
+      ],
+    });
+    expect(map("message.complete", { status: "interrupted" }, { admission_id: "adm-q" })).toEqual(
+      [],
+    );
+    // The baseline already reported this queue: an identical session.info adds nothing.
+    expect(
+      map("session.info", {
+        pending: [
+          { admission_id: "adm-run", status: "started" },
+          { admission_id: "adm-q", status: "queued", text: "later", controls: ["steer"] },
+        ],
+      }),
+    ).toEqual([]);
+    expect(
+      map("message.complete", { text: "Done", status: "complete" }, { admission_id: "adm-run" }),
+    ).toMatchObject([{ type: "turn.completed", status: "complete" }]);
+  });
+
+  it("reports queue changes from session.info and keeps its execution generation", () => {
+    const { map, generation } = makeMapper();
+    const pending = [
+      { admission_id: "adm-run", status: "started" },
+      { admission_id: "adm-q", status: "queued", text: "later", controls: ["steer"] },
+    ];
+    expect(map("session.info", { pending, execution_generation: 9, running: true })).toEqual([
+      {
+        type: "queue.updated",
+        sessionId: "s-1",
+        items: [{ id: "adm-q", text: "later", status: "queued", canSteer: true }],
+      },
+    ]);
+    expect(generation()).toBe(9);
+    expect(map("session.info", { pending, running: true })).toEqual([]);
+    expect(map("session.info", { pending: [pending[0]] })).toEqual([
+      { type: "queue.updated", sessionId: "s-1", items: [] },
+    ]);
+  });
+
+  it("maps usage ticks and the turn's final usage to context occupancy", () => {
+    const { map } = makeMapper();
+    expect(
+      map("session.usage", {
+        usage: { input: 1_000, total: 1_200, context_used: 800, context_max: 8_000 },
+        total_tokens: 1_200,
+      }),
+    ).toEqual([
+      {
+        type: "usage.updated",
+        sessionId: "s-1",
+        usage: {
+          contextUsed: 800,
+          contextMax: 8_000,
+          contextPercent: 10,
+          inputTokens: 1_000,
+          totalTokens: 1_200,
+        },
+      },
+    ]);
+    map("message.start", {}, { admission_id: "adm-run" });
+    const done = map(
+      "message.complete",
+      {
+        text: "ok",
+        status: "complete",
+        usage: { input: 2_000, total: 2_400, context_used: 1_600, context_max: 8_000 },
+      },
+      { admission_id: "adm-run" },
+    );
+    expect(done.map((event) => event.type)).toEqual(["usage.updated", "turn.completed"]);
+    expect(done[0]).toMatchObject({ usage: { contextUsed: 1_600, contextPercent: 20 } });
+  });
+
+  it("replaces todos only with a revision at least as new", () => {
+    const { mapper, map } = makeMapper();
+    mapper.adoptBaseline({ todoRevision: 2 });
+    expect(
+      map("todo.updated", { revision: 1, todos: [{ id: "1", content: "old", status: "pending" }] }),
+    ).toEqual([]);
+    expect(
+      map("todo.updated", {
+        revision: 3,
+        todos: [{ id: "1", content: "Plan", status: "in_progress" }],
+      }),
+    ).toEqual([
+      {
+        type: "todos.updated",
+        sessionId: "s-1",
+        todos: { revision: 3, items: [{ id: "1", text: "Plan", status: "in_progress" }] },
+      },
+    ]);
+    expect(map("todo.updated", { revision: 4, todos: [] })).toEqual([
+      { type: "todos.updated", sessionId: "s-1", todos: { revision: 4, items: [] } },
+    ]);
+  });
+});
+
+it("deduplicates usage and settles a known running admission even without a status", () => {
+  const { map } = makeMapper();
+  const usage = { context_used: 9, context_max: 10, total: 12 };
+  expect(map("session.info", { usage })).toHaveLength(1);
+  expect(map("session.usage", { usage })).toEqual([]);
+  map("session.info", { pending: [{ admission_id: "old", status: "started" }] });
+  map("session.info", { pending: [{ admission_id: "new", status: "started" }] });
+  map("message.start");
+  expect(map("message.complete", { outcome: "cancelled" }, { admission_id: "old" })).toEqual([]);
+  expect(map("message.complete", { outcome: "cancelled", usage }, { admission_id: "new" })).toEqual(
+    [expect.objectContaining({ type: "turn.completed" })],
+  );
 });

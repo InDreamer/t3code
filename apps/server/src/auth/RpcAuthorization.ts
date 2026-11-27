@@ -104,7 +104,6 @@ export const RPC_REQUIRED_SCOPES = {
   [WS_METHODS.paListSchedules]: AuthOrchestrationReadScope,
   [WS_METHODS.paListCommands]: AuthOrchestrationReadScope,
   [WS_METHODS.paListSessions]: AuthOrchestrationReadScope,
-  [WS_METHODS.paGetMessages]: AuthOrchestrationReadScope,
   [WS_METHODS.paSubscribeSession]: AuthOrchestrationReadScope,
   [WS_METHODS.peerLinksList]: AuthAccessReadScope,
   // Names only, so a client that reads threads can open a linked environment's.
@@ -203,8 +202,6 @@ export const RPC_REQUIRED_SCOPES = {
   [WS_METHODS.agentSessionsImport]: AuthOrchestrationOperateScope,
   [WS_METHODS.assetsCreateUrl]: AuthOrchestrationReadScope,
   [WS_METHODS.assetsPersistChatAttachments]: AuthOrchestrationOperateScope,
-  [WS_METHODS.attachmentsCreateUploadUrl]: AuthOrchestrationOperateScope,
-  [WS_METHODS.attachmentsDelete]: AuthOrchestrationOperateScope,
   [WS_METHODS.providerUploadFeedback]: AuthOrchestrationOperateScope,
   [WS_METHODS.mcpAppsCallTool]: AuthOrchestrationOperateScope,
   [WS_METHODS.mcpAppsToolInfo]: AuthOrchestrationReadScope,

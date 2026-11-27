@@ -103,6 +103,15 @@ describe("RPC authorization scopes", () => {
   });
 
   it("lets readers watch personal agents and keeps their configuration behind providers manage", () => {
+    expect(clientRpcRequiredScopes(WS_METHODS.paGetMessages, undefined)).toEqual([
+      AuthOrchestrationReadScope,
+    ]);
+    expect(
+      clientRpcRequiredScopes(WS_METHODS.paRespondRequest, { values: { key: "value" } }),
+    ).toEqual([AuthOrchestrationOperateScope, AuthProvidersManageScope]);
+    expect(clientRpcRequiredScopes(WS_METHODS.paRespondRequest, { decision: "once" })).toEqual([
+      AuthOrchestrationOperateScope,
+    ]);
     for (const method of [
       WS_METHODS.paListBots,
       WS_METHODS.paGetMessages,
@@ -113,8 +122,13 @@ describe("RPC authorization scopes", () => {
     }
     for (const method of [
       WS_METHODS.paSendMessage,
+      WS_METHODS.attachmentsCreateUploadUrl,
+      WS_METHODS.attachmentsDelete,
       WS_METHODS.paRespondRequest,
       WS_METHODS.paInterruptSession,
+      WS_METHODS.paSteerSession,
+      WS_METHODS.paManageQueuedItem,
+      WS_METHODS.paMutateSession,
     ]) {
       expect(requiredScopeForRpcMethod(method)).toBe(AuthOrchestrationOperateScope);
     }

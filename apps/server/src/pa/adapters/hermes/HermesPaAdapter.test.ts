@@ -1,7 +1,18 @@
+// @effect-diagnostics nodeBuiltinImport:off
 import { PaError } from "@t3tools/contracts";
-import { describe, expect, it } from "vite-plus/test";
+import * as Effect from "effect/Effect";
+import { createPendingAttachmentId } from "../../../attachmentStore.ts";
+import { PaAttachmentStore } from "../../PaAttachmentStore.ts";
+import { PaStore } from "../../PaStore.ts";
+import { makePaService } from "../../PaService.ts";
+import { describe, expect, it } from "@effect/vitest";
+import * as NodeFSP from "node:fs/promises";
+import { vi } from "vite-plus/test";
+import * as NodeModule from "node:module";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 
-import type { PaAdapterEvent, PaSessionSubscriber } from "../../types.ts";
+import type { PaAdapterEvent, PaSessionSubscriber, PaStagedAttachment } from "../../types.ts";
 import {
   HermesConnectionError,
   HermesRpcError,
@@ -100,8 +111,9 @@ class FakeHermesConnection implements HermesRpcConnection {
   }
 }
 
-function makeAdapter(connections: Record<string, FakeHermesConnection>) {
+function makeAdapter(connections: Record<string, FakeHermesConnection>, store?: PaStore) {
   const connectedProfiles: string[] = [];
+  const lookups: FakeHermesConnection[] = [];
   const pool = {
     getConnection: async (profile: string) => {
       connectedProfiles.push(profile);
@@ -109,9 +121,20 @@ function makeAdapter(connections: Record<string, FakeHermesConnection>) {
       if (!conn) throw new HermesConnectionError(`no fake for ${profile}`);
       return conn;
     },
+    openConnection: async (profile: string) => {
+      const live = connections[profile]!;
+      const lookup = new FakeHermesConnection(profile);
+      lookups.push(lookup);
+      lookup.onMethod("session.resume", (params) => live.call("session.resume", params));
+      return lookup;
+    },
     closeAll: () => undefined,
   } as unknown as HermesConnectionPool;
-  return { adapter: new HermesPaAdapter({ pool }), connectedProfiles };
+  return {
+    adapter: new HermesPaAdapter({ pool, ...(store ? { store } : {}) }),
+    connectedProfiles,
+    lookups,
+  };
 }
 
 /** A feedbot socket that resumes `session_id` as itself unless `canonical` redirects it. */
@@ -377,19 +400,31 @@ describe("HermesPaAdapter profile routing", () => {
     feedbotConn.onMethod("slash.exec", () => ({ output: "ok" }));
     const { adapter } = makeAdapter({ feedbot: feedbotConn });
 
-    expect(await adapter.listSessions("feedbot")).toEqual([
-      expect.objectContaining({ sessionId: "s-run", running: true, lastActivityAt: 1700000300000 }),
-    ]);
+    expect(await adapter.listSessions("feedbot", { limit: 30 })).toEqual({
+      sessions: [
+        expect.objectContaining({
+          sessionId: "s-run",
+          running: true,
+          lastActivityAt: 1700000300000,
+        }),
+      ],
+      nextCursor: null,
+    });
     expect(feedbotConn.callsOf("session.list").map((c) => c.params)).toEqual([
-      { scope: "live", limit: 30, picker: true },
+      { scope: "live", limit: 200, picker: true },
       { scope: "stored", limit: 30, picker: true },
     ]);
 
-    const created = await adapter.createSession("feedbot", { title: "Planning" });
+    const created = await adapter.createSession("feedbot", {
+      title: "Planning",
+      requestId: "create-1",
+    });
     expect(created).toMatchObject({ sessionId: "s-new", title: "Planning" });
+    // The title is set afterwards: a titled create would reuse a session of that name.
     expect(feedbotConn.callsOf("session.create")[0]?.params).toEqual({
       source: "gui",
       follow_profile_config: true,
+      request_id: "create-1",
     });
     expect(feedbotConn.callsOf("slash.exec")[0]?.params).toMatchObject({
       session_id: "s-new",
@@ -408,8 +443,10 @@ describe("HermesPaAdapter profile routing", () => {
       .catch((error: unknown) => error);
     expect(failure).toBeInstanceOf(PaError);
     expect(failure).toMatchObject({ reason: "Unsupported" });
-    await expect(adapter.listSessions("ghost")).rejects.toMatchObject({ reason: "Unavailable" });
-    await expect(adapter.getMessages("feedbot", "../x", 10)).rejects.toMatchObject({
+    await expect(adapter.listSessions("ghost", { limit: 30 })).rejects.toMatchObject({
+      reason: "Unavailable",
+    });
+    await expect(adapter.getMessages("feedbot", "../x", { limit: 10 })).rejects.toMatchObject({
       reason: "Invalid",
     });
   });
@@ -439,6 +476,440 @@ describe("HermesPaAdapter profile routing", () => {
       kind: "turn",
     });
     expect(feedbotConn.callsOf("prompt.submit")[1]?.params.text).toBe("Expand the brief");
+  });
+
+  it("subscribes before staging, preserves original files and reuses staging on a lost receipt", async () => {
+    const dir = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "pa-staging-"));
+    try {
+      const conn = makeFeedbotConn({ canonical: "canonical" });
+      const { adapter } = makeAdapter({ feedbot: conn });
+      const photo = Buffer.from("GIF89a");
+      const path = NodePath.join(dir, "photo.gif");
+      await NodeFSP.writeFile(path, photo);
+      conn.onMethod("image.attach_bytes", () => ({ path: "/cache/upload.gif", mime: "image/gif" }));
+      conn.onMethod("file.attach", () => ({
+        ref_text: '@file:"stored/report 1.pdf"',
+        ref_path: "stored/report 1.pdf",
+      }));
+      let attempts = 0;
+      conn.onMethod("prompt.submit", () => {
+        if (++attempts === 1) throw new HermesConnectionError("lost receipt");
+        return { admission_id: "admission", submission_id: "transcript-id", status: "queued" };
+      });
+      const attachments = [
+        {
+          metadata: {
+            type: "image" as const,
+            id: "image",
+            name: "photo.gif",
+            mimeType: "image/gif",
+            sizeBytes: photo.length,
+          },
+          path,
+        },
+        {
+          metadata: {
+            type: "file" as const,
+            id: "pdf",
+            name: "parent/report\u0001 1.pdf",
+            mimeType: "application/pdf",
+            sizeBytes: 5,
+          },
+          path: NodePath.join(dir, "original.pdf"),
+        },
+      ];
+      await NodeFSP.writeFile(attachments[1]!.path, "paper");
+      let durable: ReadonlyArray<PaStagedAttachment> = [];
+      const options = {
+        inputId: "same",
+        queued: true,
+        attachments,
+        onStaged: (parts: ReadonlyArray<PaStagedAttachment>) => {
+          durable = JSON.parse(JSON.stringify(parts));
+        },
+      };
+      await expect(adapter.sendMessage("feedbot", "s", "", options)).rejects.toMatchObject({
+        reason: "Unavailable",
+      });
+      await expect(adapter.sendMessage("feedbot", "s", "", options)).resolves.toMatchObject({
+        queued: true,
+        submissionId: "transcript-id",
+        admissionId: "admission",
+      });
+      expect(conn.calls.map((call) => call.method)).toEqual([
+        "session.resume",
+        "image.attach_bytes",
+        "file.attach",
+        "prompt.submit",
+        "prompt.submit",
+      ]);
+      expect(conn.callsOf("image.attach_bytes")[0]?.params).toEqual({
+        session_id: "canonical",
+        filename: "photo.gif",
+        content_base64: photo.toString("base64"),
+      });
+      expect(conn.callsOf("file.attach")[0]?.params).toEqual({
+        session_id: "canonical",
+        path: expect.stringMatching(/pa-file-.*\/report 1\.pdf$/),
+        name: "report 1.pdf",
+      });
+      expect(conn.callsOf("prompt.submit").map((call) => call.params)).toEqual(
+        Array.from({ length: 2 }, () => ({
+          session_id: "canonical",
+          input_id: "same",
+          queued: true,
+          text: '@file:"stored/report 1.pdf"',
+          attachments: [{ path: "/cache/upload.gif", mime: "image/gif" }],
+        })),
+      );
+      await expect(
+        adapter.sendMessage("feedbot", "s", "", { ...options, attachments: attachments.slice(1) }),
+      ).rejects.toMatchObject({ reason: "Conflict" });
+      await adapter.sendMessage("feedbot", "canonical", "", options);
+      expect(conn.callsOf("file.attach")).toHaveLength(1);
+      const rebuilt = makeAdapter({ feedbot: conn }).adapter;
+      await rebuilt.sendMessage("feedbot", "s", "", { ...options, staged: durable });
+      expect(conn.callsOf("image.attach_bytes")).toHaveLength(1);
+      expect(conn.callsOf("file.attach")).toHaveLength(1);
+      expect(conn.callsOf("prompt.submit").at(-1)?.params).toEqual(
+        conn.callsOf("prompt.submit")[0]?.params,
+      );
+    } finally {
+      await NodeFSP.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.effect(
+    "replays a disk-journaled file after the accepted submit loses its receipt and the service restarts",
+    () =>
+      Effect.gen(function* () {
+        const dir = yield* Effect.promise(() =>
+          NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "pa-restart-")),
+        );
+        const conn = makeFeedbotConn({ canonical: "owner" });
+        const restart = () =>
+          makePaService({
+            instances: [makeAdapter({ feedbot: conn }).adapter],
+            store: new PaStore(dir),
+            attachmentStore: new PaAttachmentStore(dir, dir),
+          });
+        try {
+          const id = createPendingAttachmentId(".pdf");
+          const input = {
+            botId: "hermes:feedbot",
+            sessionId: "owner",
+            inputId: "once",
+            text: "read",
+            attachments: [
+              {
+                id,
+                type: "file" as const,
+                name: "paper.pdf",
+                mimeType: "application/pdf",
+                sizeBytes: 3,
+              },
+            ],
+          };
+          yield* Effect.promise(() => NodeFSP.writeFile(NodePath.join(dir, id + ".pdf"), "pdf"));
+          conn.onMethod("file.attach", () => ({
+            ref_text: "@file:paper.pdf",
+            ref_path: "paper.pdf",
+          }));
+          conn.onMethod("prompt.submit", () => {
+            expect(
+              new PaAttachmentStore(dir, dir).find(input.botId, "owner", "once")?.staged?.[0]
+                ?.fileRef,
+            ).toBe("@file:paper.pdf");
+            if (conn.callsOf("prompt.submit").length === 1)
+              throw new HermesConnectionError("accepted, reply lost");
+            return { admission_id: "queue-id", submission_id: "row-id", status: "terminal" };
+          });
+          const first = restart();
+          try {
+            expect(yield* Effect.flip(first.sendMessage(input))).toMatchObject({
+              reason: "Unavailable",
+            });
+          } finally {
+            first.dispose();
+          }
+          yield* Effect.promise(() => NodeFSP.rm(NodePath.join(dir, id + ".pdf")));
+          const second = restart();
+          try {
+            conn.onMethod("session.transcript", () => ({
+              rows: [
+                {
+                  role: "user",
+                  row_id: 100,
+                  submission_id: "row-id",
+                  text: "read\n@file:paper.pdf",
+                },
+              ],
+            }));
+            const history = yield* second.getMessages({ botId: input.botId, sessionId: "segment" });
+            expect(history.messages[0]?.attachments?.[0]?.id).toMatch(/^_pa-/);
+            expect(history.messages[0]?.attachments?.[0]?.unavailable).toBeUndefined();
+            expect(
+              new PaAttachmentStore(dir, dir).find(input.botId, "owner", "once")?.rowId,
+            ).toBeUndefined();
+            const result = yield* second.sendMessage(input);
+            expect(result).toMatchObject({
+              settled: true,
+              submissionId: "row-id",
+              admissionId: "queue-id",
+            });
+            expect(conn.callsOf("file.attach")).toHaveLength(1);
+            expect(conn.callsOf("prompt.submit")[1]?.params).toEqual(
+              conn.callsOf("prompt.submit")[0]?.params,
+            );
+          } finally {
+            second.dispose();
+          }
+        } finally {
+          yield* Effect.promise(() => NodeFSP.rm(dir, { recursive: true, force: true }));
+        }
+      }),
+  );
+
+  it.effect(
+    "reclaims only refused payloads and cancellations that never got an execution generation",
+    () =>
+      Effect.gen(function* () {
+        const dir = yield* Effect.promise(() =>
+          NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "pa-cancel-")),
+        );
+        try {
+          const conn = makeFeedbotConn();
+          const storage = new PaAttachmentStore(dir, dir);
+          const service = makePaService({
+            instances: [makeAdapter({ feedbot: conn }).adapter],
+            store: new PaStore(dir),
+            attachmentStore: storage,
+          });
+          const session = { botId: "hermes:feedbot", sessionId: "s" };
+          const id = createPendingAttachmentId(".pdf");
+          yield* Effect.promise(() => NodeFSP.writeFile(NodePath.join(dir, id + ".pdf"), "pdf"));
+          const attachments = [
+            {
+              id,
+              name: "doc.pdf",
+              mimeType: "application/pdf",
+              type: "file" as const,
+              sizeBytes: 3,
+            },
+          ];
+          conn.onMethod("file.attach", () => ({ ref_text: "@file:doc.pdf", ref_path: "doc.pdf" }));
+          yield* service.sendMessage({ ...session, text: "original", inputId: "same" });
+          conn.onMethod("prompt.submit", () => {
+            throw new HermesRpcError("admission_conflict", 4062);
+          });
+          expect(
+            yield* Effect.flip(
+              service.sendMessage({ ...session, text: "new", inputId: "same", attachments }),
+            ),
+          ).toMatchObject({ reason: "Conflict" });
+          expect(storage.find(session.botId, "s", "same")).toBeUndefined();
+          conn.onMethod("prompt.submit", (p) => ({
+            admission_id: "adm-" + p.input_id,
+            status: "queued",
+          }));
+          for (const generation of [null, 4]) {
+            const inputId = "item-" + generation;
+            yield* service.sendMessage({
+              ...session,
+              text: "read",
+              inputId,
+              attachments,
+              queued: true,
+            });
+            conn.onMethod("prompt.cancel", (p) => ({
+              admission_id: p.admission_id,
+              outcome: "cancelled",
+              status: "terminal",
+              execution_generation: generation,
+            }));
+            yield* service.manageQueuedItem({
+              ...session,
+              itemId: "adm-" + inputId,
+              action: "cancel",
+            });
+            expect(!!storage.find(session.botId, "s", inputId)).toBe(generation !== null);
+          }
+          const originals = (yield* Effect.promise(() => NodeFSP.readdir(dir))).filter((name) =>
+            name.startsWith("_pa-"),
+          );
+          expect(originals).toHaveLength(1);
+          const record = storage.record.bind(storage);
+          storage.record = (botId, sessionId, inputId, patch) => {
+            if (patch.submissionId) throw new Error("journal unavailable");
+            record(botId, sessionId, inputId, patch);
+          };
+          expect(
+            yield* service.sendMessage({
+              ...session,
+              text: "accepted",
+              inputId: "fresh",
+              attachments,
+            }),
+          ).toMatchObject({ kind: "turn", submissionId: "adm-fresh" });
+          service.dispose();
+        } finally {
+          yield* Effect.promise(() => NodeFSP.rm(dir, { recursive: true, force: true }));
+        }
+      }),
+  );
+
+  it("copies when links are unsupported and replaces a symlinked in-place reference with an upload", async () => {
+    const dir = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "pa-link-"));
+    try {
+      const conn = makeFeedbotConn();
+      const { adapter } = makeAdapter({ feedbot: conn });
+      const path = NodePath.join(dir, "doc.pdf");
+      await NodeFSP.writeFile(path, "pdf");
+      const fsPromises: typeof NodeFSP = NodeModule.createRequire(import.meta.url)(
+        "node:fs/promises",
+      );
+      using mocks = new DisposableStack();
+      mocks.defer(NodeModule.syncBuiltinESMExports);
+      mocks
+        .use(vi.spyOn(fsPromises, "link"))
+        .mockRejectedValue(Object.assign(new Error("no links"), { code: "EPERM" }));
+      NodeModule.syncBuiltinESMExports();
+      conn.onMethod("file.attach", async (params) => {
+        if (typeof params.path === "string") {
+          expect(await NodeFSP.readFile(params.path, "utf8")).toBe("pdf");
+          const alias = NodePath.join(dir, "alias");
+          await NodeFSP.symlink(NodePath.dirname(params.path), alias);
+          return {
+            ref_text: "@file:temporary",
+            path: NodePath.join(alias, NodePath.basename(params.path)),
+          };
+        }
+        expect(params.data_url).toBe("data:application/octet-stream;base64,cGRm");
+        return { ref_text: "@file:uploaded", ref_path: "uploaded" };
+      });
+      await adapter.sendMessage("feedbot", "s", "", {
+        inputId: "retry",
+        attachments: [
+          {
+            path,
+            metadata: {
+              id: "pdf",
+              type: "file",
+              name: "doc.pdf",
+              sizeBytes: 3,
+              mimeType: "application/pdf",
+            },
+          },
+        ],
+      });
+      expect(conn.callsOf("prompt.submit")[0]?.params.text).toBe("@file:uploaded");
+    } finally {
+      await NodeFSP.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to original file bytes when the gateway cannot resolve the upload path", async () => {
+    const dir = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "pa-remote-file-"));
+    try {
+      const conn = makeFeedbotConn();
+      const { adapter } = makeAdapter({ feedbot: conn });
+      const path = NodePath.join(dir, "paper.pdf");
+      const bytes = Buffer.from("%PDF-1.4\noriginal");
+      await NodeFSP.writeFile(path, bytes);
+      const options = {
+        inputId: "remote-file",
+        attachments: [
+          {
+            path,
+            metadata: {
+              type: "file" as const,
+              id: "pdf",
+              name: "report.pdf",
+              mimeType: "application/pdf",
+              sizeBytes: bytes.length,
+            },
+          },
+        ],
+      };
+      conn.onMethod("file.attach", (params) => {
+        if (params.path) throw new HermesRpcError("cannot read path", 5028);
+        expect(params.data_url).toBe(
+          "data:application/octet-stream;base64," + bytes.toString("base64"),
+        );
+        return { ref_text: "@file:report.pdf", ref_path: "report.pdf" };
+      });
+      await adapter.sendMessage("feedbot", "session", "", options);
+      expect(conn.callsOf("prompt.submit")[0]?.params).toEqual({
+        session_id: "session",
+        text: "@file:report.pdf",
+        input_id: "remote-file",
+      });
+      const [local, remote] = conn.callsOf("file.attach");
+      expect(remote?.timeoutMs).toBe(60_000);
+      await expect(NodeFSP.stat(String(local?.params.path))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      conn.onMethod("file.attach", () => {
+        throw new HermesRpcError("permission_denied", 403);
+      });
+      await expect(
+        adapter.sendMessage("feedbot", "session", "", {
+          ...options,
+          inputId: "denied",
+        }),
+      ).rejects.toMatchObject({ reason: "Forbidden" });
+      expect(conn.callsOf("file.attach")).toHaveLength(3);
+      conn.onMethod("file.attach", () => {
+        throw new HermesRpcError("invalid_params", 400);
+      });
+      const file = options.attachments[0]!;
+      await NodeFSP.truncate(path, 5 * 1024 * 1024 + 1);
+      await expect(
+        adapter.sendMessage("feedbot", "session", "", {
+          ...options,
+          inputId: "large",
+          attachments: [
+            { ...file, metadata: { ...file.metadata, sizeBytes: 5 * 1024 * 1024 + 1 } },
+          ],
+        }),
+      ).rejects.toMatchObject({ reason: "Unsupported", message: expect.stringContaining("5 MiB") });
+      expect(conn.callsOf("file.attach")).toHaveLength(4);
+      expect(conn.callsOf("prompt.submit")).toHaveLength(1);
+    } finally {
+      await NodeFSP.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports the persisted user row and input id from the session's completion receipt", async () => {
+    const conn = makeFeedbotConn();
+    const { adapter } = makeAdapter({ feedbot: conn });
+    const rows: Array<[string, number]> = [];
+    const viewer = collect();
+    const stop = await adapter.subscribeSession(
+      "feedbot",
+      "s",
+      {
+        ...viewer.subscriber,
+        onUserRowPersisted: (id, row) => {
+          rows.push([id, row]);
+          throw new Error("journal error");
+        },
+      },
+      LIVE,
+    );
+    conn.emitEvent({
+      event: "message.complete",
+      session_id: "s",
+      seq: 13,
+      replay_epoch: "ep-A",
+      payload: {
+        status: "complete",
+        persisted_turn: { submission_id: "input", user_row_id: 42 },
+      },
+    });
+    expect(rows).toEqual([["input", 42]]);
+    expect(viewer.events.at(-1)?.type).toBe("turn.completed");
+    stop();
   });
 });
 
@@ -590,6 +1061,28 @@ describe("HermesPaAdapter streaming", () => {
     await adapter.subscribeSession("feedbot", "s-1", feed.subscriber, LIVE);
     feedbotConn.simulateClose();
     expect(feed.closes).toEqual(["Hermes gateway connection closed"]);
+  });
+
+  it("releases a cold history lookup without detaching an open owner feed", async () => {
+    const conn = makeFeedbotConn({ canonical: "owner" });
+    const { adapter, lookups } = makeAdapter({ feedbot: conn });
+    const feed = collect();
+    const stop = await adapter.subscribeSession("feedbot", "owner", feed.subscriber, LIVE);
+    expect(await adapter.attachmentSessionId("feedbot", "segment", true)).toBe("owner");
+    expect(await adapter.attachmentSessionId("feedbot", "segment", true)).toBe("owner");
+    expect(lookups).toHaveLength(1);
+    expect(lookups[0]?.isOpen()).toBe(false);
+    expect(conn.isOpen()).toBe(true);
+    expect(conn.callsOf("session.detach")).toHaveLength(0);
+    conn.emitEvent({
+      event: "message.delta",
+      session_id: "owner",
+      seq: 13,
+      replay_epoch: "ep-A",
+      payload: { text: "still running" },
+    });
+    expect(feed.events.at(-1)).toMatchObject({ type: "text.delta", text: "still running" });
+    stop();
   });
 
   it("adopts the canonical session id session.resume redirects to", async () => {
@@ -1607,5 +2100,530 @@ describe("HermesPaAdapter bootstrap buffering", () => {
     release();
     await adapter.subscribeSession("feedbot", "s-1", collect().subscriber, { resume: true });
     expect(conn.callsOf("session.events.since").at(-1)?.params.last_sequence).toBe(19);
+  });
+});
+
+describe("HermesPaAdapter paging", () => {
+  it("searches and pages only the stored scope, filtering live rows on the first page", async () => {
+    const conn = makeFeedbotConn();
+    conn.onMethod("session.list", (p) => {
+      if (p.scope === "live") {
+        return {
+          scope: "live",
+          sessions: [
+            { session_id: "s-live", title: "Trip plan", running: true },
+            { session_id: "s-other", title: "Groceries", running: true },
+          ],
+        };
+      }
+      return p.cursor === "c-2"
+        ? {
+            scope: "stored",
+            sessions: [{ session_id: "s-old", title: "Old trip" }],
+            next_cursor: null,
+          }
+        : {
+            scope: "stored",
+            sessions: [{ session_id: "s-stored", title: "Trip budget", last_active_at: 5 }],
+            next_cursor: "c-2",
+          };
+    });
+    const { adapter } = makeAdapter({ feedbot: conn });
+
+    const first = await adapter.listSessions("feedbot", { query: "trip", limit: 20 });
+    expect(first.sessions.map((s) => s.sessionId).sort()).toEqual(["s-live", "s-stored"]);
+    expect(first.nextCursor).toBe("c-2");
+    const next = await adapter.listSessions("feedbot", { query: "trip", cursor: "c-2", limit: 20 });
+    expect(next).toEqual({
+      sessions: [expect.objectContaining({ sessionId: "s-old" })],
+      nextCursor: null,
+    });
+    expect(conn.callsOf("session.list").map((c) => c.params)).toEqual([
+      { scope: "live", limit: 200, picker: true },
+      { scope: "stored", limit: 20, picker: true, query: "trip" },
+      { scope: "stored", limit: 20, picker: true, query: "trip", cursor: "c-2" },
+    ]);
+  });
+
+  it("searches all live sessions before paging", async () => {
+    const conn = makeFeedbotConn();
+    conn.onMethod("session.list", (p) => ({
+      sessions:
+        p.scope === "live"
+          ? Array.from({ length: 35 }, (_, i) => ({
+              session_id: "s-" + i,
+              title: "Live " + i,
+            })).slice(0, Number(p.limit))
+          : [],
+    }));
+    const { adapter } = makeAdapter({ feedbot: conn });
+    const first = await adapter.listSessions("feedbot", { limit: 30 });
+    expect(first.sessions).toHaveLength(30);
+    expect(
+      (await adapter.listSessions("feedbot", { limit: 30, cursor: first.nextCursor! })).sessions,
+    ).toHaveLength(5);
+    expect(
+      (await adapter.listSessions("feedbot", { limit: 30, query: "s-34" })).sessions.map(
+        (s) => s.sessionId,
+      ),
+    ).toEqual(["s-34"]);
+  });
+
+  it("reads transcript pages backwards and reports a stale cursor's reset", async () => {
+    const conn = makeFeedbotConn();
+    conn.onMethod("session.transcript", (p) =>
+      p.cursor === undefined
+        ? {
+            session_id: "s-1",
+            rows: [
+              { role: "user", text: "again", row_id: 7, row_kind: "message" },
+              {
+                role: "system",
+                text: "Summary",
+                row_id: 8,
+                row_kind: "compaction",
+                compacted_messages: 40,
+              },
+            ],
+            next_cursor: "older-1",
+            reset: true,
+          }
+        : {
+            session_id: "s-1",
+            rows: [{ role: "assistant", text: "head", row_kind: "message", truncated: true }],
+            next_cursor: null,
+            reset: p.cursor === "stale",
+          },
+    );
+    const { adapter } = makeAdapter({ feedbot: conn });
+
+    const latest = await adapter.getMessages("feedbot", "s-1", { limit: 50 });
+    // A cursor-less read always starts from the newest page: its `reset` is not a reset.
+    expect(latest).toMatchObject({ nextCursor: "older-1", reset: false });
+    expect(latest.messages.map((m) => [m.id, m.rowId, m.rowKind, m.compactedMessages])).toEqual([
+      ["row-7", 7, "message", undefined],
+      ["row-8", 8, "compaction", 40],
+    ]);
+    const older = await adapter.getMessages("feedbot", "s-1", { limit: 50, cursor: "older-1" });
+    expect(older).toMatchObject({ nextCursor: null, reset: false });
+    expect(older.messages[0]).toMatchObject({ text: "head", truncated: true });
+    expect(older.messages[0]?.id).toMatch(/^h-/);
+    const stale = await adapter.getMessages("feedbot", "s-1", { limit: 50, cursor: "stale" });
+    expect(stale.reset).toBe(true);
+    expect(conn.callsOf("session.transcript").map((c) => c.params)).toEqual([
+      { session_id: "s-1", limit: 50, order: "latest", inline_images: false },
+      { session_id: "s-1", limit: 50, order: "latest", inline_images: false, cursor: "older-1" },
+      { session_id: "s-1", limit: 50, order: "latest", inline_images: false, cursor: "stale" },
+    ]);
+  });
+});
+
+describe("HermesPaAdapter session rename", () => {
+  function makeRenameConn(revision: number) {
+    const conn = makeFeedbotConn();
+    const resume = conn["handlers"].get("session.resume")!;
+    conn.onMethod("session.resume", (p) => ({ ...(resume(p) as object), revision }));
+    return conn;
+  }
+
+  it("fences the rename without subscribing and keeps it across a retried request", async () => {
+    const conn = makeRenameConn(3);
+    let committed = false;
+    conn.onMethod("session.mutate", (p) => {
+      committed = true;
+      return { session_id: p.session_id, operation: "rename", revision: 4, title: "Trip" };
+    });
+    const { adapter } = makeAdapter({ feedbot: conn });
+
+    expect(
+      await adapter.renameSession("feedbot", "s-1", { title: " Trip ", requestId: "rn-1" }),
+    ).toEqual({ title: "Trip" });
+    // The response was lost: the same request id must resend the same fence to be replayed.
+    expect(
+      await adapter.renameSession("feedbot", "s-1", { title: "Trip", requestId: "rn-1" }),
+    ).toEqual({ title: "Trip" });
+    expect(committed).toBe(true);
+    expect(conn.callsOf("session.mutate").map((c) => c.params)).toEqual([
+      {
+        session_id: "s-1",
+        request_id: "rn-1",
+        expected_revision: 0,
+        operation: "rename",
+        payload: { title: "Trip" },
+      },
+      {
+        session_id: "s-1",
+        request_id: "rn-1",
+        expected_revision: 0,
+        operation: "rename",
+        payload: { title: "Trip" },
+      },
+    ]);
+    await expect(
+      adapter.renameSession("feedbot", "s-1", { title: "Other", requestId: "rn-1" }),
+    ).rejects.toMatchObject({ reason: "Conflict" });
+  });
+
+  it("replays the negotiated rename revision after a lost receipt and a service restart", async () => {
+    const dir = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "pa-rename-"));
+    try {
+      const conn = makeRenameConn(9);
+      let committed = false;
+      conn.onMethod("session.mutate", (p) => {
+        if (p.expected_revision !== 9)
+          throw new HermesRpcError(
+            committed ? "admission_conflict" : "revision_conflict",
+            4001,
+            undefined,
+            9,
+          );
+        if (!committed) {
+          committed = true;
+          throw new HermesConnectionError("lost receipt");
+        }
+        return { title: "Trip", revision: 10 };
+      });
+      const rename = () =>
+        makeAdapter({ feedbot: conn }, new PaStore(dir)).adapter.renameSession("feedbot", "s-1", {
+          requestId: "same",
+          title: "Trip",
+        });
+      await expect(rename()).rejects.toMatchObject({ reason: "Unavailable" });
+      await expect(rename()).resolves.toEqual({ title: "Trip" });
+      expect(conn.callsOf("session.mutate").map((c) => c.params.expected_revision)).toEqual([
+        0, 9, 9,
+      ]);
+    } finally {
+      await NodeFSP.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("renames the selected compressed row without changing shared feed ownership", async () => {
+    const conn = makeFeedbotConn({ canonical: "owner" });
+    const { adapter } = makeAdapter({ feedbot: conn });
+    const stop = await adapter.subscribeSession("feedbot", "segment", collect().subscriber, LIVE);
+    conn.onMethod("session.mutate", (p) => {
+      expect(p.session_id).toBe("segment");
+      return { revision: 11, title: "Segment" };
+    });
+    await adapter.renameSession("feedbot", "segment", { title: "Segment", requestId: "same" });
+    expect(conn.callsOf("session.resume")).toHaveLength(1);
+    expect(conn.callsOf("session.detach")).toHaveLength(0);
+    stop();
+  });
+
+  it("retries a revision conflict once on the fence the refusal carries", async () => {
+    const conn = makeRenameConn(3);
+    conn.onMethod("session.mutate", (p) => {
+      if (p.expected_revision === 0) {
+        throw new HermesRpcError("revision_conflict", 4001, undefined, 9);
+      }
+      return { session_id: p.session_id, operation: "rename", revision: 10, title: "Trip" };
+    });
+    const { adapter } = makeAdapter({ feedbot: conn });
+
+    expect(
+      await adapter.renameSession("feedbot", "s-1", { title: "Trip", requestId: "rn-2" }),
+    ).toEqual({ title: "Trip" });
+    expect(conn.callsOf("session.mutate").map((c) => c.params.expected_revision)).toEqual([0, 9]);
+
+    // A conflict that persists on the fresh fence is reported, not retried forever.
+    conn.onMethod("session.mutate", () => {
+      throw new HermesRpcError("revision_conflict", 4001, undefined, 12);
+    });
+    await expect(
+      adapter.renameSession("feedbot", "s-1", { title: "Again", requestId: "rn-3" }),
+    ).rejects.toMatchObject({ reason: "Conflict" });
+    expect(conn.callsOf("session.mutate")).toHaveLength(4);
+    expect(conn.callsOf("session.resume")).toHaveLength(0);
+  });
+});
+
+describe("HermesPaAdapter credential prompts", () => {
+  const prompts: Array<{
+    method: string;
+    params: Record<string, unknown>;
+    fields: Array<string>;
+    values: Record<string, string>;
+    value: string;
+  }> = [
+    {
+      method: "sudo",
+      params: { command: "apt install jq" },
+      fields: ["password"],
+      values: { password: "hunter2" },
+      value: "hunter2",
+    },
+    {
+      method: "secret",
+      params: { env_var: "TAVILY_API_KEY", prompt: "Paste your Tavily key" },
+      fields: ["value"],
+      values: { value: "tvly-1" },
+      value: "tvly-1",
+    },
+    {
+      method: "vault.unlock_prompt",
+      params: { backend: "bitwarden", display_name: "Bitwarden" },
+      fields: ["password"],
+      values: { password: "master" },
+      value: "master",
+    },
+    {
+      method: "vault.code",
+      params: { site: "github.com", hint: "Check your authenticator" },
+      fields: ["code"],
+      values: { code: "123456" },
+      value: "123456",
+    },
+    {
+      method: "vault.save_login",
+      params: { origin: "https://github.com", site: "github.com" },
+      fields: ["identifier", "password"],
+      values: { identifier: "me@example.com", password: "pw" },
+      value: JSON.stringify({ identifier: "me@example.com", password: "pw" }),
+    },
+  ];
+
+  it.each(prompts)("opens $method as a secret card and answers {value}", async (prompt) => {
+    const conn = makeFeedbotConn();
+    const { adapter } = makeAdapter({ feedbot: conn });
+    const feed = collect();
+    await adapter.subscribeSession("feedbot", "s-1", feed.subscriber, LIVE);
+    conn.emitRequest({
+      request_id: "srq-secret",
+      method: prompt.method,
+      session_id: "s-1",
+      params: { session_id: "s-1", ...prompt.params },
+    });
+    const opened = feed.events.at(-1);
+    expect(opened).toMatchObject({
+      type: "request.opened",
+      request: { requestId: "srq-secret", kind: "secret", scope: "session" },
+    });
+    expect(
+      opened?.type === "request.opened" && opened.request.fields?.map((field) => field.id),
+    ).toEqual(prompt.fields);
+    expect(adapter.requests.kindOf("feedbot", "s-1", "srq-secret")).toBe("secret");
+
+    // A missing required value is refused without answering, and the error never echoes values.
+    const missing = await adapter.requests
+      .respond("feedbot", "s-1", { requestId: "srq-secret", values: {} })
+      .catch((error: unknown) => error);
+    expect(missing).toMatchObject({ reason: "Invalid" });
+    expect(conn.serverResponses).toEqual([]);
+
+    await adapter.requests.respond("feedbot", "s-1", {
+      requestId: "srq-secret",
+      values: prompt.values,
+    });
+    expect(conn.serverResponses).toEqual([
+      { requestId: "srq-secret", result: { value: prompt.value } },
+    ]);
+    expect(adapter.requests.kindOf("feedbot", "s-1", "srq-secret")).toBeNull();
+  });
+
+  it("declines with an empty value and tells the viewer where a secret is saved", async () => {
+    const conn = makeFeedbotConn();
+    const { adapter } = makeAdapter({ feedbot: conn });
+    const feed = collect();
+    await adapter.subscribeSession("feedbot", "s-1", feed.subscriber, LIVE);
+    conn.emitRequest({
+      request_id: "srq-key",
+      method: "secret",
+      session_id: "s-1",
+      params: { session_id: "s-1", env_var: "API_KEY", prompt: "Key?" },
+    });
+    expect(feed.events.at(-1)).toMatchObject({
+      type: "request.opened",
+      request: { sideEffectNotice: expect.stringContaining(".env") },
+    });
+    await adapter.requests.respond("feedbot", "s-1", { requestId: "srq-key", skip: true });
+    expect(conn.serverResponses).toEqual([{ requestId: "srq-key", result: { value: "" } }]);
+  });
+
+  it("leaves Hermes Desktop's own requests unanswered so Desktop can still settle them", async () => {
+    const conn = makeFeedbotConn();
+    const { adapter } = makeAdapter({ feedbot: conn });
+    const feed = collect();
+    await adapter.subscribeSession("feedbot", "s-1", feed.subscriber, LIVE);
+    for (const method of ["theme.set", "preview.open", "window.read", "terminal.read", "tour"]) {
+      conn.emitRequest({ request_id: `srq-${method}`, method, session_id: "s-1", params: {} });
+    }
+    expect(feed.events.some((event) => event.type === "request.opened")).toBe(false);
+    expect(conn.serverResponses).toEqual([]);
+    expect(conn.serverRejections).toEqual([]);
+  });
+});
+
+describe("HermesPaAdapter queue and steering", () => {
+  it("reports a send made behind a running turn as queued, and only that one", async () => {
+    const feedbotConn = makeFeedbotConn();
+    feedbotConn.onMethod("prompt.submit", () => ({ admission_id: "adm-2", status: "queued" }));
+    const { adapter } = makeAdapter({ feedbot: feedbotConn });
+    expect(
+      await adapter.sendMessage("feedbot", "s-1", "after this", { inputId: "in-2", queued: true }),
+    ).toEqual({ kind: "turn", sessionId: "s-1", submissionId: "adm-2", queued: true });
+    expect(feedbotConn.callsOf("prompt.submit")[0]?.params).toEqual({
+      session_id: "s-1",
+      text: "after this",
+      input_id: "in-2",
+      queued: true,
+    });
+    // An idle session's admission also answers `queued` until the drain claims it.
+    expect(await adapter.sendMessage("feedbot", "s-1", "hello", { inputId: "in-3" })).toEqual({
+      kind: "turn",
+      sessionId: "s-1",
+      submissionId: "adm-2",
+    });
+  });
+
+  it("steers on the running claim's fresh generation and never re-sends an unconfirmed steer", async () => {
+    const feedbotConn = makeFeedbotConn();
+    const { adapter } = makeAdapter({ feedbot: feedbotConn });
+    let ack: Record<string, unknown> = { status: "queued", execution_generation: 5 };
+    feedbotConn.onMethod("session.steer", () => ack);
+
+    expect(await adapter.steerSession("feedbot", "s-1", "  focus on tests ")).toEqual({
+      status: "delivered",
+    });
+    expect(feedbotConn.callsOf("session.steer")[0]?.params).toEqual({
+      session_id: "s-1",
+      execution_generation: 5,
+      text: "focus on tests",
+    });
+    // Refreshed first: a generation tracked while idle goes stale.
+    expect(feedbotConn.callsOf("session.resume")).toHaveLength(1);
+
+    ack = { voice_stopped: true };
+    expect(await adapter.steerSession("feedbot", "s-1", "stop")).toEqual({
+      status: "voiceStopped",
+    });
+    ack = { status: "rejected", delivered: false };
+    expect(await adapter.steerSession("feedbot", "s-1", "late")).toEqual({
+      status: "notDelivered",
+    });
+    ack = { status: "rejected" };
+    await expect(adapter.steerSession("feedbot", "s-1", "maybe seen")).rejects.toMatchObject({
+      reason: "Conflict",
+    });
+    feedbotConn.onMethod("session.steer", () => {
+      throw new HermesRpcError("stale_generation", 4009);
+    });
+    expect(await adapter.steerSession("feedbot", "s-1", "too late")).toEqual({
+      status: "notDelivered",
+    });
+    await expect(adapter.steerSession("feedbot", "s-1", "   ")).rejects.toMatchObject({
+      reason: "Invalid",
+    });
+  });
+
+  it("cancels, steers and resolves queued admissions by their Hermes ids", async () => {
+    const feedbotConn = makeFeedbotConn();
+    feedbotConn.onMethod("session.resume", (p) => ({
+      session_id: p.session_id,
+      running: true,
+      last_sequence: 12,
+      replay_epoch: "ep-A",
+      execution_generation: 8,
+      subscription_id: "sub-1",
+      open_requests: [],
+      prompts: [],
+      pending: [{ admission_id: "adm-lost", status: "unknown", execution_generation: 6 }],
+    }));
+    feedbotConn.onMethod("prompt.cancel", () => ({ status: "terminal" }));
+    feedbotConn.onMethod("prompt.steer_queued", () => ({ status: "started" }));
+    feedbotConn.onMethod("prompt.resolve_unknown", () => ({ status: "terminal" }));
+    const { adapter } = makeAdapter({ feedbot: feedbotConn });
+
+    await adapter.manageQueuedItem("feedbot", "s-1", { itemId: "adm-q", action: "cancel" });
+    await adapter.manageQueuedItem("feedbot", "s-1", { itemId: "adm-q2", action: "steer" });
+    await adapter.manageQueuedItem("feedbot", "s-1", {
+      itemId: "adm-lost",
+      action: "resolveUnknown",
+    });
+    expect(feedbotConn.callsOf("prompt.cancel")[0]?.params).toEqual({
+      session_id: "s-1",
+      admission_id: "adm-q",
+    });
+    expect(feedbotConn.callsOf("prompt.steer_queued")[0]?.params).toEqual({
+      session_id: "s-1",
+      admission_id: "adm-q2",
+    });
+    // Fenced on the lost admission's own generation, not the session's current one.
+    expect(feedbotConn.callsOf("prompt.resolve_unknown")[0]?.params).toEqual({
+      session_id: "s-1",
+      admission_id: "adm-lost",
+      execution_generation: 6,
+    });
+    feedbotConn.onMethod("prompt.steer_queued", () => {
+      throw new HermesRpcError("steer_unavailable", 4009);
+    });
+    await expect(
+      adapter.manageQueuedItem("feedbot", "s-1", { itemId: "adm-q3", action: "steer" }),
+    ).rejects.toMatchObject({ reason: "Conflict" });
+  });
+
+  it("opens a feed with the queue, usage and todo plan the resume reports", async () => {
+    const feedbotConn = makeFeedbotConn();
+    feedbotConn.onMethod("session.resume", (p) => ({
+      session_id: p.session_id,
+      running: true,
+      last_sequence: 12,
+      replay_epoch: "ep-A",
+      execution_generation: 5,
+      subscription_id: "sub-1",
+      open_requests: [],
+      prompts: [],
+      pending: [
+        { admission_id: "adm-run", status: "started", text: "first" },
+        { admission_id: "adm-q", status: "queued", text: "second", controls: ["steer"] },
+      ],
+      info: { usage: { input: 10, total: 10, context_used: 2_000, context_max: 10_000 } },
+      todo_state: { revision: 2, todos: [{ id: "1", content: "Plan", status: "in_progress" }] },
+    }));
+    const { adapter } = makeAdapter({ feedbot: feedbotConn });
+    const feed = collect();
+    await adapter.subscribeSession("feedbot", "s-1", feed.subscriber, LIVE);
+    expect(feed.events[0]).toEqual({
+      type: "snapshot",
+      sessionId: "s-1",
+      running: true,
+      openRequests: [],
+      snapshotRequired: false,
+      queuedItems: [{ id: "adm-q", text: "second", status: "queued", canSteer: true }],
+      usage: {
+        contextUsed: 2_000,
+        contextMax: 10_000,
+        contextPercent: 20,
+        inputTokens: 10,
+        totalTokens: 10,
+      },
+      todos: { revision: 2, items: [{ id: "1", text: "Plan", status: "in_progress" }] },
+    });
+
+    // The cancelled queued row completes under its own id; the running turn keeps streaming.
+    feedbotConn.emitEvent({
+      event: "message.complete",
+      session_id: "s-1",
+      seq: 13,
+      replay_epoch: "ep-A",
+      admission_id: "adm-q",
+      payload: { text: "", admission_id: "adm-q", outcome: "cancelled" },
+    });
+    feedbotConn.emitEvent({
+      event: "todo.updated",
+      session_id: "s-1",
+      seq: 14,
+      replay_epoch: "ep-A",
+      payload: { revision: 1, todos: [] },
+    });
+    feedbotConn.emitEvent({
+      event: "session.info",
+      session_id: "s-1",
+      seq: 15,
+      replay_epoch: "ep-A",
+      payload: { pending: [{ admission_id: "adm-run", status: "started" }] },
+    });
+    expect(feed.events.slice(1)).toEqual([{ type: "queue.updated", sessionId: "s-1", items: [] }]);
   });
 });
