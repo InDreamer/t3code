@@ -11,6 +11,9 @@ import type {
 import { T, useGT, useMessages, Var } from "gt-react";
 import {
   AlertTriangleIcon,
+  ChevronDownIcon,
+  ChevronLeftIcon,
+  ChevronRightIcon,
   ClockIcon,
   CpuIcon,
   ExternalLinkIcon,
@@ -26,7 +29,14 @@ import {
 import { useEffect, useState } from "react";
 
 import { useStableCallback } from "~/hooks/useStableCallback";
-import { modelConfirmationForDraft } from "./BotSettingsSheet.logic";
+import {
+  buildPaginationSlots,
+  filterToggleItems,
+  modelConfirmationForDraft,
+  paginateItems,
+  TOGGLE_PAGE_SIZE,
+  type ToggleFilterMode,
+} from "./BotSettingsSheet.logic";
 import { cn } from "../../lib/utils";
 import { EffortGlyph } from "../chat/EffortGlyph";
 import { Badge } from "../ui/badge";
@@ -111,76 +121,200 @@ function rebaseDrafts(
 function ToggleListSection({
   section,
   value,
+  defaultExpanded,
   onChange,
 }: {
   readonly section: Extract<PaConfigSection, { kind: "toggleList" }>;
   readonly value: ReadonlyArray<string>;
+  readonly defaultExpanded: boolean;
   readonly onChange: (enabled: ReadonlyArray<string>) => void;
 }) {
   const gt = useGT();
+  const [expanded, setExpanded] = useState(defaultExpanded);
   const [filter, setFilter] = useState("");
+  const [filterMode, setFilterMode] = useState<ToggleFilterMode>("all");
+  const [page, setPage] = useState(1);
+
   const enabled = new Set(value);
-  const needle = filter.trim().toLowerCase();
-  const items = needle
-    ? section.items.filter(
-        (item) =>
-          item.label.toLowerCase().includes(needle) ||
-          (item.group ?? "").toLowerCase().includes(needle),
-      )
-    : section.items;
+  const disabledCount = section.items.length - enabled.size;
+  const filteredItems = filterToggleItems(section.items, enabled, filter, filterMode);
+  const pageSlice = paginateItems(filteredItems, page, TOGGLE_PAGE_SIZE);
+  const paginationSlots = buildPaginationSlots(pageSlice.page, pageSlice.totalPages);
+  const showFilterTabs = section.items.length > TOGGLE_PAGE_SIZE;
+
+  const filterTabs: ReadonlyArray<{
+    readonly id: ToggleFilterMode;
+    readonly label: string;
+  }> = [
+    { id: "all", label: gt("全部 ({count})", { count: section.items.length }) },
+    { id: "enabled", label: gt("已启用 ({count})", { count: enabled.size }) },
+    { id: "disabled", label: gt("未启用 ({count})", { count: disabledCount }) },
+  ];
+
   return (
-    <div className="space-y-2">
-      <div className="flex items-center justify-between gap-2">
-        <Label>{section.label}</Label>
-        <Badge variant="outline" size="sm">
+    <div className="overflow-hidden rounded-xl border border-border/60 bg-card/40">
+      <button
+        type="button"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((prev) => !prev)}
+        className="flex w-full items-center justify-between gap-2 px-3 py-2.5 text-left transition-colors hover:bg-muted/40"
+      >
+        <div className="flex min-w-0 items-center gap-2">
+          {expanded ? (
+            <ChevronDownIcon className="size-4 shrink-0 text-muted-foreground" />
+          ) : (
+            <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground" />
+          )}
+          <div className="min-w-0">
+            <div className="truncate font-medium text-sm text-foreground">{section.label}</div>
+            {section.description ? (
+              <div className="truncate text-2xs text-muted-foreground">{section.description}</div>
+            ) : null}
+          </div>
+        </div>
+        <Badge variant="outline" size="sm" className="shrink-0">
           <T>
             已启用 <Var>{enabled.size}</Var> / <Var>{section.items.length}</Var>
           </T>
         </Badge>
-      </div>
-      {section.description ? (
-        <p className="text-2xs text-muted-foreground">{section.description}</p>
-      ) : null}
-      {section.items.length > TOGGLE_FILTER_THRESHOLD ? (
-        <Input
-          placeholder={gt("搜索名称或分类...")}
-          value={filter}
-          onChange={(e) => setFilter(e.target.value)}
-        />
-      ) : null}
-      {items.length === 0 ? (
-        <div className="py-6 text-center text-muted-foreground text-xs">
-          <T>没有匹配的项目</T>
-        </div>
-      ) : (
-        <div className="space-y-1.5">
-          {items.map((item) => (
-            <div
-              key={item.id}
-              className="flex items-center justify-between rounded-lg border border-border/50 px-3 py-2"
-            >
-              <div className="min-w-0 pr-3">
-                <div className="truncate font-medium text-xs">{item.label}</div>
-                {item.description || item.group ? (
-                  <div className="truncate text-2xs text-muted-foreground">
-                    {item.description ?? item.group}
-                  </div>
-                ) : null}
-              </div>
-              <Switch
-                size="sm"
-                checked={enabled.has(item.id)}
-                onCheckedChange={(next) => {
-                  const copy = new Set(enabled);
-                  if (next) copy.add(item.id);
-                  else copy.delete(item.id);
-                  onChange(Array.from(copy));
-                }}
-              />
+      </button>
+
+      {expanded ? (
+        <div className="space-y-2.5 border-t border-border/50 p-3">
+          {section.items.length > TOGGLE_FILTER_THRESHOLD ? (
+            <Input
+              size="sm"
+              type="search"
+              placeholder={gt("搜索名称、分类或说明...")}
+              value={filter}
+              onChange={(e) => {
+                setFilter(e.target.value);
+                setPage(1);
+              }}
+            />
+          ) : null}
+
+          {showFilterTabs ? (
+            <div className="flex flex-wrap items-center gap-1">
+              {filterTabs.map((item) => {
+                const active = filterMode === item.id;
+                return (
+                  <button
+                    key={item.id}
+                    type="button"
+                    aria-pressed={active}
+                    onClick={() => {
+                      setFilterMode(item.id);
+                      setPage(1);
+                    }}
+                    className={cn(
+                      "rounded-md px-2 py-1 text-2xs font-medium transition-colors",
+                      active
+                        ? "bg-accent text-accent-foreground"
+                        : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
+                    )}
+                  >
+                    {item.label}
+                  </button>
+                );
+              })}
             </div>
-          ))}
+          ) : null}
+
+          {pageSlice.items.length === 0 ? (
+            <div className="py-6 text-center text-muted-foreground text-xs">
+              <T>没有匹配的项目</T>
+            </div>
+          ) : (
+            <div className="space-y-1.5">
+              {pageSlice.items.map((item) => (
+                <div
+                  key={item.id}
+                  className="flex items-center justify-between rounded-lg border border-border/50 bg-background/60 px-3 py-2"
+                >
+                  <div className="min-w-0 pr-3">
+                    <div className="flex items-center gap-1.5">
+                      <span className="truncate font-medium text-xs">{item.label}</span>
+                      {item.group && item.description ? (
+                        <Badge variant="secondary" size="sm" className="shrink-0">
+                          {item.group}
+                        </Badge>
+                      ) : null}
+                    </div>
+                    {item.description || item.group ? (
+                      <div className="truncate text-2xs text-muted-foreground">
+                        {item.description ?? item.group}
+                      </div>
+                    ) : null}
+                  </div>
+                  <Switch
+                    size="sm"
+                    checked={enabled.has(item.id)}
+                    onCheckedChange={(next) => {
+                      const copy = new Set(enabled);
+                      if (next) copy.add(item.id);
+                      else copy.delete(item.id);
+                      onChange(Array.from(copy));
+                    }}
+                  />
+                </div>
+              ))}
+            </div>
+          )}
+
+          {pageSlice.totalPages > 1 ? (
+            <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border/50 pt-2 text-2xs text-muted-foreground">
+              <span>
+                {gt("第 {start}-{end} 项 · 共 {total} 项", {
+                  start: pageSlice.startIndex,
+                  end: pageSlice.endIndex,
+                  total: pageSlice.totalItems,
+                })}
+              </span>
+              <div className="flex items-center gap-0.5">
+                <Button
+                  type="button"
+                  size="icon-xs"
+                  variant="ghost"
+                  disabled={pageSlice.page <= 1}
+                  aria-label={gt("上一页")}
+                  onClick={() => setPage(pageSlice.page - 1)}
+                >
+                  <ChevronLeftIcon className="size-3.5" />
+                </Button>
+                {paginationSlots.map((slot) =>
+                  typeof slot === "number" ? (
+                    <Button
+                      key={slot}
+                      type="button"
+                      size="micro"
+                      variant={slot === pageSlice.page ? "secondary" : "ghost"}
+                      aria-current={slot === pageSlice.page ? "page" : undefined}
+                      onClick={() => setPage(slot)}
+                    >
+                      {slot}
+                    </Button>
+                  ) : (
+                    <span key={slot} className="px-1 text-muted-foreground">
+                      …
+                    </span>
+                  ),
+                )}
+                <Button
+                  type="button"
+                  size="icon-xs"
+                  variant="ghost"
+                  disabled={pageSlice.page >= pageSlice.totalPages}
+                  aria-label={gt("下一页")}
+                  onClick={() => setPage(pageSlice.page + 1)}
+                >
+                  <ChevronRightIcon className="size-3.5" />
+                </Button>
+              </div>
+            </div>
+          ) : null}
         </div>
-      )}
+      ) : null}
     </div>
   );
 }
@@ -888,23 +1022,22 @@ function BotSettingsBody({
           ) : null}
 
           {!loading && activeTab === "toggles" ? (
-            <div className="space-y-5">
+            <div className="space-y-3">
               {toggleSections.map((section, index) => {
                 const draft = drafts[section.id];
                 return (
-                  <div key={section.id} className="space-y-5">
-                    {index > 0 ? <Separator /> : null}
-                    <ToggleListSection
-                      section={section}
-                      value={draft?.kind === "toggleList" ? draft.enabled : []}
-                      onChange={(enabled) =>
-                        setDrafts((prev) => ({
-                          ...prev,
-                          [section.id]: { kind: "toggleList", enabled },
-                        }))
-                      }
-                    />
-                  </div>
+                  <ToggleListSection
+                    key={section.id}
+                    section={section}
+                    defaultExpanded={index === 0}
+                    value={draft?.kind === "toggleList" ? draft.enabled : []}
+                    onChange={(enabled) =>
+                      setDrafts((prev) => ({
+                        ...prev,
+                        [section.id]: { kind: "toggleList", enabled },
+                      }))
+                    }
+                  />
                 );
               })}
             </div>
