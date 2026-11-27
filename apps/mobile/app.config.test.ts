@@ -6,16 +6,27 @@ import assetLinks from "../web/public/.well-known/assetlinks.json";
 
 // Keep config parsing independent of local env files and build credentials.
 vi.mock("../../scripts/lib/public-config.ts", () => ({
-  loadRepoEnv: () => ({ APP_VARIANT: process.env.APP_VARIANT }),
+  loadRepoEnv: () => ({
+    APP_VARIANT: process.env.APP_VARIANT,
+    T3CODE_IOS_PERSONAL_TEAM: process.env.T3CODE_IOS_PERSONAL_TEAM,
+    T3CODE_IOS_PERSONAL_TEAM_BUNDLE_ID: process.env.T3CODE_IOS_PERSONAL_TEAM_BUNDLE_ID,
+    T3CODE_IOS_PERSONAL_TEAM_ID: process.env.T3CODE_IOS_PERSONAL_TEAM_ID,
+  }),
 }));
 
 afterEach(() => {
   vi.unstubAllEnvs();
 });
 
-async function loadConfig(variant: string | undefined) {
+async function loadConfig(
+  variant: string | undefined,
+  extraEnv: Record<string, string | undefined> = {},
+) {
   vi.resetModules();
   vi.stubEnv("APP_VARIANT", variant);
+  for (const [key, value] of Object.entries(extraEnv)) {
+    vi.stubEnv(key, value);
+  }
   return (await import("./app.config.ts")).default;
 }
 
@@ -44,4 +55,17 @@ it.each([
     { scheme: "https", host, pathPrefix: "/threads/" },
   ]);
   expect(assetLinks.map((link) => link.target.package_name)).toContain(identifier);
+});
+
+it("strips paid-team signing settings and OTA updates for Personal Team iOS builds", async () => {
+  const config = await loadConfig("production", {
+    T3CODE_IOS_PERSONAL_TEAM: "1",
+    T3CODE_IOS_PERSONAL_TEAM_BUNDLE_ID: "com.example.t3code",
+    T3CODE_IOS_PERSONAL_TEAM_ID: "G84T2A9GPN",
+  });
+  expect(config.ios?.bundleIdentifier).toBe("com.example.t3code");
+  expect(config.ios?.appleTeamId).toBe("G84T2A9GPN");
+  expect(config.ios?.associatedDomains).toBeUndefined();
+  expect(config.ios?.entitlements).toBeUndefined();
+  expect(config.updates?.enabled).toBe(false);
 });
