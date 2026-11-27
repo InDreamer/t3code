@@ -13,6 +13,7 @@ import { Pressable, View } from "react-native";
 import { AppBar } from "../../components/ui/AppBar";
 import { SymbolView } from "../../components/ui/AppSymbol";
 import { AppText as Text, AppTextInput as TextInput } from "../../components/ui/AppText";
+import { Button } from "../../components/ui/Button";
 import { EmptyState } from "../../components/ui/EmptyState";
 import { ListSection } from "../../components/ui/ListSection";
 import { ListToggleRow } from "../../components/ui/ListToggleRow";
@@ -24,7 +25,7 @@ import { useMountedRef } from "../../lib/useMountedRef";
 import { useSelectWorkspaceDetail } from "../layout/workspace/useSelectWorkspaceDetail";
 import { BotAvatar } from "./BotAvatar";
 import { paClient, paErrorMessage } from "./paApi";
-import { addPaBot, usePaCreatableEngines } from "./paRosterStore";
+import { addPaBot, refreshPaRoster, usePaCreateOptions } from "./paRosterStore";
 
 const INPUT = "rounded-xl border border-input-border bg-input px-3 py-2.5 text-sm text-foreground";
 
@@ -36,18 +37,22 @@ export function PaCreateBotSheet({
   const messages = useMessages();
   const navigation = useNavigation();
   const selectDetail = useSelectWorkspaceDetail();
-  const engines = usePaCreatableEngines();
+  const { engines, environments } = usePaCreateOptions();
   const mounted = useMountedRef();
   const dismissed = useRef(false);
   const manyEnvironments = new Set(engines.map((engine) => engine.environmentId)).size > 1;
   const preferred = route.params?.environmentId;
-  const suggested =
-    engines.find((item) => item.environmentId === preferred && item.instance.online) ??
-    engines.find((item) => item.instance.online) ??
-    engines[0] ??
-    null;
-  const [selected, setSelected] = useState(suggested);
-  if (!selected && suggested) setSelected(suggested);
+  const waitingForPreferred = environments.some(
+    (env) => env.environmentId === preferred && env.entry.loading,
+  );
+  const suggested = waitingForPreferred
+    ? null
+    : (engines.find((item) => item.environmentId === preferred && item.instance.online) ??
+      engines.find((item) => item.instance.online) ??
+      engines[0] ??
+      null);
+  const [chosen, setSelected] = useState<typeof suggested>(null);
+  const selected = chosen ?? suggested;
   const engine = engines.find((item) => item.key === selected?.key);
   const engineLabel = (item: (typeof engines)[number]) =>
     manyEnvironments ? `${item.instance.label} · ${item.environmentLabel}` : item.instance.label;
@@ -124,13 +129,33 @@ export function PaCreateBotSheet({
           automaticallyAdjustKeyboardInsets
           contentContainerStyle={{ padding: 16, gap: 16, paddingBottom: 40 }}
         >
-          {!selected && engines.length === 0 ? (
+          {environments.map(({ environmentId, environmentLabel, entry }) =>
+            entry.loading ? (
+              <Text key={environmentId} className="text-sm text-foreground-muted">
+                {environmentLabel} · {gt("Loading bots")}
+              </Text>
+            ) : entry.error ? (
+              <View key={environmentId} className="gap-2">
+                <Text selectable className="text-sm text-danger">
+                  {environmentLabel} · {entry.error}
+                </Text>
+                <Button
+                  size="compact"
+                  tone="text"
+                  label={gt("Retry")}
+                  onPress={() => void refreshPaRoster(environmentId)}
+                />
+              </View>
+            ) : null,
+          )}
+          {!selected && !environments.some(({ entry }) => entry.loading || entry.error) ? (
             <EmptyState
               title={gt("No bot engines")}
               detail={gt("Bots appear here once an environment runs a personal agent engine.")}
               variant="plain"
             />
-          ) : (
+          ) : null}
+          {selected ? (
             <>
               <View className="flex-row items-center gap-4 rounded-2xl border border-border-subtle bg-card p-3">
                 <BotAvatar color={avatarColor} shape={avatarShape} size="md" />
@@ -278,28 +303,25 @@ export function PaCreateBotSheet({
                   ))}
                 </View>
                 <View className="flex-row flex-wrap gap-2.5 pt-1">
-                  {PA_AVATAR_COLORS.map((swatch) => (
+                  {PA_AVATAR_COLORS.map(({ value: color, label }) => (
                     <Pressable
-                      key={swatch.value}
+                      key={color}
                       accessibilityRole="radio"
-                      accessibilityLabel={messages(swatch.label)}
-                      accessibilityState={{ checked: avatarColor === swatch.value }}
-                      onPress={() => setAvatarColor(swatch.value)}
+                      accessibilityLabel={messages(label)}
+                      accessibilityState={{ checked: avatarColor === color }}
+                      onPress={() => setAvatarColor(color)}
                       className={cn(
                         "size-9 items-center justify-center rounded-full",
-                        avatarColor === swatch.value && "border-2 border-foreground",
+                        avatarColor === color && "border-2 border-foreground",
                       )}
                     >
-                      <View
-                        className="size-7 rounded-full"
-                        style={{ backgroundColor: swatch.value }}
-                      />
+                      <View className="size-7 rounded-full" style={{ backgroundColor: color }} />
                     </Pressable>
                   ))}
                 </View>
               </View>
             </>
-          )}
+          ) : null}
         </NativeScrollView>
       </ScreenContent>
     </View>

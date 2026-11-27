@@ -3,7 +3,7 @@ import { useGT } from "gt-react-native";
 import { useEffect } from "react";
 import { BackHandler, Keyboard } from "react-native";
 import { usePaneRole } from "../../../components/ui/Pane";
-import { usePaCreatableEngines } from "../../pa/paRosterStore";
+import { isWorkspaceDetailRoute } from "./workspace-detail-selection";
 import { AppBar } from "../../../components/ui/AppBar";
 import { AppText as Text } from "../../../components/ui/AppText";
 import { useAndroidControlSizing } from "../../../components/ui/useAndroidControlSizing";
@@ -27,7 +27,6 @@ export function ListSearchToolbar(props: {
   const { scale } = useAndroidControlSizing();
   const { filters, tab: section } = props;
   const sidebar = usePaneRole() === "sidebar";
-  const canCreate = usePaCreatableEngines(section === "bots").length > 0;
   const workspace = useWorkspaceTabs()!;
   const { dispatch, getScrollOffset, recordScrollOffset, isTabActive } = workspace;
   const { onRequestVisibility } = props;
@@ -56,7 +55,11 @@ export function ListSearchToolbar(props: {
       // Frozen Home screens stay mounted under a detail route or another tab,
       // so back only applies while this list is in front.
       const state = navigation.getState();
-      if ((!sidebar && state?.routes[state.index]?.name !== "Home") || !isTabActive(section))
+      const top = state?.routes[state.index]?.name;
+      if (
+        (top !== "Home" && !(sidebar && top && isWorkspaceDetailRoute(top))) ||
+        !isTabActive(section)
+      )
         return false;
       if (Keyboard.isVisible()) Keyboard.dismiss();
       else closeSearch();
@@ -86,17 +89,6 @@ export function ListSearchToolbar(props: {
             )
           }
         />
-      }
-      actions={
-        section === "bots" && canCreate
-          ? [
-              {
-                icon: "plus",
-                accessibilityLabel: gt("Create bot"),
-                onPress: () => navigation.navigate("PaCreateBot", {}),
-              },
-            ]
-          : undefined
       }
       search={{
         value: tab.query,

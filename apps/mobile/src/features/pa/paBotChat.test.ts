@@ -263,7 +263,10 @@ describe("createPaBotChat", () => {
       { id: "asset", name: "log.txt", type: "file" as const, mimeType: "text/plain", sizeBytes: 4 },
     ];
     expect(await chat.send("read", { attachments })).toBe(false);
+    expect(chat.failedAttachmentKey("s1", "read")).toBe(JSON.stringify(["asset"]));
+    expect(chat.failedAttachmentKey("s1", "changed")).toBeUndefined();
     expect(await chat.send("read", { attachments })).toBe(true);
+    expect(chat.failedAttachmentKey("s1", "read")).toBeUndefined();
     expect(sendMessage.mock.calls[0]).toEqual(sendMessage.mock.calls[1]);
   });
 
@@ -342,6 +345,59 @@ describe("createPaBotChat", () => {
     expect(chat.getState().activeSessionId).toBe("s2");
     expect(feeds.has("gone")).toBe(false);
     expect(feeds.has("s2")).toBe(true);
+  });
+
+  it.each(["offline", "hidden"])(
+    "retries missing-session recovery after it was %s",
+    async (scenario) => {
+      const { api: client, feeds } = fakeClient();
+      const chat = createPaBotChat({ api: client, botId: "bot" });
+      const hide = chat.holdVisible();
+      await chat.setContext(context);
+      if (scenario === "hidden") hide();
+      const noSessions = { primarySessionId: null, sessions: [] };
+      vi.mocked(client.listSessions).mockResolvedValue(noSessions);
+      if (scenario === "offline")
+        vi.mocked(client.listSessions).mockRejectedValueOnce(new Error("offline"));
+      feeds
+        .get("s1")!
+        .onFailure(new PaError({ reason: "NotFound", message: "missing" }), { retrying: false });
+      await until(chat, () => chat.getState().initializationError !== null);
+      expect(feeds.has("s1")).toBe(false);
+      if (scenario === "hidden") chat.holdVisible();
+      else await chat.retryInitialization();
+      await until(chat, () => chat.getState().activeSessionId === "primary");
+      expect(feeds.has("primary")).toBe(true);
+      expect(chat.getState().initializationError).toBeNull();
+    },
+  );
+
+  it("keeps the model command in the draft when no permitted picker is available", async () => {
+    const { api: client } = fakeClient({
+      listCommands: async () => [
+        {
+          name: "/model",
+          handling: "client:model-picker",
+          group: "command",
+          requiredScope: "operate",
+          description: "",
+        },
+      ],
+    });
+    const chat = createPaBotChat({ api: client, botId: "bot" });
+    chat.holdVisible();
+    await chat.setContext({
+      ...context,
+      capabilities: { ...CAPABILITIES, commands: { supported: true } },
+    });
+    chat.setDraft("/model small");
+    expect(await chat.send()).toBe(false);
+    expect(paBotChatView(chat.getState()).draft).toBe("/model small");
+    expect(client.sendMessage).not.toHaveBeenCalled();
+    const open = vi.fn();
+    chat.setOpenModelPicker(open);
+    expect(await chat.send()).toBe(true);
+    expect(open).toHaveBeenCalledWith("small");
   });
 
   it("answers a secret request without echoing a transport error", async () => {

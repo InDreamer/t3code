@@ -286,8 +286,8 @@ export function PaBotsScreen(
               );
           }
         }}
-        ListEmptyComponent={
-          loading ? (
+        ListFooterComponent={
+          filtered.length > 0 ? null : loading ? (
             <View className="items-center py-12">
               <AppActivityIndicator
                 colorClassName="accent-icon"

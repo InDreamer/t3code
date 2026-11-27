@@ -152,7 +152,11 @@ function PaBotRoute({
       .split("/")
       .at(-1) || null;
   const quickCommands = selectPaQuickCommands(
-    capabilities?.commands.supported === false ? [] : state.slashCommands,
+    capabilities?.commands.supported === false
+      ? []
+      : state.slashCommands.filter(
+          (command) => canSelectModel || command.handling !== "client:model-picker",
+        ),
   );
   const contentMaxWidth = chatContentMaxWidth(Platform.OS, layout.usesSplitView);
   const showComposer = bot !== null;
@@ -230,7 +234,7 @@ function PaBotRoute({
                 : 24,
             }}
           >
-            <View>
+            <View collapsable={false}>
               {!bot ? (
                 entry.loading ? (
                   <AppActivityIndicator className="my-12" colorClassName="accent-icon" />
@@ -257,80 +261,80 @@ function PaBotRoute({
                   />
                 </View>
               ) : null}
-            </View>
-            {bot && view.transcript.olderCursor !== null && !view.loadingMessages ? (
-              <View className="items-center gap-1 pb-3">
-                <Button
-                  size="compact"
-                  tone="text"
-                  label={
-                    view.older?.loading
-                      ? gt("Loading earlier messages…")
-                      : gt("Load earlier messages")
+              {bot && view.transcript.olderCursor !== null && !view.loadingMessages ? (
+                <View className="items-center gap-1 pb-3">
+                  <Button
+                    size="compact"
+                    tone="text"
+                    label={
+                      view.older?.loading
+                        ? gt("Loading earlier messages…")
+                        : gt("Load earlier messages")
+                    }
+                    disabled={view.older?.loading === true}
+                    onPress={loadOlder}
+                  />
+                  {view.older?.error ? (
+                    <Text className="text-xs text-foreground-muted">{view.older.error}</Text>
+                  ) : null}
+                </View>
+              ) : null}
+              {bot && loadingChat ? (
+                <View className="flex-row items-center justify-center gap-2 py-12">
+                  <AppActivityIndicator colorClassName="accent-icon" />
+                  <Text className="text-sm text-foreground-muted">
+                    <T>Loading conversation…</T>
+                  </Text>
+                </View>
+              ) : null}
+              {bot && state.initializationError ? (
+                <EmptyState
+                  title={gt("Could not connect to the bot session")}
+                  detail={state.initializationError}
+                  variant="plain"
+                  action={
+                    <Button label={gt("Retry")} onPress={() => void chat.retryInitialization()} />
                   }
-                  disabled={view.older?.loading === true}
-                  onPress={loadOlder}
                 />
-                {view.older?.error ? (
-                  <Text className="text-xs text-foreground-muted">{view.older.error}</Text>
-                ) : null}
-              </View>
-            ) : null}
-            {bot && loadingChat ? (
-              <View className="flex-row items-center justify-center gap-2 py-12">
-                <AppActivityIndicator colorClassName="accent-icon" />
-                <Text className="text-sm text-foreground-muted">
-                  <T>Loading conversation…</T>
-                </Text>
-              </View>
-            ) : null}
-            {bot && state.initializationError ? (
-              <EmptyState
-                title={gt("Could not connect to the bot session")}
-                detail={state.initializationError}
-                variant="plain"
-                action={
-                  <Button label={gt("Retry")} onPress={() => void chat.retryInitialization()} />
-                }
-              />
-            ) : null}
-            {bot && empty && !state.initializationError ? (
-              <View className="items-center gap-3 py-12">
-                <BotAvatar
-                  color={bot.avatarColor}
-                  shape={bot.avatarShape}
-                  size="lg"
-                  starred={bot.isDefault}
-                />
-                <Text className="text-base font-t3-bold text-foreground">{bot.name}</Text>
-                <Text className="max-w-[280px] text-center text-sm text-foreground-muted">
-                  {bot.description ||
-                    (quickCommands.length > 0
-                      ? gt("Start chatting or type / to use {engine} commands.", {
-                          engine: bot.engineLabel,
-                        })
-                      : gt("Start chatting."))}
-                </Text>
-                {quickCommands.length > 0 ? (
-                  <View className="flex-row flex-wrap justify-center gap-2 pt-1">
-                    {quickCommands.map((command) => (
-                      <Pressable
-                        key={command}
-                        accessibilityRole="button"
-                        disabled={!canOperate}
-                        onPress={() => {
-                          followEnd(false);
-                          void chat.send(command);
-                        }}
-                        className="rounded-full border border-border-subtle bg-subtle px-3 py-1.5 active:opacity-70"
-                      >
-                        <Text className="font-mono text-xs text-foreground-muted">{command}</Text>
-                      </Pressable>
-                    ))}
-                  </View>
-                ) : null}
-              </View>
-            ) : null}
+              ) : null}
+              {bot && empty && !state.initializationError ? (
+                <View className="items-center gap-3 py-12">
+                  <BotAvatar
+                    color={bot.avatarColor}
+                    shape={bot.avatarShape}
+                    size="lg"
+                    starred={bot.isDefault}
+                  />
+                  <Text className="text-base font-t3-bold text-foreground">{bot.name}</Text>
+                  <Text className="max-w-[280px] text-center text-sm text-foreground-muted">
+                    {bot.description ||
+                      (quickCommands.length > 0
+                        ? gt("Start chatting or type / to use {engine} commands.", {
+                            engine: bot.engineLabel,
+                          })
+                        : gt("Start chatting."))}
+                  </Text>
+                  {quickCommands.length > 0 ? (
+                    <View className="flex-row flex-wrap justify-center gap-2 pt-1">
+                      {quickCommands.map((command) => (
+                        <Pressable
+                          key={command}
+                          accessibilityRole="button"
+                          disabled={!canOperate}
+                          onPress={() => {
+                            followEnd(false);
+                            void chat.send(command);
+                          }}
+                          className="rounded-full border border-border-subtle bg-subtle px-3 py-1.5 active:opacity-70"
+                        >
+                          <Text className="font-mono text-xs text-foreground-muted">{command}</Text>
+                        </Pressable>
+                      ))}
+                    </View>
+                  ) : null}
+                </View>
+              ) : null}
+            </View>
             {view.timelineItems.map((item) => {
               switch (item.kind) {
                 case "user":

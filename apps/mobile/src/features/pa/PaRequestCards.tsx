@@ -6,6 +6,7 @@ import { Pressable, View } from "react-native";
 import { SymbolView } from "../../components/ui/AppSymbol";
 import { AppText as Text, AppTextInput as TextInput } from "../../components/ui/AppText";
 import { Button } from "../../components/ui/Button";
+import type { SecretTextInputHandle } from "../../components/ui/SecretTextInput.types";
 import { SecretTextInput } from "../../components/ui/SecretTextInput";
 import { useMountedRef } from "../../lib/useMountedRef";
 import { cn } from "../../lib/cn";
@@ -188,23 +189,23 @@ export function PaSecretRequestCard(props: {
   const inFlight = useRef(false);
   const fields = props.request.fields ?? [];
   const busy = props.responding || submitting;
-  const canSubmit =
+  const inputRefs = useRef<Array<SecretTextInputHandle | null>>([]);
+  const canSubmit = (answers: Readonly<Record<string, string>>) =>
     fields.length > 0 &&
-    fields.every((field) => field.required !== true || (values[field.id] ?? "").length > 0);
+    fields.every((field) => field.required !== true || (answers[field.id] ?? "").length > 0);
   const send = async (answer: PaSecretAnswer) => {
     if (inFlight.current) return;
     inFlight.current = true;
     setSubmitting(true);
-    const typed = values;
     setValues({});
     const accepted = await props.onAnswer(answer).finally(() => {
       inFlight.current = false;
       if (mounted.current) setSubmitting(false);
     });
-    if (mounted.current && !accepted && answer.type === "submit") setValues(typed);
+    if (mounted.current && !accepted && answer.type === "submit") setValues(answer.values);
   };
-  const submit = () => {
-    if (canSubmit && !busy) void send({ type: "submit", values });
+  const submit = (answers: Readonly<Record<string, string>>) => {
+    if (canSubmit(answers) && !busy) void send({ type: "submit", values: answers });
   };
   return (
     <View className="gap-2.5 rounded-2xl border border-border bg-card p-3.5">
@@ -232,8 +233,12 @@ export function PaSecretRequestCard(props: {
             editable={!busy}
             returnKeyType={index < fields.length - 1 ? "next" : "done"}
             onChangeText={(value) => setValues((current) => ({ ...current, [field.id]: value }))}
-            onSubmitEditing={() => {
-              if (index === fields.length - 1) submit();
+            onMount={(handle) => {
+              inputRefs.current[index] = handle;
+            }}
+            onSubmitEditing={(value) => {
+              if (index === fields.length - 1) submit({ ...values, [field.id]: value });
+              else inputRefs.current[index + 1]?.focus();
             }}
           />
         </View>
@@ -256,8 +261,8 @@ export function PaSecretRequestCard(props: {
         <Button
           size="compact"
           label={gt("Submit")}
-          disabled={busy || !canSubmit}
-          onPress={submit}
+          disabled={busy || !canSubmit(values)}
+          onPress={() => submit(values)}
         />
       </View>
     </View>

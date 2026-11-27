@@ -9,9 +9,11 @@ import { vi } from "vite-plus/test";
 const harness = vi.hoisted(() => ({
   clearOutbox: vi.fn<(environmentId: string) => Promise<void>>(),
   clearDrafts: vi.fn<(environmentId: string) => Promise<void>>(),
+  clearRoster: vi.fn(),
   clearComposerErrors: vi.fn(),
 }));
 
+vi.mock("../features/pa/paRosterStore", () => ({ clearPaRosterEnvironment: harness.clearRoster }));
 vi.mock("../state/thread-outbox-removal", () => ({
   clearThreadOutboxEnvironment: harness.clearOutbox,
 }));
@@ -49,6 +51,7 @@ describe("EnvironmentOwnedDataCleanup", () => {
       const cleanup = yield* Persistence.EnvironmentOwnedDataCleanup;
       yield* cleanup.clear(ENVIRONMENT_ID);
 
+      expect(harness.clearRoster).toHaveBeenCalledWith(ENVIRONMENT_ID);
       expect(draftsCleared).toBe(true);
       expect(warnings).toEqual([
         [

@@ -4,7 +4,12 @@ import {
   formatPaReasoningLabel,
   getSelectableReasoningLevels,
 } from "@t3tools/client-runtime/pa/reasoning";
-import { EnvironmentId, type PaModelCatalog, type PaModelProvider } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  type PaModelCatalog,
+  type PaSelectBotModelInput,
+  type PaModelProvider,
+} from "@t3tools/contracts";
 import { T, useGT, useMessages } from "gt-react-native";
 import { useEffect, useEffectEvent, useRef, useState } from "react";
 import { Pressable, View } from "react-native";
@@ -22,6 +27,8 @@ import { paClient, paErrorMessage, paSelectModelPermissionAtom } from "./paApi";
 import type { PaBotParams } from "./paBotParams";
 import { patchPaBot, usePaBot } from "./paRosterStore";
 import { usePaBotChat } from "./usePaBotChat";
+
+type ModelSelection = Pick<PaSelectBotModelInput, "provider" | "model" | "reasoningEffort">;
 
 type PaModelParams = PaBotParams & { readonly query?: string };
 
@@ -44,7 +51,7 @@ export function PaModelSheet({ route }: StaticScreenProps<PaModelParams>) {
   const { chat, state } = usePaBotChat(environmentId, botId);
   return (
     <PaModelPicker
-      key={JSON.stringify([environmentId, botId, state.activeSessionId])}
+      key={JSON.stringify([environmentId, botId, state.activeSessionId ?? route.params.sessionId])}
       params={route.params}
       chat={chat}
       state={state}
@@ -62,7 +69,7 @@ function PaModelPicker({
   const navigation = useNavigation();
   const { environmentId, botId } = params;
   const { bot, capabilities } = usePaBot(environmentId, botId);
-  const sessionId = state.activeSessionId;
+  const sessionId = state.activeSessionId ?? params.sessionId ?? null;
   const canSelect = useAtomValue(paSelectModelPermissionAtom(EnvironmentId.make(environmentId)));
   const [customProvider, setCustomProvider] = useState<string | null>(null);
   const [query, setQuery] = useState(params.query ?? "");
@@ -71,8 +78,7 @@ function PaModelPicker({
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState<string | null>(null);
   const [confirm, setConfirm] = useState<{
-    readonly provider: string;
-    readonly model: string;
+    readonly input: ModelSelection;
     readonly message: string;
   } | null>(null);
   const [showDetected, setShowDetected] = useState(false);
@@ -119,12 +125,11 @@ function PaModelPicker({
       : null) ??
     bot?.model ??
     null;
-  const liveEffort =
-    state.sessionReasoning?.sessionId === sessionId &&
-    state.sessionReasoning.settingsVersion === state.settingsVersion
-      ? state.sessionReasoning.effort
-      : null;
-  const currentEffort = liveEffort ?? catalog?.current?.reasoningEffort ?? null;
+  const reasoning = sessionId ? state.sessionReasoning[sessionId] : undefined;
+  const currentEffort =
+    (reasoning?.settingsVersion === state.settingsVersion ? reasoning.effort : null) ??
+    catalog?.current?.reasoningEffort ??
+    null;
   const levels = getSelectableReasoningLevels(catalog, currentProvider, currentModel);
   const needle = query.trim().toLowerCase();
   const options = (catalog?.providers ?? []).filter((option) => option.models.length > 0);
@@ -134,15 +139,10 @@ function PaModelPicker({
     ? options.map((option) => filterProvider(option, needle)).filter((o) => o.models.length > 0)
     : [...primary, ...(showDetected ? detected : [])];
 
-  const apply = async (
-    input: {
-      readonly provider?: string;
-      readonly model?: string;
-      readonly reasoningEffort?: string;
-    },
-    confirmed = false,
-  ) => {
-    if (saving || !canSelect || !catalog) return;
+  const canApply =
+    canSelect && catalog !== null && (catalog.scope !== "session" || sessionId !== null);
+  const apply = async (input: ModelSelection, confirmed = false) => {
+    if (saving || !canApply || !catalog) return;
     const generation = request.current;
     const key = input.reasoningEffort ?? `${input.provider ?? ""}/${input.model ?? ""}`;
     setSaving(key);
@@ -155,7 +155,11 @@ function PaModelPicker({
         ...(confirmed ? { confirm: true } : {}),
       })
       .catch((cause: unknown) => {
-        if (generation !== request.current) return null;
+        if (
+          generation !== request.current ||
+          chat.getState().activeSessionId !== state.activeSessionId
+        )
+          return null;
         setError(
           paErrorMessage(
             cause,
@@ -166,37 +170,32 @@ function PaModelPicker({
         );
         return null;
       });
-    if (generation !== request.current || chat.getState().activeSessionId !== sessionId) return;
+    if (result?.status === "applied") {
+      if (input.reasoningEffort) {
+        chat.setReasoning(sessionId, result.current.reasoningEffort ?? input.reasoningEffort);
+      } else {
+        if (catalog.scope === "session" && sessionId) {
+          chat.patchSession(sessionId, { model: result.current.model });
+        } else {
+          patchPaBot(environmentId, botId, {
+            model: result.current.model,
+            provider: result.current.provider,
+          });
+        }
+        chat.bumpSettings();
+      }
+    }
+    if (generation !== request.current || chat.getState().activeSessionId !== state.activeSessionId)
+      return;
     setSaving(null);
     if (!result) return;
-    if (result.status === "confirmRequired" && input.model) {
-      setConfirm({ provider: input.provider ?? "", model: input.model, message: result.message });
+    if (result.status === "confirmRequired") {
+      setConfirm({ input, message: result.message });
       return;
     }
-    if (result.status !== "applied") return;
     setConfirm(null);
-    const current = {
-      ...(catalog?.current?.reasoningEffort !== undefined
-        ? { reasoningEffort: catalog.current.reasoningEffort }
-        : {}),
-      ...result.current,
-    };
-    setCatalog({ ...catalog, current });
-    if (input.reasoningEffort) {
-      chat.setReasoning(result.current.reasoningEffort ?? input.reasoningEffort);
-      return;
-    }
-    // Agent-scoped models are the Bot's own; the roster shows them.
-    if (catalog.scope === "session") {
-      if (sessionId) chat.patchSession(sessionId, { model: result.current.model });
-    } else {
-      patchPaBot(environmentId, botId, {
-        model: result.current.model,
-        provider: result.current.provider,
-      });
-    }
-    chat.bumpSettings();
-    navigation.goBack();
+    setCatalog({ ...catalog, current: { ...catalog.current, ...result.current } });
+    if (!input.reasoningEffort && navigation.isFocused()) navigation.goBack();
   };
 
   const renderGroup = (option: PaModelProvider) => (
@@ -222,7 +221,7 @@ function PaModelPicker({
             title={model.id}
             role="radio"
             selected={selected}
-            disabled={!canSelect || saving !== null}
+            disabled={!canApply || saving !== null}
             isFirst={index === 0}
             isLast={index === option.models.length - 1}
             onPress={() => void apply({ provider: option.id, model: model.id })}
@@ -261,8 +260,11 @@ function PaModelPicker({
                     <Pressable
                       key={level.id}
                       accessibilityRole="radio"
-                      accessibilityState={{ checked: selected, disabled: saving !== null }}
-                      disabled={!canSelect || saving !== null || selected}
+                      accessibilityState={{
+                        checked: selected,
+                        disabled: !canApply || saving !== null,
+                      }}
+                      disabled={!canApply || saving !== null || selected}
                       onPress={() => void apply({ reasoningEffort: level.id })}
                       className={cn(
                         "rounded-full border px-3 py-1.5 active:opacity-70",
@@ -298,16 +300,8 @@ function PaModelPicker({
                 <Button
                   size="compact"
                   label={gt("Confirm switch")}
-                  disabled={!canSelect || saving !== null}
-                  onPress={() =>
-                    void apply(
-                      {
-                        ...(confirm.provider ? { provider: confirm.provider } : {}),
-                        model: confirm.model,
-                      },
-                      true,
-                    )
-                  }
+                  disabled={!canApply || saving !== null}
+                  onPress={() => void apply(confirm.input, true)}
                 />
               </View>
             </View>
@@ -384,7 +378,7 @@ function PaModelPicker({
                 <Button
                   size="compact"
                   label={gt("Use")}
-                  disabled={!canSelect || !custom.trim() || saving !== null}
+                  disabled={!canApply || !custom.trim() || saving !== null}
                   onPress={() =>
                     void apply({
                       ...(customProviderId ? { provider: customProviderId } : {}),

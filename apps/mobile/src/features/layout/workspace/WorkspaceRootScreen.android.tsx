@@ -120,6 +120,7 @@ function WorkspaceRoot() {
                     </>
                   ) : tab === "bots" ? (
                     <PaBotsScreen
+                      showCreateAction
                       renderFrame={(list) => (
                         <>
                           <ListSearchToolbar tab="bots" />

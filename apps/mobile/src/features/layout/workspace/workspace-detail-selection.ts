@@ -48,6 +48,10 @@ const IDENTITY = {
   PaBot: ["environmentId", "botId"],
 } as const;
 
+export function isWorkspaceDetailRoute(name: string) {
+  return Object.hasOwn(IDENTITY, name);
+}
+
 type RouteLike = { readonly name: string; readonly key?: string; readonly params?: object };
 
 function showsDetail(route: RouteLike, detail: WorkspaceDetail) {

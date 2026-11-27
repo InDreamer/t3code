@@ -17,6 +17,7 @@ import {
   removePersistedComposerAttachmentFile,
   type DraftComposerAttachment,
 } from "../../lib/composerImages";
+import { retainComposerAttachmentFileForPreview } from "../../lib/composerAttachmentPreviewRetention";
 import { uploadComposerAttachmentShared } from "../../state/composer-attachment-uploads";
 import { useEnvironmentScope } from "../../state/session";
 
@@ -36,6 +37,13 @@ export function usePaAttachments(environmentIdValue: string, caps: PaCapabilitie
   const enabled = canUpload && Boolean(caps?.images || caps?.files);
   const [items, setItems] = useState<ReadonlyArray<DraftComposerAttachment>>([]);
   const staged = useRef<ReadonlyArray<DraftComposerAttachment>>([]);
+  const leases = useRef(new Map<string, () => void>());
+  const release = (items: ReadonlyArray<DraftComposerAttachment>) => {
+    for (const item of items) {
+      leases.current.get(item.id)?.();
+      leases.current.delete(item.id);
+    }
+  };
   const active = useRef(false);
   const uploadingRef = useRef(false);
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- releases copied picker files when the session composer unmounts
@@ -43,7 +51,8 @@ export function usePaAttachments(environmentIdValue: string, caps: PaCapabilitie
     active.current = true;
     return () => {
       active.current = false;
-      discard(staged.current);
+      for (const releaseLease of leases.current.values()) releaseLease();
+      leases.current.clear();
       staged.current = [];
     };
   }, []);
@@ -70,6 +79,9 @@ export function usePaAttachments(environmentIdValue: string, caps: PaCapabilitie
           attachment.sizeBytes <=
             Math.min(PROVIDER_SEND_TURN_MAX_FILE_BYTES, caps.maxFileBytes ?? Infinity);
       if (fits) {
+        if (isFileBackedComposerAttachment(attachment)) {
+          leases.current.set(attachment.id, retainComposerAttachmentFileForPreview(attachment));
+        }
         allowed.push(attachment);
         if (image) images += 1;
       } else rejected.push(attachment);
@@ -79,11 +91,14 @@ export function usePaAttachments(environmentIdValue: string, caps: PaCapabilitie
     if (allowed.length > 0) replace([...staged.current, ...allowed]);
   };
 
-  const uploadStaged = async () => {
+  const uploadStaged = async (replayKey?: string) => {
+    // A lost admission reply must replay the original payload, even if its pending uploads expired.
+    const replay =
+      replayKey === JSON.stringify(staged.current.map((item) => item.uploadedAttachmentId));
     const result: PaAttachment[] = [];
     for (const item of staged.current) {
       const id =
-        item.uploadEnvironmentId === environmentId && item.uploadedAttachmentId
+        replay && item.uploadEnvironmentId === environmentId && item.uploadedAttachmentId
           ? item.uploadedAttachmentId
           : await Effect.runPromise(uploadComposerAttachmentShared(environmentId, item));
       if (!active.current) return null;
@@ -131,18 +146,18 @@ export function usePaAttachments(environmentIdValue: string, caps: PaCapabilitie
     remove(id: string) {
       if (!active.current || uploadingRef.current) return;
       const removed = staged.current.filter((item) => item.id === id);
-      discard(removed);
+      release(removed);
       replace(staged.current.filter((item) => item.id !== id));
     },
     /** Uploads every pending attachment; null when one failed and the message should wait. */
-    async upload(): Promise<ReadonlyArray<PaAttachment> | null> {
+    async upload(replayKey?: string): Promise<ReadonlyArray<PaAttachment> | null> {
       if (!active.current || uploadingRef.current || (!enabled && staged.current.length > 0))
         return null;
       if (!staged.current.length) return [];
       uploadingRef.current = true;
       setUploading(true);
       setError(null);
-      return uploadStaged()
+      return uploadStaged(replayKey)
         .catch(() => {
           if (active.current) setError(gt("Could not upload the attachments"));
           return null;
@@ -157,7 +172,7 @@ export function usePaAttachments(environmentIdValue: string, caps: PaCapabilitie
       const ids = new Set(uploaded.map((item) => item.id));
       const wasSent = (item: DraftComposerAttachment) =>
         !!item.uploadedAttachmentId && ids.has(item.uploadedAttachmentId);
-      discard(staged.current.filter(wasSent));
+      release(staged.current.filter(wasSent));
       replace(staged.current.filter((item) => !wasSent(item)));
     },
   };

@@ -59,6 +59,7 @@ export function AndroidWorkspaceSidebar() {
           ) : tab === "bots" ? (
             <WorkspaceTabsContext value={context}>
               <PaBotsScreen
+                showCreateAction
                 sidebar
                 selectedBotKey={selectedBot}
                 renderFrame={(list) => (

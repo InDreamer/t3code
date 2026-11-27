@@ -80,11 +80,15 @@ export interface PaBotChatState {
   readonly respondingIds: ReadonlySet<string>;
   readonly queueBusyIds: ReadonlySet<string>;
   readonly clarifyAnswers: Readonly<Record<string, PaClarifyAnswers>>;
-  readonly sessionReasoning: {
-    readonly sessionId: string;
-    readonly effort: string;
-    readonly settingsVersion: number;
-  } | null;
+  readonly sessionReasoning: Readonly<
+    Record<
+      string,
+      {
+        readonly effort: string;
+        readonly settingsVersion: number;
+      }
+    >
+  >;
   /** Bumped when the Bot's settings or model change, so readers of them read again. */
   readonly settingsVersion: number;
 }
@@ -113,7 +117,7 @@ function initialState(sessionId: string | null): PaBotChatState {
     respondingIds: new Set(),
     queueBusyIds: new Set(),
     clarifyAnswers: {},
-    sessionReasoning: null,
+    sessionReasoning: {},
     settingsVersion: 0,
   };
 }
@@ -166,7 +170,8 @@ export function createPaBotChat(input: {
   const failedSends = new Map<string, { text: string; inputId: string; attachmentKey?: string }>();
   /** An admitted row can be reconciled by text, or by turn completion for rewritten prompts. */
   const pendingUserRows = new Map<string, Map<string, boolean>>();
-  const recoveredSessions = new Set<string>();
+  const recoveringSessions = new Set<string>();
+  let missingSession: { id: string; cause: unknown } | null = null;
   let pendingSessionCreate: { readonly title: string; readonly id: string } | null = null;
   const listeners = new Set<() => void>();
 
@@ -287,6 +292,17 @@ export function createPaBotChat(input: {
       ),
     }));
 
+  const setReasoning = (sessionId: string | null, effort: string) => {
+    if (!sessionId) return;
+    set((previous) => ({
+      ...previous,
+      sessionReasoning: {
+        ...previous.sessionReasoning,
+        [sessionId]: { effort, settingsVersion: previous.settingsVersion },
+      },
+    }));
+  };
+
   const loadTranscript = (
     sessionId: string,
     showSpinner: boolean,
@@ -371,8 +387,9 @@ export function createPaBotChat(input: {
 
   /** A session the engine no longer has (often a stale primary): move to one it does have. */
   const recoverMissingSession = async (missingId: string, cause: unknown) => {
-    if (recoveredSessions.has(missingId)) return;
-    recoveredSessions.add(missingId);
+    if (recoveringSessions.has(missingId) || !context.connected) return;
+    recoveringSessions.add(missingId);
+    set((previous) => ({ ...previous, initializationError: null }));
     try {
       const result = await client.listSessions(botId);
       if (disposed || state.activeSessionId !== missingId) return;
@@ -395,12 +412,24 @@ export function createPaBotChat(input: {
         sessionsCursor: result.nextCursor ?? null,
       }));
       if (!nextId) {
-        showError(missingId, paErrorMessage(cause, m(msg("This conversation no longer exists"))));
+        set((previous) => ({
+          ...previous,
+          initializationError: paErrorMessage(cause, m(msg("This conversation no longer exists"))),
+        }));
         return;
       }
       show(nextId);
     } catch (error) {
-      showError(missingId, paErrorMessage(error, m(msg("Could not connect to the bot session"))));
+      if (state.activeSessionId === missingId)
+        set((previous) => ({
+          ...previous,
+          initializationError: paErrorMessage(
+            error,
+            m(msg("Could not connect to the bot session")),
+          ),
+        }));
+    } finally {
+      recoveringSessions.delete(missingId);
     }
   };
 
@@ -452,13 +481,7 @@ export function createPaBotChat(input: {
               ...(event.model ? { model: event.model } : {}),
             });
           }
-          if (event.reasoningEffort) {
-            const effort = event.reasoningEffort;
-            set((previous) => ({
-              ...previous,
-              sessionReasoning: { sessionId, effort, settingsVersion: previous.settingsVersion },
-            }));
-          }
+          if (event.reasoningEffort) setReasoning(sessionId, event.reasoningEffort);
           return;
         case "turn.started":
           running = true;
@@ -494,6 +517,10 @@ export function createPaBotChat(input: {
           transcriptShown = true;
         }
         if (!retrying && paErrorReason(error) === "NotFound") {
+          closed = true;
+          stopFollow?.();
+          stopFollow = null;
+          missingSession = { id: sessionId, cause: error };
           void recoverMissingSession(sessionId, error);
           return;
         }
@@ -508,6 +535,10 @@ export function createPaBotChat(input: {
         );
       },
     });
+    if (closed) {
+      stop();
+      return;
+    }
     stopFollow = () => {
       closed = true;
       stop();
@@ -516,10 +547,17 @@ export function createPaBotChat(input: {
 
   /** Shows a session and follows its feed. */
   const show = (sessionId: string) => {
+    missingSession = null;
     set((previous) =>
       previous.activeSessionId === sessionId
         ? previous
-        : { ...previous, activeSessionId: sessionId, older: null, clarifyAnswers: {} },
+        : {
+            ...previous,
+            activeSessionId: sessionId,
+            older: null,
+            clarifyAnswers: {},
+            initializationError: null,
+          },
     );
     follow(sessionId);
   };
@@ -658,6 +696,7 @@ export function createPaBotChat(input: {
       ? null
       : parsePaClientSlashAction(text, commandsSupported() ? state.slashCommands : []);
     if (clientAction) {
+      if (clientAction.kind === "model-picker" && !openModelPicker) return false;
       set((previous) => ({ ...previous, sending: true }));
       try {
         if (restoreDraft)
@@ -773,7 +812,16 @@ export function createPaBotChat(input: {
       context = next;
       if (disposed || !next.capabilities || !next.connected) return;
       if (state.started) {
-        if (!initialized && (!previous.connected || (!previous.canOperate && next.canOperate)))
+        if (
+          missingSession &&
+          visibleHolders &&
+          (!previous.connected || (!previous.canOperate && next.canOperate))
+        ) {
+          void recoverMissingSession(missingSession.id, missingSession.cause);
+        } else if (
+          !initialized &&
+          (!previous.connected || (!previous.canOperate && next.canOperate))
+        )
           void initialize();
         if (next.unread && !previous.unread && state.activeSessionId) markRead();
         return;
@@ -787,11 +835,15 @@ export function createPaBotChat(input: {
       }
       return initialize();
     },
-    retryInitialization: initialize,
+    retryInitialization: () =>
+      missingSession
+        ? recoverMissingSession(missingSession.id, missingSession.cause)
+        : initialize(),
     holdVisible() {
       visibleHolders += 1;
       if (state.activeSessionId && context.unread) markRead();
-      if (!initialized && state.started) void initialize();
+      if (missingSession) void recoverMissingSession(missingSession.id, missingSession.cause);
+      else if (!initialized && state.started) void initialize();
       return () => {
         visibleHolders -= 1;
       };
@@ -875,6 +927,10 @@ export function createPaBotChat(input: {
             : previous,
         );
       }
+    },
+    failedAttachmentKey(sessionId: string, text: string) {
+      const attempt = failedSends.get(sessionId);
+      return attempt?.text === text.trim() ? attempt.attachmentKey : undefined;
     },
     send,
     /** Hands the draft to the running turn; one the turn ended too early to take is sent normally. */
@@ -1021,14 +1077,7 @@ export function createPaBotChat(input: {
     dismissError() {
       showError(state.activeSessionId, null);
     },
-    setReasoning(effort: string) {
-      const sessionId = state.activeSessionId;
-      if (!sessionId) return;
-      set((previous) => ({
-        ...previous,
-        sessionReasoning: { sessionId, effort, settingsVersion: previous.settingsVersion },
-      }));
-    },
+    setReasoning,
     /** The Bot's settings or model changed elsewhere: readers of them read again. */
     bumpSettings() {
       set((previous) => ({ ...previous, settingsVersion: previous.settingsVersion + 1 }));

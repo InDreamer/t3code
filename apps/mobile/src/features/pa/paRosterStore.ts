@@ -7,7 +7,7 @@ import { useEffect, useSyncExternalStore } from "react";
 import { AppState } from "react-native";
 
 import { m } from "../../i18n/messages";
-import { workspaceConnections, useWorkspaceEnvironments } from "../../state/workspace";
+import { workspaceConnections } from "../../state/workspace";
 import { paCreateBotPermissionAtom, paClient, paErrorMessage } from "./paApi";
 
 /** One environment's Bot roster as last read. */
@@ -51,6 +51,14 @@ function subscribe(listener: () => void) {
 
 const getEntries = () => entries;
 
+export function clearPaRosterEnvironment(environmentId: string) {
+  inFlight.delete(environmentId);
+  const next = new Map(entries);
+  if (!next.delete(environmentId)) return;
+  entries = next;
+  for (const listener of listeners) listener();
+}
+
 export function readPaRosterEntry(environmentId: string): PaRosterEntry {
   return entries.get(environmentId) ?? EMPTY_ENTRY;
 }
@@ -63,6 +71,7 @@ export function refreshPaRoster(environmentId: string): Promise<void> {
     ...entry,
     refreshing: entry.loadedAt !== null,
     loading: entry.loadedAt === null,
+    error: null,
   }));
   const read = paClient(environmentId)
     .listBots()
@@ -123,6 +132,7 @@ export function patchPaBot(
 }
 
 export function addPaBot(environmentId: string, bot: PaBotSummary) {
+  if (!entries.has(environmentId)) return;
   inFlight.delete(environmentId);
   setEntry(environmentId, (entry) => ({
     ...entry,
@@ -151,23 +161,6 @@ export function usePaBot(environmentId: string, botId: string) {
 
 /** Keeps the given environments' rosters current: now, and whenever the app comes back. */
 export function usePaRosterRefresh(environmentIds: ReadonlyArray<string>) {
-  const environments = useWorkspaceEnvironments();
-  const known = JSON.stringify(environments.map((environment) => environment.environmentId).sort());
-  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- removed connections release their cached roster and pending read
-  useEffect(() => {
-    const retained = new Set<string>(JSON.parse(known));
-    const next = new Map(entries);
-    for (const id of entries.keys()) {
-      if (!retained.has(id)) {
-        next.delete(id);
-        inFlight.delete(id);
-      }
-    }
-    if (next.size !== entries.size) {
-      entries = next;
-      for (const listener of listeners) listener();
-    }
-  }, [known]);
   const key = environmentIds.join("\u0000");
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- the engines change Bots outside this app, so rosters reread on mount and on return to the foreground
   useEffect(() => {
@@ -193,7 +186,7 @@ const permittedEnginesAtom = Atom.make((get) =>
   ),
 );
 
-export function usePaCreatableEngines(active = true) {
+export function usePaCreateOptions(active = true) {
   const environments = useAtomValue(permittedEnginesAtom);
   const rosters = usePaRosterEntries();
   const ids = JSON.stringify(environments.map((environment) => environment.environmentId));
@@ -203,7 +196,7 @@ export function usePaCreatableEngines(active = true) {
     const connected: string[] = JSON.parse(ids);
     for (const id of connected) if (!entries.has(id)) void refreshPaRoster(id);
   }, [active, ids]);
-  return environments.flatMap((environment) =>
+  const engines = environments.flatMap((environment) =>
     paCreatableInstances(rosters.get(environment.environmentId)?.instances ?? []).map(
       (instance) => ({
         key: JSON.stringify([environment.environmentId, instance.instanceId]),
@@ -213,4 +206,16 @@ export function usePaCreatableEngines(active = true) {
       }),
     ),
   );
+  return {
+    engines,
+    environments: environments.map(({ environmentId, environmentLabel }) => ({
+      environmentId,
+      environmentLabel,
+      entry: rosters.get(environmentId) ?? EMPTY_ENTRY,
+    })),
+  };
+}
+
+export function usePaCreatableEngines(active = true) {
+  return usePaCreateOptions(active).engines;
 }

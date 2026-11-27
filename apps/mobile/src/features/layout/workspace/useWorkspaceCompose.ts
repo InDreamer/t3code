@@ -18,8 +18,8 @@ export function useWorkspaceCompose() {
     const openCreate = () => {
       if (rootNavigationRef.isReady()) rootNavigationRef.navigate("PaCreateBot", {});
     };
-    return { label: gt("New bot"), onPress: openCreate } as const;
+    return { label: gt("Create bot"), onPress: openCreate } as const;
   }
   if (workspace.state.selectedTab !== "threads") return null;
-  return { label: gt("New chat"), onPress: startNewTask } as const;
+  return { label: gt("New chat"), headerLabel: gt("New task"), onPress: startNewTask } as const;
 }

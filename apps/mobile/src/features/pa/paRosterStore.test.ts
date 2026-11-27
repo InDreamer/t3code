@@ -2,7 +2,13 @@ import type { PaBotSummary } from "@t3tools/contracts";
 import { expect, it, vi } from "vite-plus/test";
 
 import type { PaClient } from "./paApi";
-import { addPaBot, patchPaBot, readPaRosterEntry, refreshPaRoster } from "./paRosterStore";
+import {
+  addPaBot,
+  clearPaRosterEnvironment,
+  patchPaBot,
+  readPaRosterEntry,
+  refreshPaRoster,
+} from "./paRosterStore";
 
 const { listBots } = vi.hoisted(() => ({ listBots: vi.fn<PaClient["listBots"]>() }));
 vi.mock("./paApi", () => ({ paClient: () => ({ listBots }) }));
@@ -53,4 +59,12 @@ it("preserves an accepted create and metadata patch over older roster reads", as
   afterPatch.resolve({ bots: [{ ...bot, pinned: true }], instances: [] });
   await latest;
   expect(readPaRosterEntry("env").refreshing).toBe(false);
+  const removedRead = Promise.withResolvers<Awaited<ReturnType<PaClient["listBots"]>>>();
+  listBots.mockReturnValueOnce(removedRead.promise);
+  const pending = refreshPaRoster("env");
+  clearPaRosterEnvironment("env");
+  removedRead.resolve({ bots: [bot], instances: [] });
+  await pending;
+  expect(readPaRosterEntry("env").bots).toEqual([]);
+  expect(readPaRosterEntry("env").loadedAt).toBeNull();
 });

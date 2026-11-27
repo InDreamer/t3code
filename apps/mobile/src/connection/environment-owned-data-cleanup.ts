@@ -37,6 +37,11 @@ export const layer = Layer.succeed(
         );
       return Effect.all(
         [
+          Effect.promise(async () => {
+            // The roster client depends on this connection runtime.
+            const { clearPaRosterEnvironment } = await import("../features/pa/paRosterStore");
+            clearPaRosterEnvironment(environmentId);
+          }),
           settle("outbox", clearThreadOutboxEnvironment),
           settle("drafts", clearComposerDraftsEnvironment),
           Effect.sync(() => clearThreadComposerErrorsForEnvironment(environmentId)),

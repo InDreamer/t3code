@@ -779,7 +779,13 @@ function PaBotSettings(props: {
                 tone="secondary"
                 icon="brain"
                 label={gt("Change model")}
-                onPress={() => navigation.navigate("PaModel", { environmentId, botId: bot.botId })}
+                onPress={() =>
+                  navigation.navigate("PaModel", {
+                    environmentId,
+                    botId: bot.botId,
+                    ...(bot.primarySessionId ? { sessionId: bot.primarySessionId } : {}),
+                  })
+                }
               />
             </View>
           ) : null}

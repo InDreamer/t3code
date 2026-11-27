@@ -207,6 +207,11 @@ describe("workspace root navigation", () => {
 const mocks = vi.hoisted(() => ({
   split: false,
   floating: false,
+  sidebar: false,
+  top: "Home",
+  canCreate: true,
+  rosterError: false,
+  navigate: vi.fn(),
   state: undefined as WorkspaceTabsState | undefined,
   openWorkspaceTab: (_tab: string) => {},
   backListeners: new Set<() => boolean>(),
@@ -222,7 +227,8 @@ vi.mock("react-native", () => ({
       return { remove: () => mocks.backListeners.delete(listener) };
     },
   },
-  Keyboard: { dismiss: () => undefined },
+  Keyboard: { dismiss: () => undefined, isVisible: () => false },
+  Platform: { OS: "android" },
   useWindowDimensions: () => ({ width: 400, height: 800 }),
   View: ({ children }: { children: ReactNode }) => createElement("div", null, children),
 }));
@@ -236,7 +242,14 @@ vi.mock("../AdaptiveWorkspaceLayout", () => ({
     startNewTask: () => undefined,
   }),
 }));
-vi.mock("@react-navigation/native", () => ({ useIsFocused: () => true }));
+vi.mock("@react-navigation/native", () => ({
+  useIsFocused: () => true,
+  useNavigationState: () => null,
+  useNavigation: () => ({
+    navigate: mocks.navigate,
+    getState: () => ({ index: 1, routes: [{ name: "Home" }, { name: mocks.top }] }),
+  }),
+}));
 vi.mock("../adaptive-workspace-context", () => ({
   useAdaptiveWorkspaceLayout: () => ({ openWorkspaceTab: mocks.openWorkspaceTab }),
 }));
@@ -245,7 +258,13 @@ vi.mock("./navigation-tabs", () => ({
 }));
 vi.mock("./WorkspaceTabsContext", () => ({
   WorkspaceTabsContext: createContext(null),
-  useWorkspaceTabs: () => ({ state: mocks.state, dispatch: () => undefined }),
+  useWorkspaceTabs: () => ({
+    state: mocks.state,
+    dispatch: () => undefined,
+    getScrollOffset: () => 0,
+    recordScrollOffset: () => undefined,
+    isTabActive: (tab: string) => mocks.state?.selectedTab === tab,
+  }),
 }));
 vi.mock("./WorkspaceExtraTab", () => ({
   WorkspaceExtraTab: function UsageProbe() {
@@ -269,20 +288,103 @@ vi.mock("../../pull-requests/PullRequestFilterMenuContext", () => ({
 }));
 vi.mock("../../pull-requests/PullRequestsScreen", () => ({ PullRequestsScreen: () => null }));
 vi.mock("../../issues/IssuesScreen", () => ({ IssuesScreen: () => null }));
-vi.mock("../../pa/PaBotsScreen", () => ({ PaBotsScreen: () => null }));
-vi.mock("./ListSearchToolbar.android", () => ({ ListSearchToolbar: () => null }));
+vi.mock("../../../components/ui/AppText", () => ({ AppText: "span" }));
+vi.mock("../../../components/ui/AppActivityIndicator", () => ({
+  AppActivityIndicator: () => null,
+}));
+vi.mock("../../../components/ui/Button", () => ({
+  Button: ({ label, onPress }: { label: string; onPress: () => void }) =>
+    createElement("button", { onClick: onPress }, label),
+}));
+vi.mock("../../../components/ui/Dialog", () => ({}));
+vi.mock("../../../components/ui/EmptyState", () => ({
+  EmptyState: ({ title, action }: { title: string; action?: ReactNode }) =>
+    createElement("div", null, title, action),
+}));
+vi.mock("../../../components/ui/RefreshControl", () => ({ RefreshControl: () => null }));
+vi.mock("../../../components/ui/useBarInset", () => ({ useContentTopInset: () => 0 }));
+vi.mock("../../../native/NativeScrollViewMarker", () => ({ NativeScrollView: () => null }));
+vi.mock("../../../native/native-layout-metrics", () => ({
+  useNativeColumnLayoutMetrics: () => null,
+}));
+vi.mock("../../../native/v5-workspace-context", () => ({
+  NativePrimaryColumnContext: createContext(null),
+}));
+vi.mock("../../../state/workspace", () => ({
+  useWorkspaceEnvironments: () => [
+    { environmentId: "env", isEnabled: true, connectionState: "connected" },
+  ],
+}));
+vi.mock("./useSearchScrollRestoration", () => ({ useSearchScrollRestoration: () => undefined }));
+vi.mock("./useSelectWorkspaceDetail", () => ({ useSelectWorkspaceDetail: () => vi.fn() }));
+vi.mock("../../threads/useMessageTimeFormatter", () => ({ useMessageTimeFormatter: () => String }));
+vi.mock("../../pa/paApi", () => ({}));
+vi.mock("../../pa/PaBotRow", () => ({
+  PaBotRow: ({ bot }: { bot: { name: string } }) => createElement("div", null, bot.name),
+}));
+vi.mock("../../pa/paRosterStore", () => ({
+  usePaCreatableEngines: () => (mocks.canCreate ? ["engine"] : []),
+  usePaRosterRefresh: () => undefined,
+  usePaRosterEntries: () =>
+    new Map([
+      [
+        "env",
+        {
+          instances: [{ online: true }],
+          bots: mocks.rosterError ? [] : [{ name: "Helper bot", botId: "helper" }],
+          loading: false,
+          error: mocks.rosterError ? "Offline" : null,
+          loadedAt: 1,
+        },
+      ],
+    ]),
+}));
+vi.mock("@legendapp/list/react-native", () => ({
+  LegendList: ({
+    data,
+    renderItem,
+    ListHeaderComponent,
+    ListFooterComponent,
+  }: {
+    data: { key: string }[];
+    renderItem: (props: { item: { key: string } }) => ReactNode;
+    ListHeaderComponent?: ReactNode;
+    ListFooterComponent?: ReactNode;
+  }) =>
+    createElement(
+      "div",
+      null,
+      ListHeaderComponent,
+      data.map((item) => createElement("div", { key: item.key }, renderItem({ item }))),
+      ListFooterComponent,
+    ),
+}));
+vi.mock("../../keyboard/hardwareKeyboardCommands", () => ({
+  useHardwareKeyboardCommand: () => undefined,
+}));
+vi.mock("../../home/WorkspaceConnectionTitle", () => ({ WorkspaceConnectionTitle: () => null }));
+vi.mock("./SharedSlotTitle", () => ({ SharedSlotTitle: () => null }));
+vi.mock("../../settings/settings-navigation", () => ({}));
+vi.mock("./AndroidWorkspaceTabsProvider", () => ({ useAndroidWorkspaceRoot: () => null }));
+vi.mock("./WorkspaceThreadSidebar", () => ({ WorkspaceThreadSidebar: () => null }));
+vi.mock("../../home/AndroidHomeFab", () => ({ AndroidHomeFabLayout: () => null }));
 vi.mock("./AndroidWorkspaceNavigation", () => ({
   AndroidWorkspaceNavigation: () => null,
   FloatingWorkspaceTabs: () => null,
 }));
 vi.mock("./WorkspaceNoTabs", () => ({ WorkspaceNoTabs: () => null }));
-vi.mock("../../../components/ui/Pane", () => ({ usePaneRole: () => "screen" }));
-vi.mock("./AndroidWorkspaceSidebar.android", () => ({ AndroidWorkspaceSidebar: () => null }));
+vi.mock("../../../components/ui/Pane", () => ({
+  usePaneRole: () => (mocks.sidebar ? "sidebar" : "screen"),
+}));
 vi.mock("../../../components/ui/WorkspaceAppBar.android", () => ({
   WorkspaceAppBarScope: ({ children }: { children: ReactNode }) => children,
 }));
 
 function setup(split: boolean, floating: boolean, state = selected("usage")) {
+  mocks.sidebar = false;
+  mocks.canCreate = true;
+  mocks.rosterError = false;
+  mocks.top = "Home";
   mocks.split = split;
   mocks.floating = floating;
   mocks.state = state;
@@ -339,3 +441,56 @@ it.each([
     }
   },
 );
+
+it.each([false, true])(
+  "opens Create from a populated Android Bots list (sidebar %s)",
+  (sidebar) => {
+    using _actEnvironment = setup(sidebar, false, selected("bots"));
+    mocks.sidebar = sidebar;
+    const container = document.createElement("div");
+    const root = createRoot(container);
+    using _root = { [Symbol.dispose]: () => act(() => root.unmount()) };
+    const show = () =>
+      act(() =>
+        root.render(
+          createElement(WorkspaceRootScreen, { key: String(mocks.canCreate) + mocks.rosterError }),
+        ),
+      );
+    show();
+    expect(container.textContent).toContain("Helper bot");
+    const create = [...container.querySelectorAll("button")].find(
+      (button) => button.textContent === "Create bot",
+    );
+    expect(create).toBeDefined();
+    act(() => create!.click());
+    expect(mocks.navigate).toHaveBeenCalledWith("PaCreateBot", {});
+    mocks.rosterError = true;
+    show();
+    expect(container.textContent).toContain("Offline");
+    expect(container.textContent).toContain("No bots yet");
+    expect(container.textContent).toContain("Create bot");
+    mocks.canCreate = false;
+    show();
+    expect(container.textContent).not.toContain("Create bot");
+  },
+);
+
+it("keeps Android sidebar search from swallowing Back over a sheet", () => {
+  using _actEnvironment = setup(
+    true,
+    false,
+    workspaceTabsReducer(selected("bots"), { type: "search", tab: "bots" }),
+  );
+  mocks.sidebar = true;
+  const root = createRoot(document.createElement("div"));
+  using _root = { [Symbol.dispose]: () => act(() => root.unmount()) };
+  act(() => root.render(createElement(WorkspaceRootScreen)));
+  for (const top of ["PaCreateBot", "PaBotSettings", "PaModel", "Settings"]) {
+    mocks.top = top;
+    expect(pressBack()).toBe(false);
+  }
+  for (const top of ["PaBot", "Thread", "PullRequest", "Issue", "Home"]) {
+    mocks.top = top;
+    expect(pressBack()).toBe(true);
+  }
+});

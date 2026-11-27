@@ -174,13 +174,16 @@ export function PaComposer(props: {
   const disabled = view.sessionId === null || !props.canOperate;
   const busy = props.sending || uploads.uploading;
   const hasAttachments = uploads.items.length > 0;
-  const slashCommands = capabilities?.commands.supported === false ? [] : props.slashCommands;
+  const commands = capabilities?.commands.supported === false ? [] : props.slashCommands;
+  const slashCommands = commands.filter(
+    (command) => props.canSelectModel || command.handling !== "client:model-picker",
+  );
   const slashQuery =
     !hasAttachments && !slashDismissed && draft.startsWith("/") && !/\s/.test(draft)
       ? draft.slice(1)
       : null;
-  const isClientCommand =
-    !hasAttachments && parsePaClientSlashAction(draft, slashCommands) !== null;
+  const clientAction = hasAttachments ? null : parsePaClientSlashAction(draft, commands);
+  const isClientCommand = clientAction !== null;
   const liveTurn = view.liveTurn;
   const sendMode = resolvePaComposerSendMode({
     running: view.running,
@@ -192,7 +195,12 @@ export function PaComposer(props: {
     attachmentsBlocked: hasAttachments && !uploads.enabled,
   });
   const hasDraft = draft.trim().length > 0 || hasAttachments;
-  const canSend = sendMode !== "blocked" && !disabled && !busy && hasDraft;
+  const canSend =
+    sendMode !== "blocked" &&
+    !disabled &&
+    !busy &&
+    hasDraft &&
+    (props.canSelectModel || clientAction?.kind !== "model-picker");
   const canInterrupt = capabilities?.execution.interrupt !== false;
   const canSteer =
     !hasAttachments && sendMode === "queue" && capabilities?.execution.steer === true;
@@ -200,20 +208,26 @@ export function PaComposer(props: {
   const showStopOnly =
     view.running && !isClientCommand && canInterrupt && (!hasDraft || sendMode === "blocked");
 
-  const sendToSession = async (sessionId: string) => {
+  const sendToSession = async (sessionId: string, steer: boolean) => {
     const current = () =>
       mounted.current && !chat.isDisposed() && chat.getState().activeSessionId === sessionId;
     await editorRef.current?.flushPendingInput();
     if (!current()) return;
     const text = chat.getState().drafts[sessionId] ?? "";
-    const attachments = await uploads.upload();
+    const action = parsePaClientSlashAction(text, commands);
+    if (!hasAttachments && action?.kind === "model-picker" && !props.canSelectModel) return;
+    if (steer) {
+      props.onSend();
+      await chat.steer();
+      return;
+    }
+    const attachments = await uploads.upload(chat.failedAttachmentKey(sessionId, text));
     if (!current() || attachments === null) return;
     const live = paBotChatView(chat.getState());
     const mode = resolvePaComposerSendMode({
       running: live.running,
       draft: text,
-      isClientCommand:
-        !attachments.length && parsePaClientSlashAction(text, slashCommands) !== null,
+      isClientCommand: !attachments.length && action !== null,
       hasOpenRequests: live.liveTurn.openRequests.length > 0,
       canQueue: capabilities?.execution.queue === true,
       hasAttachments: attachments.length > 0,
@@ -228,11 +242,11 @@ export function PaComposer(props: {
     });
     if (accepted && attachments.length) uploads.clear(attachments);
   };
-  const send = () => {
+  const send = (steer = false) => {
     if (!view.sessionId || !canSend || inFlight.current) return;
     setSlashDismissed(false);
     inFlight.current = true;
-    return sendToSession(view.sessionId).finally(() => {
+    return sendToSession(view.sessionId, steer).finally(() => {
       inFlight.current = false;
     });
   };
@@ -474,10 +488,7 @@ export function PaComposer(props: {
                   accessibilityLabel={gt("Steer the current turn")}
                   icon="arrow.turn.left.up"
                   disabled={!canSend}
-                  onPress={() => {
-                    setSlashDismissed(false);
-                    void chat.steer();
-                  }}
+                  onPress={() => void send(true)}
                 />
               ) : null}
               {showStopOnly ? null : (
