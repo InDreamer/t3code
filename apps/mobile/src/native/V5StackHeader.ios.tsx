@@ -156,7 +156,7 @@ export function V5StackHeader(props: {
   /** Workspace split columns share the vertical bar with the workspace tab bar. */
   readonly column?: "primary" | "detail";
   /** The workspace's compose action, shown as its own group in this column's bar. */
-  readonly onCompose?: () => void;
+  readonly compose?: { readonly label: string; readonly onPress: () => void } | null;
   /** UIKit morphs search items that share an identifier between bars as columns change. */
   readonly searchIdentifier?: string;
 }) {
@@ -244,13 +244,13 @@ export function V5StackHeader(props: {
     trailing.push(...bottom);
     bottom.length = 0;
   }
-  if (props.onCompose) {
+  if (props.compose) {
     const compose: HeaderItem = {
       type: "item",
       id: "workspace-compose",
-      title: gt("New task"),
+      title: props.compose.label,
       icon: { type: "sfSymbol", name: "square.and.pencil" },
-      onPress: props.onCompose,
+      onPress: props.compose.onPress,
     };
     if (trailing.length)
       trailing.push({ type: "spacer", id: "compose-group", sizing: "fixed", width: 8 });

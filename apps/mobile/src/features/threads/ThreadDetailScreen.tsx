@@ -140,11 +140,7 @@ import { assistantCitationDraftWithinLimit } from "../../lib/composerContext";
 import { serializeAssistantCitation } from "@t3tools/shared/assistantCitations";
 import type { AssistantCitation } from "@t3tools/contracts";
 import { RenderErrorBoundary, RenderFailureView } from "../../components/RenderErrorBoundary";
-import {
-  ANDROID_READING_MAX_WIDTH,
-  CHAT_CONTENT_MAX_WIDTH,
-  type LayoutVariant,
-} from "../../lib/layout";
+import { chatContentMaxWidth, type LayoutVariant } from "../../lib/layout";
 import { editPendingThreadMessage } from "../../state/edit-pending-thread-message";
 import { environmentCatalog } from "../../connection/catalog";
 import { deviceEnvironment } from "../../state/device";
@@ -1239,12 +1235,7 @@ function ThreadDetailBody(
   );
   const layoutVariant = props.layoutVariant ?? "compact";
   const isSplitLayout = layoutVariant !== "compact";
-  const contentMaxWidth =
-    Platform.OS === "android"
-      ? ANDROID_READING_MAX_WIDTH
-      : isSplitLayout
-        ? CHAT_CONTENT_MAX_WIDTH
-        : undefined;
+  const contentMaxWidth = chatContentMaxWidth(Platform.OS, isSplitLayout);
   const providerSubagentProvider = props.serverConfig?.providers.find(
     (provider) => provider.instanceId === props.selectedThread.modelSelection.instanceId,
   );

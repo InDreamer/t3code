@@ -19,6 +19,7 @@ export function SecretTextInput({ onMount, secret = true, ...props }: SecretText
         value={props.value}
         onChangeText={props.onChangeText}
         editable={props.editable}
+        maxLength={props.maxLength}
         secureTextEntry={secret && !revealed}
         autoCorrect={false}
         autoCapitalize="none"

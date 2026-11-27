@@ -43,6 +43,11 @@ import { IssueEditScreen } from "./features/issues/IssueEditScreen";
 import { IssueLabelsScreen } from "./features/issues/IssueLabelsScreen";
 import { IssueFilterSearchScreen } from "./features/issues/IssueFilterSearchScreen";
 import { IssueRouteScreen } from "./features/issues/IssueRouteScreen";
+import { PaBotRouteScreen } from "./features/pa/PaBotRouteScreen";
+import { PaBotSettingsSheet } from "./features/pa/PaBotSettingsSheet";
+import { PaCreateBotSheet } from "./features/pa/PaCreateBotSheet";
+import { PaModelSheet } from "./features/pa/PaModelSheet";
+import { PaSessionsSheet } from "./features/pa/PaSessionsSheet";
 import {
   RenderErrorBoundary,
   RenderFailureView,
@@ -653,6 +658,28 @@ const RootStackConfig = createWorkspaceStackNavigator({
     IssueFilterSearch: createNativeStackScreen({
       screen: IssueFilterSearchScreen,
       options: SEARCH_SHEET_ROUTE,
+    }),
+    PaBot: createNativeStackScreen({
+      screen: PaBotRouteScreen,
+      linking: "bots/:environmentId/:botId",
+      options: pageRoute({ duoMinimize: "never" }),
+    }),
+    PaSessions: createNativeStackScreen({
+      screen: PaSessionsSheet,
+      options: SEARCH_SHEET_ROUTE,
+    }),
+    PaModel: createNativeStackScreen({
+      screen: PaModelSheet,
+      options: SEARCH_SHEET_ROUTE,
+    }),
+    PaBotSettings: createNativeStackScreen({
+      screen: PaBotSettingsSheet,
+      options: sheetRoute({ detent: "full", android: "fullScreen" }),
+    }),
+    PaCreateBot: createNativeStackScreen({
+      screen: PaCreateBotSheet,
+      linking: "bots/new",
+      options: sheetRoute({ detent: "full", android: "fullScreen" }),
     }),
     Thread: createNativeStackScreen({
       screen: ThreadRouteScreen,

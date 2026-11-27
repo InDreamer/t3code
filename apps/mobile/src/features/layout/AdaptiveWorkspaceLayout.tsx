@@ -16,7 +16,12 @@ import { threadSelectionDeferral } from "./deferred-navigation";
 import { uuidv4 } from "../../lib/uuid";
 import { EnvironmentId, ThreadId, type SidebarProjectGroupingMode } from "@t3tools/contracts";
 import { useAtomValue } from "@effect/atom-react";
-import { NavigationContext, NavigationRouteContext, useNavigation } from "@react-navigation/native";
+import {
+  NavigationContext,
+  NavigationRouteContext,
+  useNavigation,
+  useNavigationState,
+} from "@react-navigation/native";
 import {
   use,
   useEffect,
@@ -84,6 +89,8 @@ import {
   type WorkspaceDetailSheet,
 } from "./workspace/workspace-detail-selection";
 import { startOpeningDetail } from "./workspace/useSelectWorkspaceDetail";
+import { PaBotsScreen } from "../pa/PaBotsScreen";
+import { selectedPaBotKey } from "../pa/paBotParams";
 import { useWorkspaceTabs } from "./workspace/WorkspaceTabsContext";
 import { HomeListOptionsProvider } from "../home/home-list-options";
 import { buildHomeProjectScopes, resolveHomeProjectFilterScope } from "../home/homeThreadList";
@@ -1046,8 +1053,15 @@ function AdaptiveWorkspaceLayoutContent(
                   />
                 )}
               >
-                {/* Without a sidebar route (iPadOS before 26) the columns draw the thread list. */}
-                {sidebar ?? <WorkspaceThreadSidebar />}
+                {sidebar ??
+                  (props.workspaceRouteName === "PaBot" ||
+                  (props.workspaceRouteName === "Home" &&
+                    !workspace?.settingsOpen &&
+                    workspace?.state.selectedTab === "bots") ? (
+                    <PaBotSidebar />
+                  ) : (
+                    <WorkspaceThreadSidebar />
+                  ))}
               </RenderErrorBoundary>
             </PaneContext>
             {/* Keep the pill under the content throughout the sidebar's clipping animation. */}
@@ -1199,4 +1213,9 @@ function AdaptiveWorkspaceLayoutContent(
       </AdaptiveWorkspaceContext>
     </HomeListOptionsProvider>
   );
+}
+
+function PaBotSidebar() {
+  const selectedKey = useNavigationState(selectedPaBotKey);
+  return <PaBotsScreen sidebar showCreateAction selectedBotKey={selectedKey} />;
 }

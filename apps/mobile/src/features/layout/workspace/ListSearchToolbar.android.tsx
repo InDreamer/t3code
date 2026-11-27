@@ -2,7 +2,11 @@ import { useNavigation } from "@react-navigation/native";
 import { useGT } from "gt-react-native";
 import { useEffect } from "react";
 import { BackHandler, Keyboard } from "react-native";
+import { usePaneRole } from "../../../components/ui/Pane";
+import { usePaCreatableEngines } from "../../pa/paRosterStore";
 import { AppBar } from "../../../components/ui/AppBar";
+import { AppText as Text } from "../../../components/ui/AppText";
+import { useAndroidControlSizing } from "../../../components/ui/useAndroidControlSizing";
 import { appBarMenuItemsFromActions } from "../../../components/ui/menuActionItems";
 import { useHardwareKeyboardCommand } from "../../keyboard/hardwareKeyboardCommands";
 import { WorkspaceConnectionTitle } from "../../home/WorkspaceConnectionTitle";
@@ -12,15 +16,18 @@ import { useWorkspaceTabs } from "./WorkspaceTabsContext";
 import type { PullRequestFilterMenu } from "../../pull-requests/PullRequestListFilters";
 import { openSettings } from "../../settings/settings-navigation";
 
-/** Pull request and issue search share the thread list's Android header. */
+/** Pull request, issue and Bot search share the thread list's Android header. */
 export function ListSearchToolbar(props: {
-  readonly tab: SharedSlotTab;
+  readonly tab: SharedSlotTab | "bots";
   readonly filters?: PullRequestFilterMenu | null;
   readonly onRequestVisibility?: () => void;
 }) {
   const gt = useGT();
   const navigation = useNavigation();
+  const { scale } = useAndroidControlSizing();
   const { filters, tab: section } = props;
+  const sidebar = usePaneRole() === "sidebar";
+  const canCreate = usePaCreatableEngines(section === "bots").length > 0;
   const workspace = useWorkspaceTabs()!;
   const { dispatch, getScrollOffset, recordScrollOffset, isTabActive } = workspace;
   const { onRequestVisibility } = props;
@@ -49,14 +56,14 @@ export function ListSearchToolbar(props: {
       // Frozen Home screens stay mounted under a detail route or another tab,
       // so back only applies while this list is in front.
       const state = navigation.getState();
-      if (!state || state.routes[state.index]?.name !== "Home" || !isTabActive(section))
+      if ((!sidebar && state?.routes[state.index]?.name !== "Home") || !isTabActive(section))
         return false;
       if (Keyboard.isVisible()) Keyboard.dismiss();
       else closeSearch();
       return true;
     });
     return () => subscription.remove();
-  }, [searching, closeSearch, navigation, isTabActive, section]);
+  }, [searching, closeSearch, navigation, isTabActive, section, sidebar]);
   return (
     <AppBar
       title="T3 Code"
@@ -64,13 +71,42 @@ export function ListSearchToolbar(props: {
         <WorkspaceConnectionTitle
           grow
           onPress={() => openSettings(navigation, "SettingsEnvironments")}
-          brand={<SharedSlotTitle tab={section} />}
+          brand={
+            section === "bots" ? (
+              <Text
+                numberOfLines={1}
+                maxFontSizeMultiplier={1.4}
+                className="font-t3-bold text-foreground"
+                style={{ fontSize: 20 * scale, letterSpacing: -0.4 * scale }}
+              >
+                {gt("Bots", { $context: "navigation tab, personal agent bots" })}
+              </Text>
+            ) : (
+              <SharedSlotTitle tab={section} />
+            )
+          }
         />
+      }
+      actions={
+        section === "bots" && canCreate
+          ? [
+              {
+                icon: "plus",
+                accessibilityLabel: gt("Create bot"),
+                onPress: () => navigation.navigate("PaCreateBot", {}),
+              },
+            ]
+          : undefined
       }
       search={{
         value: tab.query,
         onChangeText: (query) => dispatch({ type: "query", tab: section, query }),
-        placeholder: section === "issues" ? gt("Search issues") : gt("Search pull requests"),
+        placeholder:
+          section === "issues"
+            ? gt("Search issues")
+            : section === "bots"
+              ? gt("Search bots")
+              : gt("Search pull requests"),
         active: searching,
         onOpen: openSearch,
         onClose: closeSearch,

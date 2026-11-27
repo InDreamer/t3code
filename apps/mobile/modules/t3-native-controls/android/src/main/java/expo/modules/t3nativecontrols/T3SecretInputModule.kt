@@ -5,6 +5,7 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.os.Build
 import android.text.Editable
+import android.text.InputFilter
 import android.text.InputType
 import android.text.TextWatcher
 import android.text.method.PasswordTransformationMethod
@@ -42,6 +43,9 @@ class T3SecretInputModule : Module() {
       Prop("cursorColor") { view: T3SecretInputView, value: Int -> view.setCursorColor(value) }
       Prop("fontSize") { view: T3SecretInputView, value: Float ->
         view.input.setTextSize(TypedValue.COMPLEX_UNIT_DIP, value)
+      }
+      Prop("maxLength") { view: T3SecretInputView, value: Int? ->
+        view.input.filters = if (value == null) emptyArray() else arrayOf(InputFilter.LengthFilter(value))
       }
       Prop("editable") { view: T3SecretInputView, value: Boolean -> view.input.isEnabled = value }
       Prop("revealed") { view: T3SecretInputView, value: Boolean -> view.setRevealed(value) }

@@ -54,6 +54,7 @@ import {
 } from "../../state/entities";
 import { useThreadSearch } from "../../state/queries";
 import { requestThreadMessageJump } from "../threads/threadMessageJump";
+import { usePaCreatableEngines } from "../pa/paRosterStore";
 import { useCanShareWithGuest } from "../threads/useCanShareWithGuest";
 import { threadEnvironment } from "../../state/threads";
 import { useAtomCommand } from "../../state/use-atom-command";
@@ -98,6 +99,8 @@ const ACTION_ICONS: Record<string, AppSymbolName> = {
   appearance: "paintbrush",
   environments: "desktopcomputer",
   usage: "chart.bar.xaxis",
+  bots: "brain",
+  createBot: "plus",
   archive: "archivebox",
   files: "doc.text",
   terminal: "terminal",
@@ -287,6 +290,7 @@ export function CommandPalette(props: {
     supportsTriage: (environmentId) =>
       serverConfigs.get(environmentId)?.environment.capabilities.triage === true,
   });
+  const canCreateBot = usePaCreatableEngines().length > 0;
   const canTriage =
     useAtomValue(serverEnvironment.prepareTriage.permissionAtom(triageEnvironmentId)) &&
     triageEnvironmentId !== null &&
@@ -348,6 +352,24 @@ export function CommandPalette(props: {
         searchTerms: ["limits", "accounts", "quota"],
         run: () => openSettings(navigation, "SettingsUsage"),
       },
+      {
+        key: "bots",
+        kind: "action",
+        title: gt("Open bots"),
+        searchTerms: ["personal agent", "assistant", "hermes", "pa"],
+        run: () => selectTab("bots"),
+      },
+      ...(canCreateBot
+        ? [
+            {
+              key: "createBot",
+              kind: "action" as const,
+              title: gt("Create bot"),
+              searchTerms: ["personal agent", "assistant", "new bot"],
+              run: () => navigation.navigate("PaCreateBot", {}),
+            },
+          ]
+        : []),
       {
         key: "archive",
         kind: "action",
@@ -499,6 +521,7 @@ export function CommandPalette(props: {
     activeThreadRef,
     environments.length,
     canTriage,
+    canCreateBot,
     canShareWithGuest,
     navigation,
     projects,

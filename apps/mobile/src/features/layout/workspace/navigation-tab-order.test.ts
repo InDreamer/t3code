@@ -1,3 +1,4 @@
+import * as NodeFS from "node:fs";
 import { describe, expect, it } from "vite-plus/test";
 import {
   NAVIGATION_TAB_ORDER,
@@ -14,6 +15,33 @@ import {
 } from "./navigation-tab-order";
 
 describe("navigation tab order", () => {
+  it("registers every workspace tab with a native title and icon on both platforms", () => {
+    const module = "../../../../modules/t3-native-controls/";
+    const swift = NodeFS.readFileSync(
+      new URL(module + "ios/T3SidebarTabBarView.swift", import.meta.url),
+      "utf8",
+    );
+    const kotlin = NodeFS.readFileSync(
+      new URL(
+        module +
+          "android/src/main/java/expo/modules/t3nativecontrols/T3WorkspaceNavigationModule.kt",
+        import.meta.url,
+      ),
+      "utf8",
+    );
+    const labels = swift.slice(swift.indexOf("let labels ="), swift.indexOf("let symbols ="));
+    const icons = swift.slice(
+      swift.indexOf("let symbols ="),
+      swift.indexOf("let item = UITabBarItem"),
+    );
+    for (const tab of NAVIGATION_TAB_ORDER) {
+      expect(labels).toContain(`"${tab}": "`);
+      expect(icons.includes(`"${tab}": "`) || icons.includes(`tab == "${tab}" ?`)).toBe(true);
+      expect(kotlin).toContain(`"${tab}" -> "`);
+      expect(kotlin).toContain(`"${tab}" -> R.drawable.`);
+    }
+  });
+
   it("enables customization only above four registered sections, excluding Settings", () => {
     expect(navigationCustomizationAvailable()).toBe(false);
     expect(navigationCustomizationAvailable(3)).toBe(false);
@@ -25,7 +53,7 @@ describe("navigation tab order", () => {
   it("fills missing sections and drops removed placeholders, duplicates, and Settings", () => {
     expect(
       resolveNavigationTabOrder(["usage", "home", "inbox", "settings", "usage", null]),
-    ).toEqual(["usage", "threads", "pullRequests", "issues"]);
+    ).toEqual(["usage", "threads", "pullRequests", "issues", "bots"]);
     expect(resolveNavigationTabOrder()).toEqual(NAVIGATION_TAB_ORDER);
   });
 
@@ -51,9 +79,12 @@ describe("navigation tab order", () => {
   it("shows every real section without overflow and keeps Settings selected during editing", () => {
     // Pull requests and issues share a place, so the bar is always given one of them as hidden.
     const absent = ["issues"];
-    expect(visibleNavigationTabs(undefined, absent)).toEqual(
-      NAVIGATION_TAB_ORDER.filter((tab) => tab !== "issues"),
-    );
+    expect(visibleNavigationTabs(undefined, absent)).toEqual([
+      "threads",
+      "pullRequests",
+      "usage",
+      "bots",
+    ]);
     expect(overflowNavigationTabs(undefined, absent)).toEqual([]);
     expect(selectedNavigationTab(undefined, "threads", true)).toBe("settings");
     expect(selectedNavigationTab(undefined, "usage", false, absent)).toBe("usage");
@@ -63,7 +94,12 @@ describe("navigation tab order", () => {
   it("removes hidden sections from navigation and restores their saved positions", () => {
     const order = moveNavigationTab(undefined, "usage", 0);
     const hidden = toggleNavigationTabVisibility([], "usage");
-    expect(enabledNavigationTabs(order, hidden)).toEqual(["threads", "pullRequests", "issues"]);
+    expect(enabledNavigationTabs(order, hidden)).toEqual([
+      "threads",
+      "pullRequests",
+      "issues",
+      "bots",
+    ]);
     expect(toggleNavigationTabVisibility(hidden, "usage")).toEqual([]);
     expect(visibleNavigationTabs(order, [], 5)).toEqual(order);
     expect(enabledNavigationTabs(undefined, ["home", "inbox", "settings"])).toEqual(

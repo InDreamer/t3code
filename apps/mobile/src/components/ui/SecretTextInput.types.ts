@@ -9,6 +9,7 @@ export interface SecretTextInputProps {
   readonly onChangeText: (value: string) => void;
   /** Receives the field's current text, so a submit never uses a stale render of it. */
   readonly onSubmitEditing: (value: string) => void;
+  readonly maxLength?: number;
   readonly editable: boolean;
   /** False shows the text with no eye toggle, for a value such as an email. Defaults to true. */
   readonly secret?: boolean;

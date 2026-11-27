@@ -13,6 +13,8 @@ import { PullRequestsScreen } from "../../pull-requests/PullRequestsScreen";
 import { ListSearchToolbar } from "./ListSearchToolbar.android";
 import { IssuesScreen } from "../../issues/IssuesScreen";
 import { selectedIssueKey } from "../../issues/issueParams";
+import { selectedPaBotKey } from "../../pa/paBotParams";
+import { PaBotsScreen } from "../../pa/PaBotsScreen";
 import { selectedPullRequestKey } from "../../pull-requests/pullRequestSelection";
 import { AndroidHomeFabLayout } from "../../home/AndroidHomeFab";
 import { useAdaptiveWorkspaceLayout } from "../adaptive-workspace-context";
@@ -32,6 +34,7 @@ export function AndroidWorkspaceSidebar() {
   const { revealPrimarySidebar, startNewTask } = useAdaptiveWorkspaceLayout();
   const selectedPullRequest = useNavigationState(selectedPullRequestKey);
   const selectedIssue = useNavigationState(selectedIssueKey);
+  const selectedBot = useNavigationState(selectedPaBotKey);
   // Settings and the one-page tabs cover the sidebar.
   const coveredByPage =
     (useAndroidWorkspaceRoot()?.settingsOpen ?? false) ||
@@ -53,6 +56,19 @@ export function AndroidWorkspaceSidebar() {
             </AndroidHomeFabLayout>
           ) : tab === "usage" || tab === "workflows" ? (
             <View className="flex-1 bg-screen" />
+          ) : tab === "bots" ? (
+            <WorkspaceTabsContext value={context}>
+              <PaBotsScreen
+                sidebar
+                selectedBotKey={selectedBot}
+                renderFrame={(list) => (
+                  <View className="flex-1 bg-header">
+                    <ListSearchToolbar tab="bots" onRequestVisibility={revealPrimarySidebar} />
+                    <ScreenContent insetHorizontal>{list}</ScreenContent>
+                  </View>
+                )}
+              />
+            </WorkspaceTabsContext>
           ) : tab === "issues" ? (
             <WorkspaceTabsContext value={context}>
               <IssuesScreen

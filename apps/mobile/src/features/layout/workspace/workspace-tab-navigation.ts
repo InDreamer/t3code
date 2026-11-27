@@ -14,6 +14,7 @@ type RouteLike = {
 type ThreadSelection = NonNullable<WorkspaceSelections["threads"]>;
 type PullRequestSelection = NonNullable<WorkspaceSelections["pullRequests"]>;
 type IssueSelection = NonNullable<WorkspaceSelections["issues"]>;
+type BotSelection = NonNullable<WorkspaceSelections["bots"]>;
 
 /** Opened when Settings has columns and none of its pages has been opened yet. */
 export const DEFAULT_SETTINGS_PAGE = "SettingsEnvironments" satisfies SettingsPageTarget;
@@ -39,11 +40,12 @@ export function rememberedSettingsPage(selections: WorkspaceSelections): Setting
     : DEFAULT_SETTINGS_PAGE;
 }
 
-/** Whether a remembered chat, pull request or issue can still be opened. */
+/** Whether a remembered chat, pull request, issue or Bot can still be opened. */
 export interface WorkspaceSelectionCheck {
   readonly thread: (selection: ThreadSelection) => boolean;
   readonly pullRequest: (selection: PullRequestSelection) => boolean;
   readonly issue: (selection: IssueSelection) => boolean;
+  readonly bot: (selection: BotSelection) => boolean;
 }
 
 function stringParam(params: object | undefined, key: string) {
@@ -110,7 +112,7 @@ function sameIssue(left: IssueSelection | undefined, right: Omit<IssueSelection,
 }
 
 /**
- * The page each tab shows in a root route chain: the newest chat, pull request and issue, and
+ * The page each tab shows in a root route chain: the newest chat, pull request, issue and Bot, and
  * the Settings page directly above the Settings route. Returns `previous` when nothing changed.
  */
 export function workspaceSelectionsIn(
@@ -152,6 +154,18 @@ export function workspaceSelectionsIn(
   if (issue && (!sameIssue(next.issues, issue) || next.issues?.key !== issueRoute?.key)) {
     next = { ...next, issues: { ...issue, key: issueRoute?.key } };
   }
+  const botRoute = routes.findLast((route) => route.name === "PaBot");
+  const botEnvironmentId = stringParam(botRoute?.params, "environmentId");
+  const botId = stringParam(botRoute?.params, "botId");
+  if (
+    botEnvironmentId &&
+    botId &&
+    (next.bots?.environmentId !== botEnvironmentId ||
+      next.bots.botId !== botId ||
+      next.bots.key !== botRoute?.key)
+  ) {
+    next = { ...next, bots: { environmentId: botEnvironmentId, botId, key: botRoute?.key } };
+  }
   const list = routes.findIndex((route) => route.name === "Settings");
   const page = list < 0 ? undefined : routes[list + 1];
   if (
@@ -189,7 +203,7 @@ function keyedPage<Route extends RouteLike>(route: Route): Route & { readonly ke
 
 function detailRoute(
   state: { readonly routes: readonly RouteLike[] },
-  tab: "threads" | "pullRequests" | "issues",
+  tab: "threads" | "pullRequests" | "issues" | "bots",
   selections: WorkspaceSelections,
   check: WorkspaceSelectionCheck,
   seedPullRequest?: (identity: Omit<PullRequestSelection, "key">) => object,
@@ -218,6 +232,18 @@ function detailRoute(
         name: "Thread",
         params: { environmentId: thread.environmentId, threadId: thread.threadId },
       }
+    );
+  }
+  if (tab === "bots") {
+    const bot = selections.bots;
+    if (!bot || !check.bot(bot)) return undefined;
+    return (
+      state.routes.find(
+        (route) =>
+          route.name === "PaBot" &&
+          stringParam(route.params, "environmentId") === bot.environmentId &&
+          stringParam(route.params, "botId") === bot.botId,
+      ) ?? { key: bot.key, name: "PaBot", params: identityOf(bot) }
     );
   }
   if (tab === "issues") {
@@ -283,7 +309,7 @@ export function workspaceTabNavigationState<
   }
   const home = state.routes.find((route) => route.name === "Home") ?? { name: "Home" };
   const detail =
-    options.columns && (tab === "threads" || tab === "pullRequests")
+    options.columns && (tab === "threads" || tab === "pullRequests" || tab === "bots")
       ? detailRoute(state, tab, selections, options.check, options.seedPullRequest)
       : undefined;
   const routes = [keyed(home), ...(detail ? [keyedPage(detail)] : []), ...overlays];

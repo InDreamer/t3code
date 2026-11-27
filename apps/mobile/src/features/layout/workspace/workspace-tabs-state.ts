@@ -16,7 +16,7 @@ export type WorkspaceTab = NavigationTab;
 export type WorkspaceSearchTab = WorkspaceTab | "settings";
 export type WorkspaceSearchMode = "resting" | "active" | "expanded";
 
-/** Settings, Chats, pull requests and issues pair a list with a detail column; the others are one page. */
+/** Settings, Chats, pull requests, issues and Bots pair a list with a detail column; the others are one page. */
 export function workspaceUsesColumns(tab: WorkspaceTab, settingsOpen = false) {
   return settingsOpen || (tab !== "usage" && tab !== "workflows");
 }
@@ -41,6 +41,7 @@ function emptyTab(): WorkspaceTabState {
 /** The list a workspace page belongs to. */
 export function workspaceTabOf(routeName: string | undefined): WorkspaceTab {
   if (routeName === "Issue") return "issues";
+  if (routeName === "PaBot") return "bots";
   return routeName === "PullRequest" ? "pullRequests" : "threads";
 }
 
@@ -56,6 +57,7 @@ export function initialWorkspaceTabsState(
       issues: emptyTab(),
       workflows: emptyTab(),
       usage: emptyTab(),
+      bots: emptyTab(),
       settings: emptyTab(),
     },
   };

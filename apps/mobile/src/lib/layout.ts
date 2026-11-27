@@ -16,6 +16,14 @@ const SPLIT_SIDEBAR_DEFAULT_MAX_WIDTH = 380;
 export const CHAT_CONTENT_MAX_WIDTH = 960;
 // Limit Android reading width for wide foldables and keyboard-open split views.
 export const ANDROID_READING_MAX_WIDTH = 640;
+export function chatContentMaxWidth(platform: string, split: boolean) {
+  return platform === "android"
+    ? ANDROID_READING_MAX_WIDTH
+    : split
+      ? CHAT_CONTENT_MAX_WIDTH
+      : undefined;
+}
+
 // min-h-8 uses the 14px rem configured in metro.config.js.
 export const THREAD_WORK_ROW_MIN_HEIGHT = 28;
 

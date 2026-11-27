@@ -59,6 +59,7 @@ function withoutRouteKeys(saved: WorkspaceSelections | undefined): WorkspaceSele
     threads,
     pullRequests,
     issues,
+    bots,
     settingsKey: _,
     threadsDraft: _draft,
     ...rest
@@ -68,6 +69,7 @@ function withoutRouteKeys(saved: WorkspaceSelections | undefined): WorkspaceSele
     ...(threads ? { threads: omitKey(threads) } : {}),
     ...(pullRequests ? { pullRequests: omitKey(pullRequests) } : {}),
     ...(issues ? { issues: omitKey(issues) } : {}),
+    ...(bots ? { bots: omitKey(bots) } : {}),
   };
 }
 
@@ -124,6 +126,7 @@ export const workspaceSelectionCheck: WorkspaceSelectionCheck = {
   },
   pullRequest: (selection) => !environmentRemoved(selection.environmentId),
   issue: (selection) => !environmentRemoved(selection.environmentId),
+  bot: (selection) => !environmentRemoved(selection.environmentId),
 };
 
 /** Whether the window lays the workspace out in columns, by the rule the layout itself uses. */

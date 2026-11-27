@@ -20,6 +20,7 @@ const pullRequest = {
   name: "PullRequest",
   params: { environmentId: "env", projectId: "project", repository: "o/r", number: 7 },
 };
+const bot = { key: "bot", name: "PaBot", params: { environmentId: "env", botId: "hermes:news" } };
 const settings = { key: "settings", name: "Settings" };
 const requireFromNative = NodeModule.createRequire(
   NodeModule.createRequire(import.meta.url).resolve("@react-navigation/native/package.json"),
@@ -32,7 +33,12 @@ const { StackRouter } = NodeModule.createRequire(
 )("@react-navigation/routers") as {
   readonly StackRouter: typeof import("@react-navigation/native").StackRouter;
 };
-const available = { thread: () => true, pullRequest: () => true, issue: () => true };
+const available = {
+  thread: () => true,
+  pullRequest: () => true,
+  issue: () => true,
+  bot: () => true,
+};
 const names = (state: { routes: readonly { name: string }[] }) =>
   state.routes.map((route) => route.name);
 
@@ -127,6 +133,21 @@ describe("opening a workspace tab", () => {
     }
   });
 
+  it("reopens the remembered Bot beside the list, and only while its environment remains", () => {
+    const selections = workspaceSelectionsIn([home, bot], {});
+    expect(selections.bots).toEqual({ ...bot.params, key: "bot" });
+    const reopened = workspaceTabNavigationState({ routes: [home] }, "bots", selections, columns);
+    expect(reopened.routes.at(-1)).toMatchObject({ key: "bot", name: "PaBot", params: bot.params });
+    expect(
+      names(
+        workspaceTabNavigationState({ routes: [home] }, "bots", selections, {
+          columns: true,
+          check: { ...available, bot: () => false },
+        }),
+      ),
+    ).toEqual(["Home"]);
+  });
+
   it("keeps the route that is already open, so re-selecting a tab doesn't rebuild it", () => {
     const next = workspaceTabNavigationState(
       { routes: [home, thread] },
@@ -179,7 +200,12 @@ describe("opening a workspace tab", () => {
   });
 
   it("falls back to the list for a chat that no longer exists, or an unknown Settings page", () => {
-    const missing = { thread: () => false, pullRequest: () => true, issue: () => true };
+    const missing = {
+      thread: () => false,
+      pullRequest: () => true,
+      issue: () => true,
+      bot: () => true,
+    };
     expect(
       names(
         workspaceTabNavigationState(

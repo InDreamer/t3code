@@ -14,6 +14,7 @@ const ATTACHMENT_MENU_ACTIONS: MenuAction[] = [
 export function ComposerAttachmentButton(props: {
   readonly disabled?: boolean;
   readonly size?: "regular" | "large";
+  readonly supportsImages?: boolean;
   readonly supportsFiles: boolean;
   readonly onPickMedia: () => Promise<void>;
   readonly onPickFiles: () => Promise<void>;
@@ -21,14 +22,18 @@ export function ComposerAttachmentButton(props: {
   const gt = useGT();
   const m = useMessages();
   const { scale } = useAndroidControlSizing();
+  const images = props.supportsImages !== false;
+  const showMenu = props.supportsFiles && images;
   const button = (
     <Pressable
       accessibilityLabel={gt("Add attachment")}
       accessibilityRole="button"
       accessibilityState={{ disabled: props.disabled }}
       className="size-[44px] shrink-0 items-center justify-center rounded-full active:opacity-70 disabled:opacity-50"
-      disabled={props.disabled}
-      onPress={props.supportsFiles ? undefined : () => void props.onPickMedia()}
+      disabled={props.disabled || (!images && !props.supportsFiles)}
+      onPress={
+        showMenu ? undefined : () => void (images ? props.onPickMedia() : props.onPickFiles())
+      }
     >
       <SymbolView
         name="plus"
@@ -40,7 +45,7 @@ export function ComposerAttachmentButton(props: {
     </Pressable>
   );
 
-  if (props.disabled || !props.supportsFiles) {
+  if (props.disabled || !showMenu) {
     return button;
   }
 

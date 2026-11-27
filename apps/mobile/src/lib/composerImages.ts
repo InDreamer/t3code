@@ -431,6 +431,7 @@ export async function pickComposerImages(input: { readonly existingCount: number
 }
 
 export async function pickComposerMedia(input: {
+  readonly selectionLimit?: number;
   readonly existingCount: number;
   readonly maxVideoBytes?: number;
   readonly acceptSelection?: () => boolean;
@@ -438,7 +439,10 @@ export async function pickComposerMedia(input: {
   readonly attachments: ReadonlyArray<DraftComposerAttachment>;
   readonly error: string | null;
 }> {
-  const remainingSlots = PROVIDER_SEND_TURN_MAX_ATTACHMENTS - input.existingCount;
+  const remainingSlots = Math.min(
+    PROVIDER_SEND_TURN_MAX_ATTACHMENTS - input.existingCount,
+    input.selectionLimit ?? Infinity,
+  );
   if (remainingSlots <= 0) {
     return {
       attachments: [],

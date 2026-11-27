@@ -27,13 +27,11 @@ const SEARCH_LABELS = {
   threads: msg("Search threads"),
   pullRequests: msg("Search pull requests"),
   issues: msg("Search issues"),
+  bots: msg("Search bots"),
   settings: msg("Search settings"),
 } as const;
 
-export function WorkspaceToolbar(props: {
-  readonly onNewTask: () => void;
-  readonly sidebar?: boolean;
-}) {
+export function WorkspaceToolbar(props: { readonly sidebar?: boolean }) {
   const gt = useGT();
   const m = useMessages();
   const workspace = useWorkspaceTabs()!;
@@ -204,7 +202,9 @@ export function WorkspaceToolbar(props: {
           {composeButton}
           {compose === null ||
           isDuoDevice(deviceType) ||
-          (deviceType === "pad" && layout.usesSplitView) ||
+          (deviceType === "pad" &&
+            layout.usesSplitView &&
+            (selectedTab !== "bots" || !primaryColumn)) ||
           sidebarTabs === "picker" ||
           floatingTabs ? null : (
             <Toolbar.Button

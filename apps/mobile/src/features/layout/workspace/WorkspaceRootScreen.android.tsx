@@ -16,6 +16,7 @@ import { HomeRouteScreen } from "../../home/HomeRouteScreen";
 import { PullRequestsScreen } from "../../pull-requests/PullRequestsScreen";
 import { ListSearchToolbar } from "./ListSearchToolbar.android";
 import { IssuesScreen } from "../../issues/IssuesScreen";
+import { PaBotsScreen } from "../../pa/PaBotsScreen";
 import { useAdaptiveWorkspaceLayout } from "../AdaptiveWorkspaceLayout";
 import { WorkspaceSettledContentWidthContext } from "../workspace-content-width";
 import { AndroidWorkspaceNavigation, FloatingWorkspaceTabs } from "./AndroidWorkspaceNavigation";
@@ -110,11 +111,22 @@ function WorkspaceRoot() {
                         title={
                           tab === "issues"
                             ? gt("Issues", { $context: "screen title, list of issues" })
-                            : gt("Pull requests")
+                            : tab === "bots"
+                              ? gt("Bots", { $context: "navigation tab, personal agent bots" })
+                              : gt("Pull requests")
                         }
                       />
                       <WorkspaceEmptyDetail tab={tab} />
                     </>
+                  ) : tab === "bots" ? (
+                    <PaBotsScreen
+                      renderFrame={(list) => (
+                        <>
+                          <ListSearchToolbar tab="bots" />
+                          <ScreenContent>{list}</ScreenContent>
+                        </>
+                      )}
+                    />
                   ) : tab === "issues" ? (
                     <IssuesScreen
                       renderFrame={(filters, list) => (

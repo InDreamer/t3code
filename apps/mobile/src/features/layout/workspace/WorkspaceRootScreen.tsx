@@ -29,8 +29,10 @@ import {
 import { HomeRouteScreen } from "../../home/HomeRouteScreen";
 import { WorkspaceConnectionTitle } from "../../home/WorkspaceConnectionTitle";
 import { useAdaptiveWorkspaceLayout } from "../AdaptiveWorkspaceLayout";
+import { WorkspaceEmptyDetail } from "../WorkspaceEmptyDetail";
 import { PullRequestsScreen } from "../../pull-requests/PullRequestsScreen";
 import { IssuesScreen } from "../../issues/IssuesScreen";
+import { PaBotsScreen } from "../../pa/PaBotsScreen";
 import {
   WorkspaceTabsContext,
   WorkspaceTabsProvider,
@@ -186,6 +188,12 @@ function WorkspaceRootContent() {
             <PullRequestsScreen />
           ) : state.selectedTab === "issues" ? (
             <IssuesScreen />
+          ) : state.selectedTab === "bots" ? (
+            layout.usesSplitView && !primaryColumn ? (
+              <WorkspaceEmptyDetail tab="bots" />
+            ) : (
+              <PaBotsScreen />
+            )
           ) : (
             <WorkspaceExtraTab tab={state.selectedTab} />
           )}
@@ -195,7 +203,7 @@ function WorkspaceRootContent() {
         ) : null}
         {enabled.length === 0 && !settingsOpen ? null : settingsOpen ||
           workspaceUsesColumns(state.selectedTab) ? (
-          <WorkspaceToolbar sidebar={sidebarNavigation} onNewTask={startNewTask} />
+          <WorkspaceToolbar sidebar={sidebarNavigation} />
         ) : (
           <WorkspaceSectionToolbar onNewTask={startNewTask} showCompose={false} />
         )}

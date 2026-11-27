@@ -17,6 +17,7 @@ const NativeSidebarTabBar = requireNativeView<
     selectedTab: string;
     selectedColor: string;
     appearance: string;
+    composeAccessibilityLabel?: string;
     showsCompose: boolean;
     compact?: boolean;
     onSelectionChange: (event: NativeSyntheticEvent<{ tab: string }>) => void;
@@ -74,6 +75,7 @@ export function WorkspaceTabDock(props: { readonly placement: "column" | "window
         )}
         selectedColor={colors["--color-primary"]}
         appearance={colorScheme}
+        composeAccessibilityLabel={compose?.label}
         showsCompose={onCompose !== undefined}
         compact={compact}
         onCompose={() => onCompose?.()}

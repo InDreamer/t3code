@@ -110,6 +110,13 @@ const WorkspaceSelections = Schema.Struct({
       key: Schema.optional(Schema.String),
     }),
   ),
+  bots: Schema.optional(
+    Schema.Struct({
+      environmentId: Schema.String,
+      botId: Schema.String,
+      key: Schema.optional(Schema.String),
+    }),
+  ),
   settings: Schema.optional(Schema.String),
   settingsKey: Schema.optional(Schema.String),
   /** A draft the threads tab showed after its last chat; only meaningful in its session. */

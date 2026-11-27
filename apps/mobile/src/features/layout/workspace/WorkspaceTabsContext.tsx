@@ -68,6 +68,7 @@ function createWorkspaceTabsModel(selectedTab?: WorkspaceTab) {
     issues: 0,
     workflows: 0,
     usage: 0,
+    bots: 0,
     settings: 0,
   };
   return {

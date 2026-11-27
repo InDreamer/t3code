@@ -21,6 +21,7 @@ interface NativeSecretInputProps extends ViewProps {
   readonly placeholderColor: number;
   readonly cursorColor: number;
   readonly fontSize: number;
+  readonly maxLength?: number;
   readonly editable: boolean;
   readonly revealed: boolean;
   readonly returnKey: "next" | "done";
@@ -73,6 +74,7 @@ export function SecretTextInput({ onMount, secret = true, ...props }: SecretText
         cursorColor={nativeColor(flattenThemeColor(theme["--color-focus"], surface))}
         fontSize={FONT_SIZE}
         editable={props.editable}
+        maxLength={props.maxLength}
         revealed={!secret || revealed}
         returnKey={props.returnKeyType ?? "done"}
         onChangeText={(event) => props.onChangeText(event.nativeEvent.value)}

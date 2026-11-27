@@ -48,6 +48,7 @@ export const NativePrimaryColumnContext = createContext<{
   readonly selectedThreadKey: string | null;
   readonly selectedPullRequestKey: string | null;
   readonly selectedIssueKey: string | null;
+  readonly selectedBotKey: string | null;
 } | null>(null);
 export const NativeWorkspaceInspectorContext = createContext<{
   readonly content: InspectorContent | undefined;

@@ -17,6 +17,7 @@ export function WorkspaceEmptyDetail(props: {
   const gt = useGT();
   const pullRequests = props.tab === "pullRequests";
   const issues = props.tab === "issues";
+  const bots = props.tab === "bots";
   const settings = props.tab === "settings";
   if (props.tab !== undefined && props.tab !== "settings" && !workspaceUsesColumns(props.tab))
     return <View className="flex-1 bg-screen" />;
@@ -61,7 +62,9 @@ export function WorkspaceEmptyDetail(props: {
                   ? gt("Select a pull request")
                   : issues
                     ? gt("Select an issue")
-                    : gt("Select a thread")}
+                    : bots
+                      ? gt("Select a bot")
+                      : gt("Select a thread")}
             </Text>
             <Text className="text-center text-base text-foreground-muted">
               {settings
@@ -70,11 +73,13 @@ export function WorkspaceEmptyDetail(props: {
                   ? gt("Choose a pull request from the sidebar to review it.")
                   : issues
                     ? gt("Choose an issue from the sidebar to read it.")
-                    : Platform.OS === "android"
-                      ? gt("Choose a thread from the sidebar or start a new thread.")
-                      : gt("Choose a thread from the sidebar or start a new task.")}
+                    : bots
+                      ? gt("Choose a bot from the sidebar to chat with it.")
+                      : Platform.OS === "android"
+                        ? gt("Choose a thread from the sidebar or start a new thread.")
+                        : gt("Choose a thread from the sidebar or start a new task.")}
             </Text>
-            {props.onStartNewTask && !pullRequests && !issues && !settings ? (
+            {props.onStartNewTask && !pullRequests && !issues && !bots && !settings ? (
               Platform.OS === "android" ? (
                 <NewThreadButton extended className="mt-2" onPress={props.onStartNewTask} />
               ) : (

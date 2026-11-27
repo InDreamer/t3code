@@ -46,9 +46,10 @@ import { WorkspaceTabsProvider, useWorkspaceTabs } from "./workspace/WorkspaceTa
 import { WorkspaceNativeTabs } from "./workspace/WorkspaceNativeTabs.ios";
 import { WorkspaceTabDock } from "./workspace/WorkspaceTabDock";
 import { NAVIGATION_TAB_ORDER } from "./workspace/navigation-tab-order";
-import { workspaceUsesColumns } from "./workspace/workspace-tabs-state";
+import { workspaceTabOf, workspaceUsesColumns } from "./workspace/workspace-tabs-state";
 import { useWorkspaceCompose } from "./workspace/useWorkspaceCompose";
 import { selectedIssueKeyOf } from "../issues/issueParams";
+import { selectedPaBotKeyOf } from "../pa/paBotParams";
 import { isSettingsRoute, settingsOpenIn } from "../settings/settings-navigation";
 import { workspaceRoutesOf } from "./workspace-overlay-routes";
 import { setNativelyPoppingWorkspaceRoute } from "./workspace/workspace-detail-selection";
@@ -119,12 +120,13 @@ function ColumnScreen(props: {
   readonly selectedThreadKey?: string | null;
   readonly selectedPullRequestKey?: string | null;
   readonly selectedIssueKey?: string | null;
+  readonly selectedBotKey?: string | null;
   readonly onDismiss: (routeKey: string, native: boolean) => void;
   readonly onAppearance: (
     type: "willAppear" | "didAppear" | "willDisappear" | "didDisappear",
     key: string,
   ) => void;
-  readonly onCompose?: () => void;
+  readonly compose?: ReturnType<typeof useWorkspaceCompose>;
   readonly navigation: ViewProps["navigation"];
   readonly footer?: ReactNode;
 }) {
@@ -145,6 +147,7 @@ function ColumnScreen(props: {
         selectedThreadKey: props.selectedThreadKey ?? null,
         selectedPullRequestKey: props.selectedPullRequestKey ?? null,
         selectedIssueKey: props.selectedIssueKey ?? null,
+        selectedBotKey: props.selectedBotKey ?? null,
       }
     : null;
   const key = descriptor.route.key;
@@ -182,7 +185,7 @@ function ColumnScreen(props: {
               options={options}
               canGoBack={!props.primary}
               column={props.primary ? "primary" : "detail"}
-              onCompose={isNewTaskRoute(descriptor.route) ? undefined : props.onCompose}
+              compose={isNewTaskRoute(descriptor.route) ? undefined : props.compose}
             />
             <ColumnContent
               primary={sidebar}
@@ -204,7 +207,7 @@ function ColumnScreen(props: {
   );
 }
 
-function EmptyDetailHeader(props: { readonly onCompose: (() => void) | undefined }) {
+function EmptyDetailHeader(props: { readonly compose: ReturnType<typeof useWorkspaceCompose> }) {
   const sidebarItem = useWorkspaceSidebarHeaderItem();
   return (
     <V5StackHeader
@@ -215,7 +218,7 @@ function EmptyDetailHeader(props: { readonly onCompose: (() => void) | undefined
       }}
       canGoBack={false}
       column="detail"
-      onCompose={props.onCompose}
+      compose={props.compose}
     />
   );
 }
@@ -278,7 +281,7 @@ function WorkspaceColumns(
   // The cover detail rail needs room for thread tools above the fixed tabs.
   // The unfolded Duo keeps compose in its detail bar.
   const compose = useWorkspaceCompose();
-  const detailCompose = deviceType === "duo-unfolded" ? compose?.onPress : undefined;
+  const detailCompose = deviceType === "duo-unfolded" ? compose : null;
   // Pages a hidden tab opens as it's shown belong to the tab, so they appear in place.
   const headerOnly = use(NativeWorkspaceTabActivityContext)?.headerOnly === true;
   const [shownPages, setShownPages] = useState({ headerOnly, keys: new Set<string>() });
@@ -311,6 +314,9 @@ function WorkspaceColumns(
       ? `${pullRequestParams.environmentId}:${pullRequestParams.host}:${pullRequestParams.repository}:${pullRequestParams.number}`
       : null;
   const selectedIssueKey = selectedIssueKeyOf(props.detail.findLast(isIssueRoute)?.params);
+  const selectedBotKey = selectedPaBotKeyOf(
+    props.detail.findLast((route) => route.name === "PaBot")?.params,
+  );
   const selectedThreadKey =
     threadParams &&
     "environmentId" in threadParams &&
@@ -434,6 +440,7 @@ function WorkspaceColumns(
             selectedThreadKey={selectedThreadKey}
             selectedPullRequestKey={selectedPullRequestKey}
             selectedIssueKey={selectedIssueKey}
+            selectedBotKey={selectedBotKey}
             onDismiss={handleNativeDismiss}
             onAppearance={followCollapsedSplit}
             navigation={props.navigation}
@@ -447,7 +454,7 @@ function WorkspaceColumns(
             activityMode={layout.usesSplitView && !activeDetailKey ? "attached" : "detached"}
           >
             <PaneContext value="content">
-              <EmptyDetailHeader onCompose={detailCompose} />
+              <EmptyDetailHeader compose={detailCompose} />
             </PaneContext>
             <ColumnContent column="empty-detail">
               <WorkspaceEmptyDetail
@@ -472,7 +479,7 @@ function WorkspaceColumns(
                 animatesPush={!shownPages.keys.has(route.key)}
                 onDismiss={handleNativeDismiss}
                 onAppearance={followCollapsedSplit}
-                onCompose={isPullRequestRoute(route) ? undefined : detailCompose}
+                compose={isPullRequestRoute(route) ? undefined : detailCompose}
                 navigation={props.navigation}
               />
             ) : null;
@@ -687,8 +694,11 @@ function WorkspaceStackNavigator({
   );
   return (
     <NativeWorkspaceModeContext value={usesNativeWorkspaceColumns}>
-      <NavigationContent>
-        <WorkspaceTabsProvider settingsOpen={settingsOpen}>
+      <WorkspaceTabsProvider
+        initialTab={workspaceTabOf(state.routes.find((route) => route.name !== "Home")?.name)}
+        settingsOpen={settingsOpen}
+      >
+        <NavigationContent>
           <WorkspaceStackView
             nativeColumns={usesNativeWorkspaceColumns}
             {...rest}
@@ -697,8 +707,8 @@ function WorkspaceStackNavigator({
             descriptors={descriptors}
             navigation={navigation}
           />
-        </WorkspaceTabsProvider>
-      </NavigationContent>
+        </NavigationContent>
+      </WorkspaceTabsProvider>
     </NativeWorkspaceModeContext>
   );
 }

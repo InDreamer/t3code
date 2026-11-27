@@ -35,6 +35,7 @@ import {
 export interface ComposerAttachmentStripProps {
   readonly environmentId?: EnvironmentId;
   readonly attachments: ReadonlyArray<DraftComposerAttachment>;
+  readonly removalDisabled?: boolean;
   readonly onRemove: (imageId: string) => void;
   readonly onPressPreview?: (source: FilePreviewSource) => void;
   readonly onPressVideo?: (
@@ -345,6 +346,7 @@ export function ComposerAttachmentStrip(props: ComposerAttachmentStripProps) {
                   right: removeButtonPlacement === "gutter" ? 0 : 4,
                 }}
                 hitSlop={6}
+                disabled={props.removalDisabled}
                 onPress={() => props.onRemove(attachment.id)}
               >
                 <SymbolView
