@@ -27,6 +27,35 @@ export function formatPaModelLabel(
   return modelId.split("/").at(-1) || modelId;
 }
 
+// Checked in order; OpenRouter comes first since its model ids name the upstream vendor.
+const PA_PROVIDER_ICON_KEYS: ReadonlyArray<readonly [RegExp, string]> = [
+  [/openrouter/, "openrouter"],
+  [/anthropic|claude/, "claudeAgent"],
+  [/\bx-?ai\b|grok/, "grok"],
+  [/antigravity/, "antigravity"],
+  [/cursor/, "cursor"],
+  [/opencode/, "opencode"],
+  [/kiro/, "kiro"],
+  [/openai|codex|\bgpt|^o[134]\b/, "codex"],
+];
+
+/**
+ * The T3 provider whose icon stands for a PA model: matched on the engine's provider id, else on
+ * the model id. Null when neither names a provider T3 draws.
+ */
+export function paProviderIconKey(
+  provider: string | null | undefined,
+  model?: string | null,
+): string | null {
+  for (const id of [provider, model]) {
+    const value = id?.trim().toLowerCase();
+    if (!value) continue;
+    const match = PA_PROVIDER_ICON_KEYS.find(([pattern]) => pattern.test(value));
+    if (match) return match[1];
+  }
+  return null;
+}
+
 /** Providers whose models match `query`, best match first; providers without models drop out. */
 export function filterPaModelProviders(
   providers: ReadonlyArray<PaModelProvider>,

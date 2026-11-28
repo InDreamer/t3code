@@ -113,6 +113,38 @@ export function clearSettledPaLiveTurn(
   };
 }
 
+/**
+ * Drops stale live blocks when an authoritative page commits against a non-running turn.
+ * Covers both a settling turn whose matching reload finished and an idle snapshot after a
+ * detached completion whose terminal event was superseded by the bundled page.
+ */
+export function clearCompletedPaLiveTurn(
+  state: PaLiveTurnState,
+  settleToken?: number,
+): PaLiveTurnState {
+  if (state.phase === "running") return state;
+  if (state.phase === "settling") {
+    if (settleToken !== undefined && state.settleToken !== settleToken) return state;
+    return {
+      ...createInitialPaLiveTurn(state.sessionId),
+      ...sessionState(state),
+      openRequests: state.openRequests,
+      error: state.error,
+      settleToken: state.settleToken,
+    };
+  }
+  if (state.blocks.length === 0 && state.statusText === null && state.startedAt === null) {
+    return state;
+  }
+  return {
+    ...createInitialPaLiveTurn(state.sessionId),
+    ...sessionState(state),
+    openRequests: state.openRequests,
+    error: state.error,
+    settleToken: state.settleToken,
+  };
+}
+
 /** A send the engine admitted before its feed reported the turn: show it running now. */
 export function startPaLiveTurnLocally(state: PaLiveTurnState, nowMs: number): PaLiveTurnState {
   if (state.phase === "running") return state;

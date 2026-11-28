@@ -263,6 +263,71 @@ describe("paSessionEvents", () => {
     }),
   );
 
+  it.effect(
+    "uses protocolVersion 3 with initialResumeToken, dynamic latestPage tags, and onResumeToken",
+    () =>
+      Effect.gen(function* () {
+        let currentTag: string | undefined = "tag-1";
+        const observedTokens: string[] = [];
+        const failed = yield* Deferred.make<void>();
+        const { inputs, supervisor } = yield* makeHarness([
+          Stream.concat(
+            Stream.make(snapshot("ep:5")),
+            Stream.fail(new PaError({ reason: "Unavailable", message: "socket closed" })),
+          ),
+          Stream.make(snapshot("ep:6")),
+        ]);
+        const feed = paSessionEvents({
+          botId: "hermes:default",
+          sessionId: "s-1",
+          initialResumeToken: "ep:4",
+          latestPage: {
+            limit: 50,
+            getKnownPageTag: () => currentTag,
+          },
+          onEvent: (event) => {
+            if (event.resumeToken === "ep:5") {
+              currentTag = "tag-2";
+            }
+          },
+          onResumeToken: (token) => observedTokens.push(token),
+          onFailure: () => {
+            Deferred.doneUnsafe(failed, Effect.void);
+          },
+        });
+
+        const fiber = yield* feed.events.pipe(
+          Stream.tap(feed.deliver),
+          Stream.take(2),
+          Stream.runCollect,
+          Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+          Effect.forkChild,
+        );
+        yield* Deferred.await(failed);
+        yield* Effect.yieldNow;
+        yield* TestClock.adjust("1 second");
+        yield* Fiber.join(fiber);
+
+        expect(yield* Ref.get(inputs)).toEqual([
+          {
+            botId: "hermes:default",
+            sessionId: "s-1",
+            protocolVersion: 3,
+            resumeToken: "ep:4",
+            latestPage: { limit: 50, knownPageTag: "tag-1" },
+          },
+          {
+            botId: "hermes:default",
+            sessionId: "s-1",
+            protocolVersion: 3,
+            resumeToken: "ep:5",
+            latestPage: { limit: 50, knownPageTag: "tag-2" },
+          },
+        ]);
+        expect(observedTokens).toEqual(["ep:5", "ep:6"]);
+      }),
+  );
+
   it("treats only refusals that a reconnect cannot fix as permanent", () => {
     expect(isPermanentPaFailure(new PaError({ reason: "Conflict", message: "" }))).toBe(true);
     expect(isPermanentPaFailure(new PaError({ reason: "Unavailable", message: "" }))).toBe(false);

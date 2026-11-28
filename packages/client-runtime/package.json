@@ -395,6 +395,14 @@
       "types": "./src/pa/history.ts",
       "default": "./src/pa/history.ts"
     },
+    "./pa/cache": {
+      "types": "./src/pa/cache.ts",
+      "default": "./src/pa/cache.ts"
+    },
+    "./pa/bot-chat": {
+      "types": "./src/pa/botChat.ts",
+      "default": "./src/pa/botChat.ts"
+    },
     "./pa/environment": {
       "types": "./src/pa/environment.ts",
       "default": "./src/pa/environment.ts"

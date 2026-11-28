@@ -22,7 +22,17 @@ export interface PaSessionFollower {
   readonly environmentId: EnvironmentId;
   readonly botId: string;
   readonly sessionId: string;
+  /** Optional resume token retained across remounts for exact hub replay. */
+  readonly initialResumeToken?: string | undefined;
+  /** Requests the latest transcript page bundled with the initial snapshot (1-RTT open). */
+  readonly latestPage?:
+    | {
+        readonly limit?: number | undefined;
+        readonly getKnownPageTag?: (() => string | null | undefined) | undefined;
+      }
+    | undefined;
   readonly onEvent: (event: PaStreamEvent) => void;
+  readonly onResumeToken?: ((token: string) => void) | undefined;
   /**
    * A failed attempt. While `retrying` the feed reconnects on its own, resuming from the last
    * event applied; otherwise the engine refused this session for good and the feed has ended.
@@ -62,16 +72,40 @@ export function isPermanentPaFailure(error: unknown): boolean {
  * rerun of the stream (the environment entry was rebuilt) neither resets the token nor retries it.
  */
 export function paSessionEvents(
-  follower: Pick<PaSessionFollower, "botId" | "sessionId" | "onFailure" | "onEvent">,
+  follower: Pick<
+    PaSessionFollower,
+    | "botId"
+    | "sessionId"
+    | "initialResumeToken"
+    | "latestPage"
+    | "onFailure"
+    | "onEvent"
+    | "onResumeToken"
+  >,
 ) {
-  let resumeToken: string | undefined;
+  let resumeToken: string | undefined = follower.initialResumeToken;
   let refusedForGood = false;
-  const input = (): PaSubscribeSessionInput => ({
-    botId: follower.botId,
-    sessionId: follower.sessionId,
-    protocolVersion: 2,
-    ...(resumeToken !== undefined ? { resumeToken } : {}),
-  });
+  const input = (): PaSubscribeSessionInput => {
+    const latestPage = follower.latestPage
+      ? (() => {
+          const knownPageTag = follower.latestPage.getKnownPageTag?.() ?? undefined;
+          return {
+            ...(follower.latestPage.limit !== undefined
+              ? { limit: follower.latestPage.limit }
+              : {}),
+            ...(knownPageTag ? { knownPageTag } : {}),
+          };
+        })()
+      : undefined;
+    return {
+      botId: follower.botId,
+      sessionId: follower.sessionId,
+      protocolVersion:
+        latestPage !== undefined || follower.initialResumeToken !== undefined ? 3 : 2,
+      ...(resumeToken !== undefined ? { resumeToken } : {}),
+      ...(latestPage !== undefined ? { latestPage } : {}),
+    };
+  };
   const events = Stream.unwrap(
     Effect.gen(function* () {
       if (refusedForGood) return Stream.empty;
@@ -94,6 +128,7 @@ export function paSessionEvents(
     Effect.sync(() => {
       follower.onEvent(event);
       resumeToken = event.resumeToken;
+      follower.onResumeToken?.(event.resumeToken);
     });
   return { events, deliver };
 }

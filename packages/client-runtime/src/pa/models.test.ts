@@ -5,6 +5,7 @@ import {
   createPaModelCatalogCache,
   filterPaModelProviders,
   formatPaModelLabel,
+  paProviderIconKey,
   resolvePaModelSelection,
 } from "./models.ts";
 
@@ -56,6 +57,20 @@ describe("formatPaModelLabel", () => {
     expect(formatPaModelLabel("claude-opus", CATALOG, "anthropic")).toBe("Claude Opus");
     expect(formatPaModelLabel("anthropic/claude-opus", CATALOG, "openrouter")).toBe("claude-opus");
     expect(formatPaModelLabel("claude-opus", CATALOG, "openrouter")).toBe("claude-opus");
+  });
+});
+
+describe("paProviderIconKey", () => {
+  it("maps engine providers first, then model ids, to the icons T3 draws", () => {
+    expect(paProviderIconKey("anthropic", "claude-sonnet-4")).toBe("claudeAgent");
+    expect(paProviderIconKey("openrouter", "anthropic/claude-sonnet-4")).toBe("openrouter");
+    expect(paProviderIconKey("openai-codex", "gpt-5")).toBe("codex");
+    expect(paProviderIconKey("xai", "grok-4")).toBe("grok");
+    expect(paProviderIconKey("copilot", "gpt-5-mini")).toBe("codex");
+    expect(paProviderIconKey(null, "o3-mini")).toBe("codex");
+    expect(paProviderIconKey("custom", "x-ai/grok-code")).toBe("grok");
+    expect(paProviderIconKey("nous", "hermes-4-405b")).toBeNull();
+    expect(paProviderIconKey(null, null)).toBeNull();
   });
 });
 

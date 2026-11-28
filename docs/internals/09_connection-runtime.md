@@ -49,3 +49,10 @@ active connections stay manageable without extending the credential's lifetime.
   cache.
 - Durable subscriptions follow replacement sessions automatically. Reconnection never auto-replays
   mutations—retry and idempotency belong to each operation.
+- Personal agent chats (`packages/client-runtime/src/pa/botChat.ts`) follow the same separation:
+  `hold()` owns the live subscription while the 5-minute memory retention and disk cache (`PaCacheStore`)
+  survive bot switches. Protocol v3 (`PaService.subscribeSession`) replays missed hub events _before_
+  its attach snapshot and bundles the latest bounded page (or `pageUnchanged` via `pageTag`). Only
+  definitive read denial (`sessionDeniesScope` / `Forbidden`), never an unknown/offline auth lookup,
+  clears cached PA transcripts, and environment removal disposes controllers with `discardPending: true`
+  so flushed writes cannot race deletion.
