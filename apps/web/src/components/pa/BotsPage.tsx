@@ -2,7 +2,7 @@ import { useAtomValue } from "@effect/atom-react";
 import { paOfflineInstances, resolveActivePaBot } from "@t3tools/client-runtime/pa/roster";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import { T, useGT, Var } from "gt-react";
-import { BotIcon, Loader2Icon, PlusIcon } from "lucide-react";
+import { Loader2Icon, PlusIcon } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import { usePrimaryEnvironmentId } from "../../state/environments";
@@ -10,12 +10,15 @@ import { isElectron } from "~/env";
 import { Button } from "../ui/button";
 import { SidebarInset } from "../ui/sidebar";
 import { WorkspacePageHeader } from "../WorkspacePageHeader";
+import { BotAvatarTrio } from "./BotAvatar";
 import { BotChatPane } from "./BotChatPane";
 import { BotSettingsSheet } from "./BotSettingsSheet";
 import { CreateBotDialog } from "./CreateBotDialog";
 import { paCreateBotPermissionAtom } from "./paApi";
+import { PaBotsMark } from "./PaBotsMark";
 import {
-  loadPaBots,
+  applyPaBotWrite,
+  notePaBotActivity,
   rememberLastPaBotId,
   setPaCreateDialogOpen,
   setPaSettingsBotId,
@@ -70,9 +73,10 @@ export function BotsPage() {
           capabilities={capabilitiesFor(activeBot.instanceId)}
           selectedSessionId={search.bot === activeBot.botId ? (search.session ?? null) : null}
           settingsVersion={settingsVersion}
+          obscured={createOpen || settingsBot !== null}
           onSelectSession={(sessionId) => selectBot(activeBot.botId, sessionId)}
           onOpenSettings={() => setPaSettingsBotId(activeBot.botId)}
-          onActivity={() => void loadPaBots(true)}
+          onActivity={(patch) => notePaBotActivity(activeBot.botId, patch)}
         />
       ) : (
         <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-background">
@@ -81,7 +85,7 @@ export function BotsPage() {
             className="justify-between border-b border-border/60"
           >
             <div className="flex min-w-0 items-center gap-2">
-              <BotIcon className="size-4 shrink-0 text-muted-foreground" />
+              <PaBotsMark className="size-4 shrink-0 text-muted-foreground" aria-hidden />
               <span className="truncate text-sm font-semibold">
                 <T>Bots</T>
               </span>
@@ -126,9 +130,7 @@ export function BotsPage() {
                     ))}
                   </div>
                 ) : null}
-                <div className="flex size-14 items-center justify-center rounded-2xl bg-muted/50">
-                  <BotIcon className="size-6" />
-                </div>
+                <BotAvatarTrio />
                 <div className="space-y-1">
                   <div className="text-base font-medium text-foreground">
                     <T>No bots available</T>
@@ -157,7 +159,7 @@ export function BotsPage() {
         onOpenChange={setPaCreateDialogOpen}
         instances={instances}
         onCreated={(created) => {
-          void loadPaBots(true);
+          void applyPaBotWrite(created);
           selectBot(created.botId);
         }}
       />
@@ -169,9 +171,9 @@ export function BotsPage() {
         onOpenChange={(open) => {
           if (!open) setPaSettingsBotId(null);
         }}
-        onSaved={() => {
+        onSaved={(patch) => {
           setSettingsVersion((prev) => prev + 1);
-          void loadPaBots(true);
+          if (settingsBot) void applyPaBotWrite(settingsBot, patch ?? {});
         }}
       />
     </SidebarInset>

@@ -11,6 +11,7 @@ import IconRobot from "@tabler/icons-react-native/IconRobot";
 import { SymbolView as ExpoSymbolView } from "expo-symbols";
 import { withUniwind } from "uniwind";
 import type { AppSymbolViewProps } from "./AppSymbol.android";
+import { PaBotsMark } from "./PaBotsMark";
 
 export type { SFSymbol } from "expo-symbols";
 export type { AppSymbolName, AppSymbolViewProps } from "./AppSymbol.android";
@@ -26,6 +27,7 @@ const CUSTOM_ICONS = {
   "git.commit": IconGitCommit,
   "git.issue": IconCircleDot,
   robot: IconRobot,
+  "pa.bots": PaBotsMark,
 };
 
 function AppSymbolView(props: AppSymbolViewProps) {

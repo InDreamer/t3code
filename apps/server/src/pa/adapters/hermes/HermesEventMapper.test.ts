@@ -48,6 +48,13 @@ describe("acceptHermesSeq", () => {
 });
 
 describe("HermesEventMapper", () => {
+  it("keeps a transport replay cursor out of the reply identity", () => {
+    const { map } = makeMapper();
+    expect(map("message.complete", { text: "done" }, { replay_epoch: "ep", seq: 70 })).toEqual([
+      { type: "turn.completed", sessionId: "s-1", status: "complete", text: "done" },
+    ]);
+  });
+
   it("dedupes overlapping delta ranges into one answer segment", () => {
     const { map } = makeMapper();
     const events = [
@@ -229,7 +236,14 @@ describe("HermesEventMapper queue, usage and todos", () => {
         { admission_id: "adm-run" },
       ),
     ).toEqual([
-      { type: "turn.completed", sessionId: "s-1", status: "complete", text: "Working on" },
+      {
+        type: "turn.completed",
+        sessionId: "s-1",
+        status: "complete",
+        text: "Working on",
+        replyId: "admission:adm-run",
+        replyAliases: ["turn:t1"],
+      },
     ]);
   });
 

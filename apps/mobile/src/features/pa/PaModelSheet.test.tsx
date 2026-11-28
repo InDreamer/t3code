@@ -15,10 +15,15 @@ const ui = vi.hoisted(() => ({
   setReasoning: vi.fn(),
   bump: vi.fn(),
   goBack: vi.fn(),
+  dispatch: vi.fn(),
 }));
 vi.mock("@effect/atom-react", () => ({ useAtomValue: () => true }));
 vi.mock("@react-navigation/native", () => ({
-  useNavigation: () => ({ goBack: ui.goBack, isFocused: () => true }),
+  useNavigation: () => ({ goBack: ui.goBack, dispatch: ui.dispatch, isFocused: () => true }),
+  StackActions: {
+    popTo: (name: string, params: object) => ({ type: "POP_TO", name, params }),
+    pop: (count: number) => ({ type: "POP", payload: { count } }),
+  },
 }));
 vi.mock("react-native", () => ({
   View: "div",
@@ -92,6 +97,7 @@ vi.mock("../pull-requests/PullRequestSearchSheet", () => ({
 vi.mock("./paApi", () => ({
   paClient: () => ({ getBotModels: ui.models, selectBotModel: ui.select }),
   paSelectModelPermissionAtom: () => true,
+  paErrorMessage: (error: Error) => error.message,
 }));
 vi.mock("./paRosterStore", () => ({
   usePaBot: () => ({ bot: {}, capabilities: { models: { scope: "session" } } }),
@@ -125,6 +131,55 @@ const catalog: PaModelCatalog = {
 };
 
 afterEach(() => paModelCatalogs.clear());
+
+it.each([
+  ["keepDrafts", "profile"],
+  ["keepDrafts", "toggles"],
+  ["keepDrafts", "schedules"],
+  ["close", "profile"],
+] as const)(
+  "preserves the settings stack on failure and pops the right sheets on success (%s)",
+  async (fromSettings, draftTab) => {
+    ui.sessionId = "selected";
+    ui.dispatch.mockClear();
+    ui.models.mockResolvedValue(catalog);
+    ui.select.mockRejectedValueOnce(new Error("Unavailable")).mockResolvedValueOnce({
+      status: "applied",
+      current: { model: "another", provider: "p" },
+    });
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    const container = document.createElement("div");
+    const root = createRoot(container);
+    using _root = { [Symbol.dispose]: () => act(() => root.unmount()) };
+    await act(async () =>
+      root.render(
+        <PaModelSheet
+          route={{
+            params: { environmentId: "env", botId: "settings-bot", fromSettings, draftTab },
+          }}
+        />,
+      ),
+    );
+    const model = [...container.querySelectorAll("button")].find(
+      (item) => item.textContent === "another",
+    )!;
+    await act(async () => model.click());
+    expect(container.textContent).toContain("Unavailable");
+    expect(ui.dispatch).not.toHaveBeenCalled();
+    await act(async () => model.click());
+    expect(ui.dispatch.mock.calls).toEqual([
+      [
+        fromSettings === "close"
+          ? { type: "POP", payload: { count: 2 } }
+          : {
+              type: "POP_TO",
+              name: "PaBotSettings",
+              params: { environmentId: "env", botId: "settings-bot", tab: draftTab },
+            },
+      ],
+    ]);
+  },
+);
 
 it.each(["model", "reasoning"])(
   "applies a late %s result to the session that requested it",

@@ -5,6 +5,8 @@ import "vite-plus/test/config";
 
 const reactTests = [
   "src/features/pa/PaCreateBotSheet.test.tsx",
+  "src/features/pa/PaBotSettingsSheet.test.tsx",
+  "src/features/pa/PaBotRow.test.tsx",
   "src/features/pa/PaModelSheet.test.tsx",
   "src/features/pa/PaRequestCards.test.tsx",
   "src/features/pa/usePaAttachments.test.tsx",

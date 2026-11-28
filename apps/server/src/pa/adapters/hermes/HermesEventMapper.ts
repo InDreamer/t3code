@@ -235,12 +235,36 @@ export class HermesEventMapper {
           return [];
         const text = typeof p.text === "string" ? p.text : "";
         const error = stringField(p.error);
+        const receipt = p.persisted_turn;
+        const rowId =
+          receipt && typeof receipt === "object" && "final_assistant_row_id" in receipt
+            ? receipt.final_assistant_row_id
+            : undefined;
+        const submission =
+          receipt && typeof receipt === "object" && "submission_id" in receipt
+            ? stringField(receipt.submission_id)
+            : stringField(p.submission_id);
+        const admission = admissionId ?? this.activeAdmissionId;
+        const turn = stringField(p.turn_id) ?? this.turnId;
+        const messageId = stringField(p.message_id);
+        const ids = [
+          ...(typeof rowId === "number" && Number.isSafeInteger(rowId) && rowId > 0
+            ? ["row-" + rowId]
+            : []),
+          ...(submission ? ["submission:" + submission] : []),
+          ...(admission ? ["admission:" + admission] : []),
+          ...(turn ? ["turn:" + turn] : []),
+          ...(messageId ? ["message:" + messageId] : []),
+        ];
         this.endTurn();
         return [
           ...this.usageEvents(p.usage),
           {
             type: "turn.completed",
             sessionId,
+            ...(ids[0] && (text.trim() || (p.status !== "interrupted" && p.outcome !== "cancelled"))
+              ? { replyId: ids[0], replyAliases: ids.slice(1) }
+              : {}),
             status:
               p.status === "error"
                 ? "error"

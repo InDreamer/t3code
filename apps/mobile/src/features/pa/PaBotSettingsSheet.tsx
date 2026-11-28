@@ -1,6 +1,10 @@
 import { useAtomValue } from "@effect/atom-react";
-import { useNavigation, type StaticScreenProps } from "@react-navigation/native";
-import { PA_AVATAR_COLORS, PA_AVATAR_SHAPES } from "@t3tools/client-runtime/pa/avatar";
+import { CommonActions, useNavigation, type StaticScreenProps } from "@react-navigation/native";
+import {
+  isPaAvatarObsidian,
+  paAvatarColorOptions,
+  PA_AVATAR_SHAPES,
+} from "@t3tools/client-runtime/pa/avatar";
 import {
   changedPaConfigSections,
   filterToggleItems,
@@ -14,6 +18,7 @@ import {
 } from "@t3tools/client-runtime/pa/settings";
 import {
   EnvironmentId,
+  paProfileDescription,
   type PaAvatarShape,
   type PaBotConfig,
   type PaBotSummary,
@@ -24,8 +29,8 @@ import {
   type PaSchedule,
 } from "@t3tools/contracts";
 import { T, useGT, useMessages } from "gt-react-native";
-import { useEffect, useEffectEvent, useState } from "react";
-import { Pressable, View } from "react-native";
+import { useEffect, useEffectEvent, useState, type Dispatch, type SetStateAction } from "react";
+import { Keyboard, Pressable, View } from "react-native";
 
 import { AppActivityIndicator } from "../../components/ui/AppActivityIndicator";
 import { AppBar } from "../../components/ui/AppBar";
@@ -236,7 +241,11 @@ function OptionsSection(props: {
   );
 }
 
+const EMPTY_SCHEDULE = { name: "", spec: "every 1h", prompt: "", deliver: "" };
+
 function Schedules(props: {
+  readonly draft: typeof EMPTY_SCHEDULE;
+  readonly onDraftChange: Dispatch<SetStateAction<typeof EMPTY_SCHEDULE>>;
   readonly schedules: ReadonlyArray<PaSchedule>;
   readonly busy: boolean;
   readonly onMutate: (
@@ -245,10 +254,10 @@ function Schedules(props: {
   ) => Promise<boolean>;
 }) {
   const gt = useGT();
-  const [name, setName] = useState("");
-  const [spec, setSpec] = useState("every 1h");
-  const [prompt, setPrompt] = useState("");
-  const [deliver, setDeliver] = useState("");
+  const [page, setPage] = useState(1);
+  const slice = paginateItems(props.schedules, page, 5);
+  if (page !== slice.page) setPage(slice.page);
+  const { name, spec, prompt, deliver } = props.draft;
   const add = async () => {
     const added = await props.onMutate(
       {
@@ -261,13 +270,68 @@ function Schedules(props: {
       gt("Could not add scheduled task"),
     );
     if (added) {
-      setName("");
-      setPrompt("");
-      setDeliver("");
+      setPage(1);
+      props.onDraftChange((current) => ({
+        name: current.name === name ? "" : current.name,
+        spec: current.spec,
+        prompt: current.prompt === prompt ? "" : current.prompt,
+        deliver: current.deliver === deliver ? "" : current.deliver,
+      }));
     }
   };
   return (
     <View className="gap-4">
+      <View className="gap-2 rounded-xl border border-border-subtle p-3">
+        <FieldLabel>{gt("New scheduled task")}</FieldLabel>
+        <TextInput
+          accessibilityLabel={gt("Task name")}
+          placeholder={gt("Task name (e.g. daily briefing)")}
+          placeholderTextColorClassName="accent-foreground-muted"
+          value={name}
+          onChangeText={(name) => props.onDraftChange({ ...props.draft, name })}
+          className={INPUT}
+        />
+        <TextInput
+          accessibilityLabel={gt("Schedule")}
+          placeholder={gt("Schedule (e.g. every 1h or 0 9 * * *)")}
+          placeholderTextColorClassName="accent-foreground-muted"
+          value={spec}
+          onChangeText={(spec) => props.onDraftChange({ ...props.draft, spec })}
+          autoCapitalize="none"
+          autoCorrect={false}
+          className={INPUT}
+        />
+        <TextInput
+          accessibilityLabel={gt("Instructions")}
+          placeholder={gt("Instructions for the bot when the task runs…")}
+          placeholderTextColorClassName="accent-foreground-muted"
+          value={prompt}
+          onChangeText={(prompt) => props.onDraftChange({ ...props.draft, prompt })}
+          multiline
+          className={cn(INPUT, "min-h-[60px]")}
+        />
+        <TextInput
+          accessibilityLabel={gt("Delivery target")}
+          placeholder={gt("Delivery target (optional, e.g. local, origin or {example})", {
+            example: "telegram:<id>",
+          })}
+          placeholderTextColorClassName="accent-foreground-muted"
+          value={deliver}
+          maxLength={200}
+          onChangeText={(deliver) => props.onDraftChange({ ...props.draft, deliver })}
+          autoCapitalize="none"
+          className={INPUT}
+        />
+        <Button
+          tone="secondary"
+          icon="plus"
+          label={gt("Add scheduled task")}
+          loading={props.busy}
+          disabled={props.busy || !prompt.trim() || !spec.trim()}
+          onPress={() => void add()}
+        />
+      </View>
+      <FieldLabel>{gt("Scheduled tasks ({count})", { count: props.schedules.length })}</FieldLabel>
       {props.schedules.length === 0 ? (
         <EmptyState
           title={gt("No scheduled tasks")}
@@ -276,7 +340,7 @@ function Schedules(props: {
         />
       ) : (
         <View className="gap-2">
-          {props.schedules.map((job) => (
+          {slice.items.map((job) => (
             <View
               key={job.id}
               className={cn(
@@ -345,62 +409,35 @@ function Schedules(props: {
           ))}
         </View>
       )}
-      <View className="gap-2">
-        <FieldLabel>{gt("New scheduled task")}</FieldLabel>
-        <TextInput
-          accessibilityLabel={gt("Task name")}
-          placeholder={gt("Task name (e.g. daily briefing)")}
-          placeholderTextColorClassName="accent-foreground-muted"
-          value={name}
-          onChangeText={setName}
-          className={INPUT}
-        />
-        <TextInput
-          accessibilityLabel={gt("Schedule")}
-          placeholder={gt("Schedule (e.g. every 1h or 0 9 * * *)")}
-          placeholderTextColorClassName="accent-foreground-muted"
-          value={spec}
-          onChangeText={setSpec}
-          autoCapitalize="none"
-          autoCorrect={false}
-          className={INPUT}
-        />
-        <TextInput
-          accessibilityLabel={gt("Instructions")}
-          placeholder={gt("Instructions for the bot when the task runs…")}
-          placeholderTextColorClassName="accent-foreground-muted"
-          value={prompt}
-          onChangeText={setPrompt}
-          multiline
-          className={cn(INPUT, "min-h-[88px]")}
-        />
-        <TextInput
-          accessibilityLabel={gt("Delivery target")}
-          placeholder={gt("Delivery target (optional, e.g. local, origin or {example})", {
-            example: "telegram:<id>",
-          })}
-          placeholderTextColorClassName="accent-foreground-muted"
-          value={deliver}
-          maxLength={200}
-          onChangeText={setDeliver}
-          autoCapitalize="none"
-          className={INPUT}
-        />
-        <Button
-          tone="secondary"
-          icon="plus"
-          label={gt("Add scheduled task")}
-          loading={props.busy}
-          disabled={props.busy || !prompt.trim() || !spec.trim()}
-          onPress={() => void add()}
-        />
-      </View>
+      {slice.totalPages > 1 && (
+        <View className="flex-row items-center justify-between gap-2">
+          <Button
+            size="compact"
+            tone="text"
+            label={gt("Previous")}
+            disabled={slice.page <= 1}
+            onPress={() => setPage(slice.page - 1)}
+          />
+          <Text className="text-xs tabular-nums text-foreground-muted">
+            {gt("{page} of {total}", { page: slice.page, total: slice.totalPages })}
+          </Text>
+          <Button
+            size="compact"
+            tone="text"
+            label={gt("Next")}
+            disabled={slice.page >= slice.totalPages}
+            onPress={() => setPage(slice.page + 1)}
+          />
+        </View>
+      )}
     </View>
   );
 }
 
 /** A Bot's name, look, instructions, capabilities and scheduled tasks. */
-export function PaBotSettingsSheet({ route }: StaticScreenProps<PaBotParams>) {
+export function PaBotSettingsSheet({
+  route,
+}: StaticScreenProps<PaBotParams & { tab?: SettingsTab }>) {
   const gt = useGT();
   const navigation = useNavigation();
   const { bot, capabilities, entry } = usePaBot(route.params.environmentId, route.params.botId);
@@ -428,12 +465,16 @@ export function PaBotSettingsSheet({ route }: StaticScreenProps<PaBotParams>) {
       environmentId={route.params.environmentId}
       bot={bot}
       capabilities={capabilities}
+      tab={route.params.tab ?? "profile"}
+      onSelectTab={(tab) => navigation.dispatch(CommonActions.setParams({ tab }))}
     />
   );
 }
 
 function PaBotSettings(props: {
   readonly environmentId: string;
+  readonly tab: SettingsTab;
+  readonly onSelectTab: (tab: SettingsTab) => void;
   readonly bot: PaBotSummary;
   readonly capabilities: PaCapabilities | null;
 }) {
@@ -451,11 +492,8 @@ function PaBotSettings(props: {
   const configSupported = canEditConfig && props.capabilities?.config.supported === true;
   const modelsSupported = canSelectModel && props.capabilities?.models.supported === true;
   const schedulesSupported = canMutateSchedule && props.capabilities?.schedules.supported === true;
-  const [tab, setTab] = useState<SettingsTab>("profile");
-
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
   const [name, setName] = useState(bot.name);
   const [avatarColor, setAvatarColor] = useState(bot.avatarColor);
   const [avatarShape, setAvatarShape] = useState<PaAvatarShape>(bot.avatarShape);
@@ -469,6 +507,8 @@ function PaBotSettings(props: {
   const [config, setConfig] = useState<PaBotConfig | null>(null);
   const [drafts, setDrafts] = useState<Record<string, PaConfigSectionValue>>({});
   const [schedules, setSchedules] = useState<ReadonlyArray<PaSchedule> | null>(null);
+  const [savedScheduleSpec, setSavedScheduleSpec] = useState(EMPTY_SCHEDULE.spec);
+  const [scheduleDraft, setScheduleDraft] = useState(EMPTY_SCHEDULE);
   const [scheduleBusy, setScheduleBusy] = useState(false);
 
   const loading = !error && ((configSupported && !config) || (schedulesSupported && !schedules));
@@ -517,24 +557,31 @@ function PaBotSettings(props: {
       : []),
     ...(schedulesSupported ? [{ value: "schedules" as const, label: gt("Schedule") }] : []),
   ];
-  const activeTab = tabs.some((item) => item.value === tab) ? tab : "profile";
+  const activeTab = tabs.some((item) => item.value === props.tab) ? props.tab : "profile";
 
   const nextName = name.trim() || bot.agentRef;
   const metaPatch = {
     ...(nextName !== savedMeta.name ? { name: nextName } : {}),
-    ...(avatarColor !== savedMeta.avatarColor ? { avatarColor } : {}),
+    ...(avatarColor.toLowerCase() !== savedMeta.avatarColor.toLowerCase() ? { avatarColor } : {}),
     ...(avatarShape !== savedMeta.avatarShape ? { avatarShape } : {}),
     ...(pinned !== savedMeta.pinned ? { pinned } : {}),
   };
   const changedSections = changedPaConfigSections(sections, drafts);
-  const dirty = (canEditMeta && Object.keys(metaPatch).length > 0) || changedSections.length > 0;
+  const settingsDirty =
+    (canEditMeta && Object.keys(metaPatch).length > 0) || changedSections.length > 0;
+  const scheduleDirty =
+    scheduleDraft.name !== "" ||
+    scheduleDraft.prompt !== "" ||
+    scheduleDraft.deliver !== "" ||
+    scheduleDraft.spec !== savedScheduleSpec;
+  const dirty = settingsDirty || scheduleDirty;
 
   const saved = () => {
     void refreshPaRoster(environmentId);
     bumpPaBotSettingsIfActive(environmentId, bot.botId);
   };
   const save = async () => {
-    if (!dirty || saving) return;
+    if (!settingsDirty || saving) return;
     const belowMinimum = findPaMinEnabledViolation(changedSections, drafts);
     if (belowMinimum) {
       setError(
@@ -546,8 +593,8 @@ function PaBotSettings(props: {
       return;
     }
     setSaving(true);
+    Keyboard.dismiss();
     setError(null);
-    setNotice(null);
     // Each block that lands becomes the new baseline at once, so a later failure cannot leave
     // saved edits looking unsaved; drafts typed during the save are kept, not overwritten.
     const persist = async () => {
@@ -563,6 +610,8 @@ function PaBotSettings(props: {
       for (const section of changedSections) {
         const submitted = drafts[section.id]!;
         const next = await client.patchBotConfig(bot.botId, section.id, submitted);
+        const description = paProfileDescription(next);
+        if (description !== undefined) patchPaBot(environmentId, bot.botId, { description });
         if (!mounted.current) return;
         setConfig(next);
         const previous = baseline;
@@ -573,10 +622,12 @@ function PaBotSettings(props: {
       }
     };
     await persist().then(
-      () => mounted.current && setNotice(gt("Saved")),
+      () => {
+        saved();
+        if (mounted.current && navigation.isFocused()) navigation.goBack();
+      },
       (cause: unknown) => mounted.current && setError(paErrorMessage(cause, gt("Could not save"))),
     );
-    saved();
     if (mounted.current) setSaving(false);
   };
   const mutateSchedule = async (input: Omit<PaMutateScheduleInput, "botId">, fallback: string) => {
@@ -587,6 +638,7 @@ function PaBotSettings(props: {
       (next) => {
         if (!mounted.current) return false;
         setSchedules(next);
+        if (input.action === "add") setSavedScheduleSpec(scheduleDraft.spec);
         return true;
       },
       (cause: unknown) => {
@@ -609,9 +661,9 @@ function PaBotSettings(props: {
           ? {}
           : {
               confirm: {
-                label: gt("Save"),
+                label: gt("Save & Close"),
                 onPress: () => void save(),
-                disabled: !dirty || loading,
+                disabled: !settingsDirty || loading,
                 loading: saving,
               },
             })}
@@ -629,6 +681,7 @@ function PaBotSettings(props: {
       />
       <ScreenContent surface="sheet">
         <NativeScrollView
+          pointerEvents={saving ? "none" : "auto"}
           className="flex-1"
           contentInsetAdjustmentBehavior="automatic"
           keyboardShouldPersistTaps="handled"
@@ -637,14 +690,12 @@ function PaBotSettings(props: {
           contentContainerStyle={{ padding: 16, gap: 16, paddingBottom: 40 }}
         >
           {tabs.length > 1 ? (
-            <SegmentedControl options={tabs} selected={activeTab} onSelect={setTab} />
+            <SegmentedControl options={tabs} selected={activeTab} onSelect={props.onSelectTab} />
           ) : null}
           {error ? (
             <Text selectable className="text-sm text-danger">
               {error}
             </Text>
-          ) : notice ? (
-            <Text className="text-sm text-foreground-muted">{notice}</Text>
           ) : null}
           {loading ? <AppActivityIndicator className="my-8" /> : null}
           {!loading && activeTab === "profile" ? (
@@ -656,6 +707,9 @@ function PaBotSettings(props: {
                   size="lg"
                   starred={bot.isDefault}
                 />
+                {!bot.online && (
+                  <Text className="text-xs text-foreground-muted">{gt("Offline")}</Text>
+                )}
               </View>
               <View className="gap-1.5">
                 <FieldLabel>{gt("Name")}</FieldLabel>
@@ -700,22 +754,29 @@ function PaBotSettings(props: {
                   ))}
                 </View>
                 <View className="flex-row flex-wrap gap-2.5 pt-1">
-                  {PA_AVATAR_COLORS.map((swatch) => (
+                  {paAvatarColorOptions(bot.avatarColor).map((swatch) => (
                     <Pressable
                       key={swatch.value}
                       accessibilityRole="radio"
                       accessibilityLabel={messages(swatch.label)}
-                      accessibilityState={{ checked: avatarColor === swatch.value }}
+                      accessibilityState={{ checked: avatarColor.toLowerCase() === swatch.value }}
                       disabled={!canEditMeta}
                       onPress={() => setAvatarColor(swatch.value)}
                       className={cn(
                         "size-9 items-center justify-center rounded-full",
-                        avatarColor === swatch.value && "border-2 border-foreground",
+                        avatarColor.toLowerCase() === swatch.value && "border-2 border-foreground",
                       )}
                     >
                       <View
-                        className="size-7 rounded-full"
-                        style={{ backgroundColor: swatch.value }}
+                        className={cn(
+                          "size-7 rounded-full",
+                          isPaAvatarObsidian(swatch.value) && "bg-foreground",
+                        )}
+                        style={
+                          isPaAvatarObsidian(swatch.value)
+                            ? undefined
+                            : { backgroundColor: swatch.value }
+                        }
                       />
                     </Pressable>
                   ))}
@@ -781,6 +842,17 @@ function PaBotSettings(props: {
                 label={gt("Change model")}
                 onPress={() =>
                   navigation.navigate("PaModel", {
+                    fromSettings: dirty ? "keepDrafts" : "close",
+                    ...(dirty
+                      ? {
+                          draftTab: scheduleDirty
+                            ? "schedules"
+                            : Object.keys(metaPatch).length ||
+                                changedSections.some((section) => section.kind !== "toggleList")
+                              ? ("profile" as const)
+                              : ("toggles" as const),
+                        }
+                      : {}),
                     environmentId,
                     botId: bot.botId,
                     ...(bot.primarySessionId ? { sessionId: bot.primarySessionId } : {}),
@@ -810,7 +882,13 @@ function PaBotSettings(props: {
             </View>
           ) : null}
           {!loading && activeTab === "schedules" ? (
-            <Schedules schedules={schedules ?? []} busy={scheduleBusy} onMutate={mutateSchedule} />
+            <Schedules
+              draft={scheduleDraft}
+              onDraftChange={setScheduleDraft}
+              schedules={schedules ?? []}
+              busy={scheduleBusy}
+              onMutate={mutateSchedule}
+            />
           ) : null}
         </NativeScrollView>
       </ScreenContent>

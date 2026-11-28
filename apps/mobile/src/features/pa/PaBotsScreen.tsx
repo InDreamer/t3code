@@ -6,7 +6,7 @@ import {
   paBotPreview,
   paOfflineInstances,
 } from "@t3tools/client-runtime/pa/roster";
-import { useNavigation } from "@react-navigation/native";
+import { useIsFocused, useNavigation } from "@react-navigation/native";
 import { useGT, useMessages } from "gt-react-native";
 import { use, useRef, useState, type ReactNode } from "react";
 import { Keyboard, Platform, View } from "react-native";
@@ -22,7 +22,12 @@ import { RefreshControl } from "../../components/ui/RefreshControl";
 import { useContentTopInset } from "../../components/ui/useBarInset";
 import { NativeScrollView } from "../../native/NativeScrollViewMarker";
 import { useNativeColumnLayoutMetrics } from "../../native/native-layout-metrics";
-import { NativePrimaryColumnContext } from "../../native/v5-workspace-context";
+import { useAppActive } from "../../lib/appState";
+import { useWorkspacePaneState } from "../layout/adaptive-workspace-context";
+import {
+  NativePrimaryColumnContext,
+  NativeWorkspaceTabActivityContext,
+} from "../../native/v5-workspace-context";
 import { useWorkspaceEnvironments } from "../../state/workspace";
 import { useSearchScrollRestoration } from "../layout/workspace/useSearchScrollRestoration";
 import { useSelectWorkspaceDetail } from "../layout/workspace/useSelectWorkspaceDetail";
@@ -30,6 +35,7 @@ import { useWorkspaceTabs } from "../layout/workspace/WorkspaceTabsContext";
 import { useMessageTimeFormatter } from "../threads/useMessageTimeFormatter";
 import { paClient, paErrorMessage } from "./paApi";
 import { paBotKey } from "./paBotParams";
+import { PaRowVisibility } from "./paRowVisibility";
 import { PaBotRow, type PaBotRowAction, type PaRosterBot } from "./PaBotRow";
 import {
   patchPaBot,
@@ -73,6 +79,7 @@ export function PaBotsScreen(
   const columnSafeBottom = useNativeColumnLayoutMetrics()?.safeArea.bottom;
   const bottomSafeArea =
     Platform.OS === "ios" ? (columnSafeBottom ?? insets.bottom) : insets.bottom;
+  const [rowVisibility] = useState(() => new PaRowVisibility());
   const listRef = useRef<LegendListRef>(null);
   const tab = workspace.state.tabs.bots;
   const [initialScrollOffset] = useState(() => workspace.getScrollOffset("bots"));
@@ -88,7 +95,20 @@ export function PaBotsScreen(
     (environment) => environment.isEnabled && environment.connectionState === "connected",
   );
   const environmentIds = connected.map((environment) => String(environment.environmentId)).sort();
-  usePaRosterRefresh(environmentIds);
+  const paneRole = usePaneRole();
+  const sidebar = props.sidebar === true || (primaryColumn !== null && paneRole === "sidebar");
+  const tabActivity = use(NativeWorkspaceTabActivityContext);
+  const focused = useIsFocused();
+  const foreground = useAppActive();
+  const { panes } = useWorkspacePaneState();
+  const visible =
+    foreground &&
+    workspace.state.selectedTab === "bots" &&
+    !workspace.settingsOpen &&
+    (tabActivity?.active ?? true) &&
+    !tabActivity?.headerOnly &&
+    (sidebar ? (primaryColumn?.presented ?? panes.primarySidebarVisible) : focused);
+  usePaRosterRefresh(visible ? environmentIds : []);
   const rosters = usePaRosterEntries();
   const loaded = connected.flatMap((environment) => {
     const entry = rosters.get(String(environment.environmentId));
@@ -150,8 +170,6 @@ export function PaBotsScreen(
     ...others.map((bot) => ({ kind: "bot" as const, key: bot.key, bot })),
   ];
 
-  const paneRole = usePaneRole();
-  const sidebar = props.sidebar === true || (primaryColumn !== null && paneRole === "sidebar");
   const selectedKey = props.selectedBotKey ?? primaryColumn?.selectedBotKey ?? null;
   const createButton =
     canCreate && !query ? (
@@ -203,6 +221,8 @@ export function PaBotsScreen(
         ref={listRef}
         data={rows}
         extraData={selectedKey}
+        viewabilityConfig={{ itemVisiblePercentThreshold: 1 }}
+        onViewableItemsChanged={({ changed }) => rowVisibility.update(changed)}
         keyExtractor={(row) => row.key}
         getItemType={(row) => row.kind}
         estimatedItemSize={76}
@@ -280,6 +300,8 @@ export function PaBotsScreen(
                   time={formatTime(item.bot.lastActivityAt, nowMsFor(item.bot.environmentId))}
                   selected={selectedKey === item.bot.key}
                   sidebar={sidebar}
+                  visible={visible}
+                  rowVisibility={rowVisibility}
                   onSelect={selectBot}
                   onAction={(bot, action) => void runAction(bot, action)}
                 />

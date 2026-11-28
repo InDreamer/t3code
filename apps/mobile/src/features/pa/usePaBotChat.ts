@@ -6,7 +6,7 @@ import { useEffect, useSyncExternalStore } from "react";
 import { paClient } from "./paApi";
 import { createPaBotChat, type PaBotChat } from "./paBotChat";
 import { paBotKey } from "./paBotParams";
-import { refreshPaRoster } from "./paRosterStore";
+import { notePaBotActivity } from "./paRosterStore";
 
 const activeChats = new Map<string, PaBotChat>();
 const chatAtom = Atom.family((key: string) =>
@@ -15,7 +15,7 @@ const chatAtom = Atom.family((key: string) =>
     const chat = createPaBotChat({
       api: paClient(environmentId),
       botId,
-      onActivity: () => void refreshPaRoster(environmentId),
+      onActivity: (patch) => notePaBotActivity(environmentId, botId, patch),
     });
     activeChats.set(key, chat);
     get.addFinalizer(() => {

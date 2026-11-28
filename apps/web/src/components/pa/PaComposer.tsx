@@ -5,7 +5,7 @@ import {
   CornerUpRightIcon,
   ListPlusIcon,
   Loader2Icon,
-  ShieldAlertIcon,
+  MessageCircleQuestionIcon,
   SquareIcon,
   TerminalIcon,
   XIcon,
@@ -89,7 +89,7 @@ function PaPendingRequestBanner({
         {req.kind === "approval" ? (
           <TerminalIcon className="size-4 shrink-0 text-warning" />
         ) : (
-          <ShieldAlertIcon className="size-4 shrink-0 text-info" />
+          <MessageCircleQuestionIcon className="size-4 shrink-0 text-info" />
         )}
         <span>
           {req.title ||

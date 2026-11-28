@@ -5,6 +5,7 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   derivePaAgentSlug,
   filterPaBots,
+  paBotStatusLabels,
   formatPaRosterTime,
   groupPaBots,
   resolveActivePaBot,
@@ -69,4 +70,15 @@ describe("PA roster", () => {
     expect(formatPaRosterTime(at(2), now, time)).toBe("11/2");
     expect(formatPaRosterTime(null, now, time)).toBe("");
   });
+});
+
+it("announces the same priority as the avatar on old and new rosters", () => {
+  expect(paBotStatusLabels(bot("one", { running: true, unread: true, isDefault: true }))).toEqual([
+    "Working",
+    "Default bot",
+  ]);
+  expect(paBotStatusLabels(bot("one", { running: true, awaiting: true, unread: true }))).toEqual([
+    "Waiting for input",
+    "Unread",
+  ]);
 });

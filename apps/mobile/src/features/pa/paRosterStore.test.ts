@@ -6,6 +6,7 @@ import {
   addPaBot,
   clearPaRosterEnvironment,
   patchPaBot,
+  notePaBotActivity,
   readPaRosterEntry,
   refreshPaRoster,
 } from "./paRosterStore";
@@ -47,9 +48,12 @@ it("preserves an accepted create and metadata patch over older roster reads", as
     .mockReturnValueOnce(afterPatch.promise);
   const stale = refreshPaRoster("env");
   addPaBot("env", bot);
+  for (let i = 0; i < 8; i++) notePaBotActivity("env", bot.botId);
+  expect(listBots).toHaveBeenCalledTimes(1);
   initial.resolve({ bots: [], instances: [] });
   await stale;
   expect(readPaRosterEntry("env").bots).toEqual([bot]);
+  expect(listBots).toHaveBeenCalledTimes(2);
   const stalePatch = refreshPaRoster("env");
   patchPaBot("env", bot.botId, { pinned: true });
   afterCreate.resolve({ bots: [bot], instances: [] });
@@ -59,6 +63,25 @@ it("preserves an accepted create and metadata patch over older roster reads", as
   afterPatch.resolve({ bots: [{ ...bot, pinned: true }], instances: [] });
   await latest;
   expect(readPaRosterEntry("env").refreshing).toBe(false);
+  patchPaBot("env", bot.botId, {
+    name: "Saved",
+    model: "saved-model",
+    description: "New",
+    avatarColor: "#001122",
+  });
+  const offline = { ...bot, online: false };
+  listBots.mockResolvedValueOnce({ bots: [offline], instances: [] });
+  await refreshPaRoster("env");
+  expect(readPaRosterEntry("env").bots[0]).toMatchObject({
+    online: false,
+    name: "Saved",
+    model: "saved-model",
+    description: "New",
+    avatarColor: "#001122",
+  });
+  listBots.mockResolvedValueOnce({ bots: [bot], instances: [] });
+  await refreshPaRoster("env");
+  expect(readPaRosterEntry("env").bots).toEqual([bot]);
   const removedRead = Promise.withResolvers<Awaited<ReturnType<PaClient["listBots"]>>>();
   listBots.mockReturnValueOnce(removedRead.promise);
   const pending = refreshPaRoster("env");

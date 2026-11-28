@@ -26,6 +26,7 @@ import {
 } from "@t3tools/client-runtime/pa/timeline";
 import {
   EnvironmentAuthorizationError,
+  latestPaAssistantReply,
   type PaAttachment,
   type PaCapabilities,
   type PaClarifyAnswer,
@@ -139,7 +140,7 @@ export function createPaBotChat(input: {
   readonly botId: string;
   readonly initialSessionId?: string | null;
   readonly now?: () => number;
-  readonly onActivity?: () => void;
+  readonly onActivity?: (patch?: { running?: true; awaiting?: true }) => void;
 }) {
   const { api: client, botId } = input;
   const now = input.now ?? Date.now;
@@ -154,7 +155,8 @@ export function createPaBotChat(input: {
   let visibleHolders = 0;
   let initialized = false;
   let initialization: Promise<void> | null = null;
-  let markingRead = false;
+  const markingRead = new Set<string>();
+  const completedReplyIds = new Map<string, string>();
   let ensurePrimary: Promise<PaSessionSummary> | null = null;
   const draftEdits = new Map<string, number>();
   const createPrimary = () =>
@@ -183,18 +185,35 @@ export function createPaBotChat(input: {
     for (const listener of listeners) listener();
   };
 
-  const activity = () => input.onActivity?.();
+  const activity = (patch?: { running?: true; awaiting?: true }) => input.onActivity?.(patch);
 
-  const markRead = () => {
-    if (!visibleHolders || !context.canOperate || !context.connected || markingRead || disposed)
+  const markRead = (completionId?: string) => {
+    const sessionId = state.activeSessionId;
+    if (!sessionId || !visibleHolders || !context.canOperate || !context.connected || disposed)
       return;
-    markingRead = true;
-    void client
-      .markRead(botId)
-      .then(activity, () => undefined)
-      .finally(() => {
-        markingRead = false;
-      });
+    const ids = completionId
+      ? [completionId]
+      : [
+          state.messages.sessionId === sessionId
+            ? latestPaAssistantReply(state.messages.window.messages)?.id
+            : undefined,
+          completedReplyIds.get(sessionId),
+        ];
+    for (const id of ids) {
+      if (!id) continue;
+      const key = JSON.stringify([sessionId, id]);
+      if (markingRead.has(key)) continue;
+      markingRead.add(key);
+      void client
+        .markRead(botId, { sessionId, id })
+        .then(
+          () => activity(),
+          () => undefined,
+        )
+        .finally(() => {
+          markingRead.delete(key);
+        });
+    }
   };
 
   const updateLiveTurn = (
@@ -333,6 +352,7 @@ export function createPaBotChat(input: {
             ),
           },
         }));
+        if (context.unread) markRead();
         if (candidates.size > 0) {
           const storedUsers = new Set(
             page.messages.flatMap((item) =>
@@ -469,6 +489,11 @@ export function createPaBotChat(input: {
         case "snapshot":
           const ended = running && !event.running;
           if (ended) endTurn();
+          if (event.running || event.openRequests.length || ended)
+            activity({
+              ...(event.running ? { running: true } : {}),
+              ...(event.openRequests.length ? { awaiting: true } : {}),
+            });
           running = event.running;
           updateLiveTurn(sessionId, (previous) => reducePaStreamEvent(previous, event, now()));
           if (!transcriptRead || event.snapshotRequired || ended) readTranscript();
@@ -490,6 +515,13 @@ export function createPaBotChat(input: {
           return;
         case "turn.started":
           running = true;
+          activity({ running: true });
+          break;
+        case "request.opened":
+          activity({ awaiting: true });
+          break;
+        case "request.resolved":
+          activity();
           break;
         case "turn.completed":
         case "error": {
@@ -501,10 +533,16 @@ export function createPaBotChat(input: {
             settleToken: token,
           }));
           void loadTranscript(sessionId, false, token);
-          if (event.type === "turn.completed") {
-            if (visibleHolders) markRead();
-            else activity();
-          }
+          if (event.type === "turn.completed" && event.replyId)
+            completedReplyIds.set(sessionId, event.replyId);
+          if (
+            event.type === "turn.completed" &&
+            event.replyId &&
+            visibleHolders &&
+            context.canOperate
+          )
+            markRead(event.replyId);
+          else activity();
           return;
         }
         default:
@@ -757,6 +795,11 @@ export function createPaBotChat(input: {
         setDraftFor(sessionId, (current) => (current.trim() === text ? "" : current));
       }
       // Waiting behind the running turn, which keeps streaming untouched.
+      if (result.unknown) {
+        removeLocalMessage(sessionId, optimistic.id);
+        activity();
+        return done(true);
+      }
       if (result.kind === "turn" && result.queued === true) return done(true);
       if (attachments.length ? result.kind === "turn" : queued) {
         appendLocalMessage(sessionId, {
@@ -791,6 +834,7 @@ export function createPaBotChat(input: {
       } else {
         if (state.activeSessionId === sessionId) running = true;
         updateLiveTurn(sessionId, (previous) => startPaLiveTurnLocally(previous, now()));
+        activity({ running: true });
       }
     } catch (error) {
       removeLocalMessage(sessionId, optimistic.id);

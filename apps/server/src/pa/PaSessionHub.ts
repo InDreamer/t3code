@@ -72,7 +72,7 @@ interface BufferedEvent {
  * the buffer gets exactly what it missed, any other token gets `snapshotRequired`.
  */
 export class PaSessionHub {
-  private readonly sessionId: string;
+  readonly sessionId: string;
   private readonly feed: PaHubFeed;
   private readonly options: PaHubOptions;
   private readonly onDispose: () => void;
@@ -81,6 +81,7 @@ export class PaSessionHub {
   private readonly buffer: BufferedEvent[] = [];
   private readonly listeners = new Set<PaHubListener>();
   private running = false;
+  private turnRevision = 0;
   private openRequests: ReadonlyArray<PaPendingRequest> = [];
   /** The latest of each, never the history: a reconnecting viewer only needs what is current. */
   private queuedItems: ReadonlyArray<PaQueuedItem> = [];
@@ -151,6 +152,7 @@ export class PaSessionHub {
     const previous = this.release;
     this.release = release;
     previous?.();
+    if (resume && this.listeners.size === 0) this.scheduleIdleDisposal();
   }
 
   /** Single-flight: a feed that drops while a reconnect is running is picked up by that loop. */
@@ -223,8 +225,19 @@ export class PaSessionHub {
       case "turn.started":
       case "turn.completed":
       case "error":
+        this.turnRevision++;
         this.running = stamped.type === "turn.started";
         this.openRequests = this.openRequests.filter((request) => request.scope === "session");
+        break;
+      case "text.delta":
+      case "reasoning.delta":
+        this.running = true;
+        break;
+      case "status.updated":
+        if (stamped.text) this.running = true;
+        break;
+      case "tool.updated":
+        if (stamped.status === "started" || stamped.status === "progress") this.running = true;
         break;
       case "request.opened":
         this.openRequests = [
@@ -238,11 +251,13 @@ export class PaSessionHub {
       default:
         break;
     }
+    if (this.listeners.size === 0 && this.release !== null) this.scheduleIdleDisposal();
     for (const listener of this.listeners) listener.onEvent(stamped);
   }
 
   /** A snapshot that leaves a field out keeps the hub's last value for it. */
   private applySnapshot(snapshot: Extract<PaAdapterEvent, { type: "snapshot" }>): void {
+    if (this.running !== snapshot.running) this.turnRevision++;
     this.running = snapshot.running;
     this.openRequests = snapshot.openRequests;
     if (snapshot.queuedItems !== undefined) this.queuedItems = snapshot.queuedItems;
@@ -334,10 +349,68 @@ export class PaSessionHub {
       if (detached) return;
       detached = true;
       this.listeners.delete(listener);
-      if (this.listeners.size === 0 && !this.disposed) {
-        this.lingerTimer = this.options.timers.set(() => this.dispose(), this.options.lingerMs);
-      }
+      if (this.listeners.size === 0 && !this.disposed) this.scheduleIdleDisposal();
     };
+  }
+
+  /** Detached clients still need the roster to observe the turn's completion or request resolution. */
+  private scheduleIdleDisposal(): void {
+    if (this.holdsActivity) {
+      if (this.lingerTimer !== null) this.options.timers.clear(this.lingerTimer);
+      this.lingerTimer = null;
+    } else if (this.lingerTimer === null) {
+      this.lingerTimer = this.options.timers.set(() => this.dispose(), this.options.lingerMs);
+    }
+  }
+
+  get holdsActivity() {
+    return (
+      this.running || this.awaiting || this.queuedItems.some((item) => item.status !== "unknown")
+    );
+  }
+
+  get isRunning() {
+    return this.running;
+  }
+  get awaiting() {
+    return this.openRequests.length > 0;
+  }
+  get currentTurnRevision() {
+    return this.turnRevision;
+  }
+
+  admittedTurn(revision: number): void {
+    if (this.disposed || this.running || this.turnRevision !== revision) return;
+    // The acknowledgement can precede the engine event; only the latter starts a new timeline.
+    this.running = true;
+    this.turnRevision++;
+    if (this.listeners.size === 0) this.scheduleIdleDisposal();
+  }
+
+  get activityRevision() {
+    return this.seq + this.turnRevision;
+  }
+
+  reconcileDetached(
+    state: "idle" | "working" | "waiting" | "starting",
+    distinguishesWaiting: boolean,
+    openRequests?: ReadonlyArray<PaPendingRequest>,
+  ) {
+    if (this.listeners.size || this.disposed || this.release === null) return;
+    const running = state !== "idle";
+    if (running !== this.running) this.turnRevision++;
+    this.running = running;
+    if (openRequests) this.openRequests = openRequests;
+    else if (state === "idle" || (distinguishesWaiting && state !== "waiting"))
+      this.openRequests = this.openRequests.filter((request) => request.scope === "session");
+    if (state === "idle") {
+      this.queuedItems = this.queuedItems.filter((item) => item.status === "unknown");
+    }
+    this.scheduleIdleDisposal();
+  }
+
+  removeBot() {
+    this.failAll(new PaError({ reason: "NotFound", message: "Bot not found" }));
   }
 
   get listenerCount(): number {

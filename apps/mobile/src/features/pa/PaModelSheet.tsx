@@ -1,5 +1,5 @@
 import { useAtomValue } from "@effect/atom-react";
-import type { StaticScreenProps } from "@react-navigation/native";
+import { useNavigation, StackActions, type StaticScreenProps } from "@react-navigation/native";
 import {
   filterPaModelProviders,
   formatPaModelLabel,
@@ -31,7 +31,11 @@ import { paModelCatalogs, usePaModelCatalog } from "./usePaModelCatalog";
 
 type ModelSelection = Pick<PaSelectBotModelInput, "provider" | "model" | "reasoningEffort">;
 
-type PaModelParams = PaBotParams & { readonly query?: string };
+type PaModelParams = PaBotParams & {
+  readonly query?: string;
+  readonly draftTab?: "profile" | "toggles" | "schedules";
+  readonly fromSettings?: "keepDrafts" | "close";
+};
 
 /** Switches the Bot's (or the session's) model and reasoning effort. */
 export function PaModelSheet({ route }: StaticScreenProps<PaModelParams>) {
@@ -52,6 +56,7 @@ function PaModelPicker({
   chat,
   state,
 }: { readonly params: PaModelParams } & ReturnType<typeof usePaBotChat>) {
+  const navigation = useNavigation();
   const gt = useGT();
   const messages = useMessages();
   const { environmentId, botId } = params;
@@ -167,6 +172,17 @@ function PaModelPicker({
     }
     setConfirm(null);
     if (!input.reasoningEffort) setCustom("");
+    if (params.fromSettings && navigation.isFocused()) {
+      navigation.dispatch(
+        params.fromSettings === "keepDrafts"
+          ? StackActions.popTo(
+              "PaBotSettings",
+              { environmentId, botId, tab: params.draftTab ?? "profile" },
+              { merge: true },
+            )
+          : StackActions.pop(2),
+      );
+    }
   };
 
   const renderGroup = (option: PaModelProvider) => (

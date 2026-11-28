@@ -2,6 +2,7 @@ import {
   makePaBotId,
   PaError,
   parsePaBotId,
+  paProfileDescription,
   type PaBotConfig,
   type PaBotSummary,
   type PaCreateBotInput,
@@ -48,7 +49,7 @@ import { HermesPaAdapter } from "./adapters/hermes/HermesPaAdapter.ts";
 import { DEFAULT_PA_HUB_OPTIONS, PaSessionHub, type PaHubOptions } from "./PaSessionHub.ts";
 import { defaultVisualForBot, PaStore } from "./PaStore.ts";
 import { PaAttachmentStore } from "./PaAttachmentStore.ts";
-import { isPaInputRefusal } from "./types.ts";
+import { isPaInputRefusal, latestTranscriptReply } from "./types.ts";
 import type { PaAgentRow, PaCommandScope, PaEngineInstance } from "./types.ts";
 
 function nowMs(): number {
@@ -163,6 +164,10 @@ export function makePaService(options: {
   const { store } = options;
   const instances = new Map(options.instances.map((instance) => [instance.instanceId, instance]));
   const hubs = new Map<string, PaSessionHub>();
+  const botHubs = new Map<string, Set<PaSessionHub>>();
+  const instanceReads = new Map<string, Promise<ReadonlyArray<PaAgentRow>>>();
+  const lastRosters = new Map<string, ReadonlyArray<PaAgentRow>>();
+  const hubOwners = new Map<string, string>();
   const hubOptions = options.hub ?? DEFAULT_PA_HUB_OPTIONS;
   // Events a slow client may lag behind before its stream is cut and it resumes. It must hold a
   // whole hub replay, or a legitimate catch-up would cut the client it is catching up.
@@ -196,6 +201,12 @@ export function makePaService(options: {
   const summarize = (instance: PaEngineInstance, row: PaAgentRow): PaBotSummary => {
     const botId = makePaBotId(instance.instanceId, row.agentRef);
     const meta = store.getBotMeta(botId);
+    const sessions = Array.from(botHubs.get(botId) ?? []);
+    const running = row.running || sessions.some((hub) => hub.isRunning);
+    const awaiting =
+      Array.from(row.activeSessions?.values() ?? []).includes("waiting") ||
+      sessions.some((hub) => hub.awaiting);
+    const completedAt = Math.max(meta.lastCompletedAt ?? 0, row.lastReplyAt ?? 0);
     const visual = defaultVisualForBot(botId, row.isDefault);
     return {
       botId,
@@ -212,11 +223,13 @@ export function makePaService(options: {
       model: row.model,
       provider: row.provider,
       online: true,
-      running: row.running,
+      running,
+      awaiting,
       unread:
-        row.lastActivityAt !== null &&
-        meta.lastReadAt !== undefined &&
-        row.lastActivityAt > meta.lastReadAt,
+        (!running || awaiting) &&
+        (completedAt > (meta.lastReadAt ?? 0) ||
+          meta.replies?.some((reply) => !reply.read) === true ||
+          meta.progress?.some((entry) => entry.unread !== undefined) === true),
       lastMessagePreview: row.lastMessagePreview,
       lastActivityAt: row.lastActivityAt,
       primarySessionId: meta.primarySessionId ?? null,
@@ -250,24 +263,114 @@ export function makePaService(options: {
 
   const hubKey = (botId: string, sessionId: string) => `${botId}\u0000${sessionId}`;
 
+  const ownerFor = (botId: string, sessionId: string) =>
+    hubOwners.get(hubKey(botId, sessionId)) ?? sessionId;
+
+  const readRoster = (instance: PaEngineInstance) => {
+    const id = instance.instanceId;
+    const held = instanceReads.get(id);
+    if (held) return held;
+    const revisions = new Map(Array.from(hubs.values(), (hub) => [hub, hub.activityRevision]));
+    const read = instance
+      .listAgents()
+      .then(async (rows) => {
+        if (instanceReads.get(id) !== read) return rows;
+        const cached = new Map(lastRosters.get(id)?.map((row) => [row.agentRef, row]));
+        const confirmed: PaAgentRow[] = [];
+        const present = new Set<string>();
+        for (const row of rows) {
+          const botId = makePaBotId(id, row.agentRef);
+          present.add(botId);
+          store.rememberReplies(
+            botId,
+            (row.replies ?? []).map((reply) => ({
+              ...reply,
+              sessionId: ownerFor(botId, reply.sessionId),
+            })),
+            "history",
+          );
+          const prior = cached.get(row.agentRef);
+          const activity =
+            row.activeSessions === null ? (prior?.activeSessions ?? null) : row.activeSessions;
+          let states = activity;
+          if (row.activeSessions) {
+            for (const hub of botHubs.get(botId) ?? []) {
+              const stillDetached = () =>
+                !hub.listenerCount &&
+                revisions.get(hub) === hub.activityRevision &&
+                instanceReads.get(id) === read;
+              if (!stillDetached()) continue;
+              const state = row.activeSessions.get(ownerFor(botId, hub.sessionId));
+              if (
+                hub.holdsActivity &&
+                instance.refreshSessionActivity &&
+                (state === undefined || (hub.awaiting && state !== "waiting"))
+              ) {
+                const snapshot = await instance
+                  .refreshSessionActivity(row.agentRef, hub.sessionId, stillDetached)
+                  .catch(() => undefined);
+                if (snapshot && stillDetached()) {
+                  const verified = snapshot.running ? "working" : "idle";
+                  hub.reconcileDetached(verified, true, snapshot.openRequests);
+                  if (state !== verified) {
+                    states = new Map(states).set(ownerFor(botId, hub.sessionId), verified);
+                  }
+                }
+              } else if (state || row.completeActivity)
+                hub.reconcileDetached(state ?? "idle", row.completeActivity === true);
+            }
+          }
+          if (row.activeSessions === null && prior) {
+            confirmed.push({
+              ...row,
+              running: row.running || prior.running,
+              activeSessions: states ?? null,
+            });
+          } else if (states && states !== row.activeSessions) {
+            confirmed.push({
+              ...row,
+              running: [...states.values()].some((state) => state !== "idle"),
+              activeSessions: states,
+            });
+          } else confirmed.push(row);
+        }
+        for (const [botId, sessions] of botHubs) {
+          if (parsePaBotId(botId)?.instanceId === id && !present.has(botId))
+            for (const hub of sessions) hub.removeBot();
+        }
+        if (instanceReads.get(id) === read) lastRosters.set(id, confirmed);
+        return confirmed;
+      })
+      .finally(() => {
+        if (instanceReads.get(id) === read) instanceReads.delete(id);
+      });
+    instanceReads.set(id, read);
+    return read;
+  };
+
+  const finishPriorRosterRead = (instance: PaEngineInstance) =>
+    Effect.promise(async () => {
+      await instanceReads.get(instance.instanceId)?.catch(() => undefined);
+    });
+
   const listBots = Effect.fn("PaService.listBots")(function* () {
-    // The roster read is the status probe: an instance is online exactly when its list answered.
     const results = yield* Effect.forEach(
       Array.from(instances.values()),
       (instance) =>
-        fromPromise(() => instance.listAgents()).pipe(
+        fromPromise(() => readRoster(instance)).pipe(
           Effect.map((rows) => ({
             status: status(instance, { botCount: rows.length, error: null }),
             bots: rows.map((row) => summarize(instance, row)),
           })),
-          Effect.catch((error) =>
-            Effect.succeed({
-              status: status(instance, { botCount: 0, error: error.message }),
-              bots: [] as ReadonlyArray<PaBotSummary>,
-            }),
-          ),
+          Effect.catch((error) => {
+            const rows = lastRosters.get(instance.instanceId) ?? [];
+            return Effect.succeed({
+              status: status(instance, { botCount: rows.length, error: error.message }),
+              bots: rows.map((row) => ({ ...summarize(instance, row), online: false })),
+            });
+          }),
         ),
-      { concurrency: "unbounded" },
+      { concurrency: 3 },
     );
     return {
       instances: results.map((entry) => entry.status),
@@ -304,7 +407,8 @@ export function makePaService(options: {
         lastReadAt: nowMs(),
       }),
     );
-    const rows = yield* fromPromise(() => instance.listAgents());
+    yield* finishPriorRosterRead(instance);
+    const rows = yield* fromPromise(() => readRoster(instance));
     const row = rows.find((entry) => entry.agentRef === agentRef);
     if (!row) {
       return yield* new PaError({
@@ -325,7 +429,16 @@ export function makePaService(options: {
         ...(input.avatarColor !== undefined ? { avatarColor: input.avatarColor } : {}),
         ...(input.avatarShape !== undefined ? { avatarShape: input.avatarShape } : {}),
         ...(input.pinned !== undefined ? { pinned: input.pinned } : {}),
-        ...(input.markRead === true ? { lastReadAt: nowMs() } : {}),
+        ...(input.markRead === true
+          ? store.readPatch(
+              botId,
+              nowMs(),
+              input.seenReply && {
+                ...input.seenReply,
+                sessionId: ownerFor(botId, input.seenReply.sessionId),
+              },
+            )
+          : {}),
       }),
     );
   });
@@ -347,12 +460,25 @@ export function makePaService(options: {
     return yield* fromPromise(() => models.getCatalog(agentRef, input.sessionId));
   });
 
+  const patchCachedAgent = (
+    instance: PaEngineInstance,
+    agentRef: string,
+    patch: Partial<PaAgentRow>,
+  ) => {
+    const rows = lastRosters.get(instance.instanceId);
+    if (rows)
+      lastRosters.set(
+        instance.instanceId,
+        rows.map((row) => (row.agentRef === agentRef ? { ...row, ...patch } : row)),
+      );
+  };
+
   const selectBotModel = Effect.fn("PaService.selectBotModel")(function* (
     input: PaSelectBotModelInput,
   ) {
     const { instance, agentRef } = yield* resolveBot(input.botId);
     const models = yield* facet(instance, "models", "model selection");
-    return yield* fromPromise(() =>
+    const result = yield* fromPromise(() =>
       models.select(agentRef, {
         sessionId: input.sessionId,
         provider: input.provider,
@@ -361,6 +487,14 @@ export function makePaService(options: {
         confirm: input.confirm === true,
       }),
     );
+    if (result.status === "applied") {
+      yield* finishPriorRosterRead(instance);
+      if (instance.capabilities.models.scope === "agent" && input.model !== undefined) {
+        const { model, provider } = result.current;
+        patchCachedAgent(instance, agentRef, { model, provider });
+      }
+    }
+    return result;
   });
 
   const getBotConfig = Effect.fn("PaService.getBotConfig")(function* (botId: string) {
@@ -374,7 +508,11 @@ export function makePaService(options: {
   ) {
     const { instance, agentRef } = yield* resolveBot(input.botId);
     const config = yield* facet(instance, "config", "agent configuration");
-    return yield* fromPromise(() => config.patch(agentRef, input.sectionId, input.value));
+    const result = yield* fromPromise(() => config.patch(agentRef, input.sectionId, input.value));
+    yield* finishPriorRosterRead(instance);
+    const description = paProfileDescription(result);
+    if (description !== undefined) patchCachedAgent(instance, agentRef, { description });
+    return result;
   });
 
   const listSchedules = Effect.fn("PaService.listSchedules")(function* (botId: string) {
@@ -449,7 +587,9 @@ export function makePaService(options: {
     const setPrimary = input.setPrimary !== false;
     if (setPrimary) {
       yield* fromSync(() =>
-        store.updateBotMeta(botId, { primarySessionId: created.sessionId, lastReadAt: nowMs() }),
+        store.updateBotMeta(botId, {
+          primarySessionId: created.sessionId,
+        }),
       );
     }
     return { ...created, isPrimary: setPrimary };
@@ -496,6 +636,9 @@ export function makePaService(options: {
         cursor: input.cursor,
       }),
     );
+    const reply =
+      !input.cursor && latestTranscriptReply(ownerFor(input.botId, input.sessionId), page.messages);
+    if (reply) yield* fromSync(() => store.rememberReplies(input.botId, [reply], "history"));
     return {
       messages: yield* fromPromise(async () => {
         const storage = options.attachmentStore;
@@ -551,6 +694,8 @@ export function makePaService(options: {
             storage.claim(botId, sessionKey, inputId, input.text.trim(), uploads, caps),
           )
         : [];
+    const feed = hubs.get(hubKey(botId, input.sessionId));
+    const priorRevision = feed?.currentTurnRevision;
     const result = yield* fromPromise(() =>
       instance.sendMessage(agentRef, input.sessionId, input.text, {
         inputId,
@@ -579,6 +724,14 @@ export function makePaService(options: {
         return fromSync(() => storage.unclaim(botId, sessionKey, inputId));
       }),
     );
+    if (
+      result.kind === "turn" &&
+      !result.settled &&
+      !result.unknown &&
+      !result.queued &&
+      priorRevision !== undefined
+    )
+      feed?.admittedTurn(priorRevision);
     if (result.kind === "output" && local.length && storage && inputId)
       yield* fromSync(() => storage.unclaim(botId, sessionKey, inputId));
     if (result.kind === "turn" && local.length && storage && inputId) {
@@ -703,15 +856,36 @@ export function makePaService(options: {
     return kind === "secret" ? ("manage" as const) : ("operate" as const);
   });
 
+  const settleRequests = (
+    botId: string,
+    owner: string,
+    requestId: string,
+    except?: PaSessionHub,
+  ) => {
+    for (const hub of botHubs.get(botId) ?? []) {
+      if (hub !== except && ownerFor(botId, hub.sessionId) === owner) hub.resolveRequest(requestId);
+    }
+  };
+
   const respondRequest = Effect.fn("PaService.respondRequest")(function* (
     input: PaRespondRequestInput,
   ) {
     const { instance, agentRef, botId } = yield* resolveBot(input.botId);
     const requests = yield* facet(instance, "requests", "approvals");
     const { botId: _botId, sessionId, ...answer } = input;
-    yield* fromPromise(() => requests.respond(agentRef, sessionId, answer));
-    // The engine's own settle event may come late or never: the answered card leaves every viewer now.
-    hubs.get(hubKey(botId, sessionId))?.resolveRequest(input.requestId);
+    const owner = ownerFor(botId, sessionId);
+    yield* fromPromise(() => requests.respond(agentRef, sessionId, answer)).pipe(
+      Effect.tapError((error) =>
+        Effect.sync(() => {
+          if (
+            error.reason === "Conflict" &&
+            requests.kindOf?.(agentRef, sessionId, input.requestId) === null
+          )
+            settleRequests(botId, owner, input.requestId);
+        }),
+      ),
+    );
+    settleRequests(botId, owner, input.requestId);
   });
 
   const hubFor = (
@@ -724,6 +898,27 @@ export function makePaService(options: {
     const existing = hubs.get(key);
     if (existing) return existing;
     let ownerId = sessionId;
+    let checkingHistory = false;
+    let checkAgain = false;
+    const checkHistory = async () => {
+      if (checkingHistory) {
+        checkAgain = true;
+        return;
+      }
+      checkingHistory = true;
+      try {
+        do {
+          checkAgain = false;
+          const page = await instance.getMessages(agentRef, sessionId, { limit: 32 });
+          const reply = latestTranscriptReply(ownerId, page.messages);
+          if (reply && hubs.get(key) === hub) store.rememberReplies(botId, [reply], "history");
+        } while (checkAgain && hubs.get(key) === hub);
+      } catch {
+        // The next roster or transcript read retries against durable history.
+      } finally {
+        checkingHistory = false;
+      }
+    };
     const hub: PaSessionHub = new PaSessionHub(
       sessionId,
       (subscriber, feedOptions) =>
@@ -732,9 +927,11 @@ export function makePaService(options: {
           sessionId,
           {
             ...subscriber,
-            onAttachmentSession: (id) => {
+            onCanonicalSession: (id) => {
+              hubOwners.set(key, id);
               ownerId = id;
               try {
+                store.bindReplySession(botId, sessionId, id);
                 options.attachmentStore?.bindSession(botId, sessionId, id);
               } catch {
                 process.emitWarning("PA attachment session alias could not be recorded");
@@ -762,7 +959,39 @@ export function makePaService(options: {
               } catch {
                 process.emitWarning("PA attachment queue metadata is unavailable");
               }
+              if (
+                event.type === "turn.completed" &&
+                event.replyId &&
+                (event.status !== "interrupted" || event.text?.trim())
+              ) {
+                const { replyAliases = [], ...completion } = event;
+                enriched = completion;
+                try {
+                  const identified = store.rememberReplies(
+                    botId,
+                    [
+                      {
+                        sessionId: ownerId,
+                        ids: [event.replyId, ...replyAliases],
+                        timestamp: nowMs(),
+                      },
+                    ],
+                    "feed",
+                  );
+                  if (!identified) void checkHistory();
+                } catch {
+                  process.emitWarning("PA turn completion could not be recorded");
+                }
+              }
+              if (
+                event.type === "turn.completed" &&
+                !event.replyId &&
+                (event.status !== "interrupted" || event.text?.trim())
+              )
+                void checkHistory();
               subscriber.onEvent(enriched);
+              if (event.type === "request.resolved")
+                settleRequests(botId, ownerId, event.requestId, hubs.get(key));
             },
           },
           feedOptions,
@@ -770,9 +999,15 @@ export function makePaService(options: {
       hubOptions,
       () => {
         if (hubs.get(key) === hub) hubs.delete(key);
+        const sessions = botHubs.get(botId);
+        sessions?.delete(hub);
+        if (sessions?.size === 0) botHubs.delete(botId);
       },
     );
     hubs.set(key, hub);
+    const sessions = botHubs.get(botId) ?? new Set<PaSessionHub>();
+    sessions.add(hub);
+    botHubs.set(botId, sessions);
     return hub;
   };
 
@@ -844,6 +1079,9 @@ export function makePaService(options: {
     subscribeSession,
     dispose: () => {
       for (const hub of Array.from(hubs.values())) hub.dispose();
+      instanceReads.clear();
+      lastRosters.clear();
+      hubOwners.clear();
       for (const instance of instances.values()) instance.dispose?.();
     },
   };

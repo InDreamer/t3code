@@ -1,7 +1,6 @@
 import {
   ArrowLeftIcon,
   ArrowRightIcon,
-  BotIcon,
   ChartNoAxesColumnIcon,
   Code2Icon,
   SettingsIcon,
@@ -45,6 +44,7 @@ import { readIssueListPreferences } from "../issue/issueListPreferences";
 import { IssueGlyph } from "../issue/issuePresentation";
 import { isSidebarUtilityPage, useNavigateToMainApp } from "./mainAppLocation";
 import { getLastPaBotId } from "../pa/paBotsStore";
+import { PaBotsMark } from "../pa/PaBotsMark";
 import { SidebarThreadUndoNotice } from "./SidebarThreadUndoNotice";
 import { SidebarProviderUpdatePill } from "./SidebarProviderUpdatePill";
 import { SidebarUpdateArchitectureWarning, SidebarUpdatePill } from "./SidebarUpdatePill";
@@ -292,7 +292,7 @@ export const SidebarModeSwitcher = memo(function SidebarModeSwitcher({
               : "text-sidebar-muted-foreground hover:text-sidebar-foreground",
           )}
         >
-          <BotIcon className="size-3.5 shrink-0" aria-hidden />
+          <PaBotsMark className="size-3.5 shrink-0" aria-hidden />
           <span className="truncate">
             <T>Bots</T>
           </span>

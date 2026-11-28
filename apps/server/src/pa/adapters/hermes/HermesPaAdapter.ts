@@ -25,12 +25,14 @@ import {
 } from "@t3tools/contracts";
 
 import type { PaStore } from "../../PaStore.ts";
-import { isPaInputRefusal } from "../../types.ts";
+import { isPaInputRefusal, latestTranscriptReply } from "../../types.ts";
 import type {
   PaAdapterEvent,
   PaAdapterSession,
+  PaAgentRow,
   PaEngineInstance,
   PaMessagePage,
+  PaReply,
   PaSendOptions,
   PaLocalAttachment,
   PaStagedAttachment,
@@ -64,6 +66,7 @@ import {
   normalizeCronJobs,
   normalizeHermesQueue,
   normalizeHermesReasoningEffort,
+  normalizeHermesTimestamp,
   normalizeHermesTodoState,
   normalizeHermesUsage,
   normalizeModelCatalog,
@@ -163,6 +166,37 @@ interface TrackedSessionState {
 
 type FeedRequest = HermesTrackedRequest & { readonly connection?: HermesRpcConnection };
 
+function snapshotRequests(
+  snapshot: HermesResumeSnapshot,
+  conn: HermesRpcConnection,
+  generation: number,
+) {
+  const authoritative = new Map<string, FeedRequest>();
+  for (const entry of snapshot.open_requests ?? []) {
+    const tracked = normalizePendingRequest(
+      entry.id ?? entry.request_id ?? "",
+      entry.method,
+      entry.params,
+      "server_request",
+      generation,
+    );
+    if (tracked) authoritative.set(tracked.request.requestId, { ...tracked, connection: conn });
+  }
+  for (const prompt of snapshot.prompts ?? []) {
+    const tracked = normalizePendingRequest(
+      prompt.prompt_id ?? prompt.id ?? "",
+      prompt.kind === "clarify" ? "clarify" : "approval",
+      prompt.payload ?? prompt.params ?? prompt,
+      "canonical",
+      typeof prompt.execution_generation === "number" ? prompt.execution_generation : generation,
+    );
+    if (tracked && !authoritative.has(tracked.request.requestId)) {
+      authoritative.set(tracked.request.requestId, tracked);
+    }
+  }
+  return authoritative;
+}
+
 interface HermesSubmitReceipt {
   readonly admission_id?: string;
   readonly submission_id?: string;
@@ -204,6 +238,7 @@ interface RenameAttempt {
 
 /** Hermes's `session.list` page cap. */
 const SESSION_LIST_MAX = 200;
+const ROSTER_HISTORY_LIMIT = 8;
 const RENAME_ATTEMPT_CACHE_SIZE = 256;
 
 /** Results of recent slash commands by input id: Hermes has no input-id dedupe for `slash.exec`. */
@@ -231,7 +266,10 @@ function isSlashRefusal(error: unknown): boolean {
 }
 
 /** Older gateways lack the method or key; anything else is a real failure worth surfacing. */
-function isUnsupportedRpc(error: unknown, method: "model.options" | "config.get"): boolean {
+function isUnsupportedRpc(
+  error: unknown,
+  method: "model.options" | "config.get" | "session.active_list",
+): boolean {
   return (
     error instanceof HermesRpcError &&
     (error.code === -32601 ||
@@ -330,6 +368,10 @@ export class HermesPaAdapter implements PaEngineInstance {
   private readonly store: PaStore | undefined;
   private readonly pool: HermesConnectionPool;
   private readonly sessionStates = new Map<string, TrackedSessionState>();
+  private readonly rosterReplies = new Map<
+    string,
+    { key: string; reply: PaReply | null; cursor?: string }
+  >();
   private readonly slashRuns = new Map<string, SlashRun>();
   private readonly stagedInputs = new Map<
     string,
@@ -365,6 +407,7 @@ export class HermesPaAdapter implements PaEngineInstance {
     this.stagedInputs.clear();
     this.settledSlashRuns.clear();
     this.sessionStates.clear();
+    this.rosterReplies.clear();
     this.pool.closeAll();
   };
 
@@ -409,35 +452,177 @@ export class HermesPaAdapter implements PaEngineInstance {
   }
 
   /** An answered prompt is gone for every alias of its session on this profile. */
-  private forgetRequest(profile: string, requestId: string): void {
-    for (const state of this.sessionStates.values()) {
-      if (state.profile === profile) state.requests.delete(requestId);
+  private forgetRequest(profile: string, sessionId: string, requestId: string): void {
+    for (const [key, state] of this.sessionStates) {
+      if (
+        state.profile === profile &&
+        (state.canonicalSessionId === sessionId || key === this.sessionKey(profile, sessionId))
+      )
+        state.requests.delete(requestId);
     }
+  }
+
+  private async activeSessions(conn: HermesRpcConnection) {
+    let complete = true;
+    const result = await conn
+      .call<{ sessions: ReadonlyArray<HermesSessionRow> }>("session.active_list")
+      .catch((error: unknown) => {
+        if (!isUnsupportedRpc(error, "session.active_list")) throw error;
+        complete = false;
+        return conn.call<{ sessions: ReadonlyArray<HermesSessionRow> }>("session.list", {
+          scope: "live",
+          limit: SESSION_LIST_MAX,
+          include_hidden: true,
+        });
+      });
+    const states = new Map<string, "working" | "waiting" | "starting" | "idle">();
+    for (const row of result.sessions) {
+      const id = row.session_id ?? row.id;
+      if (id)
+        states.set(
+          id,
+          row.status === "waiting" || row.status === "starting" || row.status === "working"
+            ? row.status
+            : row.running
+              ? "working"
+              : "idle",
+        );
+    }
+    return { states, rows: result.sessions, complete };
+  }
+
+  private async latestReply(
+    profile: string,
+    sessionId: string,
+    key: string,
+    budget: { remaining: number },
+  ): Promise<PaReply | null> {
+    const cacheId = this.sessionKey(profile, sessionId);
+    const cached = this.rosterReplies.get(cacheId);
+    const same = cached?.key === key;
+    if (key && same && !cached.cursor) return cached.reply;
+    let cursor = same ? cached.cursor : undefined;
+    let reply: PaReply | null = null;
+    do {
+      if (!budget.remaining) {
+        if (cursor) this.rosterReplies.set(cacheId, { key, reply: null, cursor });
+        return null;
+      }
+      budget.remaining--;
+      const page = await this.getMessages(profile, sessionId, { limit: 32, cursor });
+      reply = latestTranscriptReply(sessionId, page.messages);
+      if (reply || !page.nextCursor) break;
+      if (page.reset || page.nextCursor === cursor) {
+        this.rosterReplies.delete(cacheId);
+        return null;
+      }
+      cursor = page.nextCursor ?? undefined;
+    } while (cursor);
+    this.rosterReplies.set(cacheId, { key, reply });
+    return reply;
+  }
+
+  private async rosterActivity(
+    row: HermesProfileRow,
+    agent: PaAgentRow,
+    budget: { remaining: number },
+  ): Promise<PaAgentRow> {
+    const conn = await this.pool.getConnection(row.name).catch(() => null);
+    if (!conn) return { ...agent, activeSessions: null };
+    const active = await this.activeSessions(conn).catch(() => undefined);
+    const sessions = new Map<string, HermesSessionRow>();
+    for (const session of [row.last_session, row.canonical_session]) {
+      const id = session?.resolved_id ?? session?.id;
+      if (id && session) sessions.set(id, session);
+    }
+    // active_list also covers live rows beyond session.list's page cap.
+    for (const session of active?.rows ?? []) {
+      const id = session.session_id ?? session.id;
+      if (id) sessions.set(id, { ...session, ...sessions.get(id) });
+    }
+    const list = (scope: "stored" | "live", cursor?: string) =>
+      conn
+        .call<{ sessions: ReadonlyArray<HermesSessionRow>; next_cursor?: string }>("session.list", {
+          scope,
+          ...(cursor ? { cursor } : {}),
+          limit: ROSTER_HISTORY_LIMIT,
+          include_hidden: true,
+          picker: true,
+        })
+        .catch(() => null);
+    const [stored, live] = await Promise.all([list("stored"), list("live")]);
+    const page =
+      stored?.next_cursor && !stored.sessions.length
+        ? await list("stored", stored.next_cursor)
+        : stored;
+    for (const session of [...(page?.sessions ?? []), ...(live?.sessions ?? [])]) {
+      const id = session.session_id ?? session.id;
+      if (id) sessions.set(id, { ...sessions.get(id), ...session });
+    }
+    const lastReadAt =
+      this.store?.getBotMeta(makePaBotId(this.instanceId, row.name)).lastReadAt ?? 0;
+    const activity = (session: HermesSessionRow) =>
+      normalizeHermesTimestamp(
+        session.last_active_at ?? session.updated_at ?? session.last_active,
+      ) ?? 0;
+    const candidates = [...sessions]
+      .filter(([, session]) => {
+        const updated = normalizeHermesTimestamp(session.last_active_at ?? session.updated_at);
+        return updated === null || updated >= lastReadAt;
+      })
+      .sort(([, a], [, b]) => activity(b) - activity(a))
+      .slice(0, ROSTER_HISTORY_LIMIT);
+    const replies: PaReply[] = [];
+    for (const [id, session] of candidates) {
+      // Picker counts and last_reply describe the current segment, even on an empty compression tip.
+      const facts = [
+        activity(session) || null,
+        session.message_count,
+        session.last_reply,
+        session.preview,
+      ];
+      const key = facts.some((value) => value != null) ? JSON.stringify(facts) : "";
+      const reply = await this.latestReply(row.name, id, key, budget).catch(() => null);
+      if (reply) replies.push(reply);
+    }
+    return {
+      ...agent,
+      activeSessions: active?.states ?? null,
+      completeActivity: active?.complete ?? false,
+      running:
+        (active?.complete ? false : agent.running) ||
+        Array.from(active?.states.values() ?? []).some((state) => state !== "idle"),
+      replies,
+    };
   }
 
   listAgents = () =>
     withPaErrors(async () => {
       const defaultConn = await this.pool.getConnection("default");
-      const listRes = await defaultConn.call<{ profiles?: ReadonlyArray<HermesProfileRow> }>(
+      const listRes = await defaultConn.call<{ profiles: ReadonlyArray<HermesProfileRow> }>(
         "profiles.list",
         { include_sessions: true },
       );
-      // One `profiles.describe` over the already-open default socket, and only for a profile
-      // whose row omits its model: no per-profile attach on every roster refresh.
-      return Promise.all(
-        (listRes.profiles ?? []).map(async (row) => {
-          const agent = normalizeProfileRow(row);
-          if (agent.model) return agent;
-          const described = await defaultConn
-            .call<HermesProfileDescription>("profiles.describe", { name: row.name })
-            .catch(() => null);
-          return {
-            ...agent,
-            model: described?.model?.default || null,
-            provider: described?.model?.provider || agent.provider,
-          };
-        }),
-      );
+      const agents: PaAgentRow[] = [];
+      const budget = { remaining: ROSTER_HISTORY_LIMIT };
+      for (let index = 0; index < listRes.profiles.length; index += 3) {
+        const batch = await Promise.all(
+          listRes.profiles.slice(index, index + 3).map(async (row) => {
+            const agent = await this.rosterActivity(row, normalizeProfileRow(row), budget);
+            if (agent.model) return agent;
+            const described = await defaultConn
+              .call<HermesProfileDescription>("profiles.describe", { name: row.name })
+              .catch(() => null);
+            return {
+              ...agent,
+              model: described?.model?.default || null,
+              provider: described?.model?.provider || agent.provider,
+            };
+          }),
+        );
+        agents.push(...batch);
+      }
+      return agents;
     });
 
   listSessions = (
@@ -715,6 +900,48 @@ export class HermesPaAdapter implements PaEngineInstance {
     this.applyResumeSnapshot(state, conn, snap);
     return state;
   }
+
+  refreshSessionActivity = async (
+    profile: string,
+    sessionId: string,
+    stillDetached: () => boolean,
+  ) => {
+    const state = this.sessionStates.get(this.sessionKey(profile, sessionId));
+    const conn = state?.attachedConn;
+    if (!state || !conn || !state.subscribers) return undefined;
+    const target = {
+      session_id: state.canonicalSessionId ?? sessionId,
+      omit_messages: true,
+      defer_history: true,
+    };
+    // Poll the existing attachment so Hermes preserves the feed and its request routing.
+    const snapshot: HermesResumeSnapshot = await conn
+      .call<HermesResumeSnapshot>("session.resume", target)
+      .catch((cause: unknown) => {
+        if (toPaError(cause).reason === "NotFound")
+          return { running: false, open_requests: [], prompts: [] };
+        throw cause;
+      });
+    if (
+      !stillDetached() ||
+      state.attachedConn !== conn ||
+      !state.subscribers ||
+      typeof snapshot.running !== "boolean"
+    )
+      return undefined;
+    const requests = snapshotRequests(
+      snapshot,
+      conn,
+      snapshot.execution_generation ?? state.executionGeneration,
+    );
+    state.requests.clear();
+    for (const [id, request] of requests) state.requests.set(id, request);
+    return {
+      running:
+        snapshot.running || snapshot.pending?.some((item) => item.status === "queued") === true,
+      openRequests: Array.from(requests.values(), (tracked) => tracked.request),
+    };
+  };
 
   attachmentSessionId = (profile: string, sessionId: string, readOnly: boolean) =>
     withPaErrors(async () => {
@@ -1087,6 +1314,7 @@ export class HermesPaAdapter implements PaEngineInstance {
       ...(res.admission_id && res.submission_id && res.admission_id !== res.submission_id
         ? { admissionId: res.admission_id }
         : {}),
+      ...(res.status === "unknown" ? { unknown: true } : {}),
       ...(res.status === "terminal" ? { settled: true } : {}),
       // Every admission answers `queued` before the drain claims it, an idle session's too: only
       // a send the client made behind a running turn is reported as waiting.
@@ -1249,7 +1477,7 @@ export class HermesPaAdapter implements PaEngineInstance {
             input,
             decision,
           );
-          this.forgetRequest(profile, input.requestId);
+          this.forgetRequest(profile, state.canonicalSessionId ?? sessionId, input.requestId);
           if (outcome === "already_resolved") {
             throw new PaError({
               reason: "Conflict",
@@ -1544,7 +1772,7 @@ export class HermesPaAdapter implements PaEngineInstance {
       throw err;
     }
     this.applyResumeSnapshot(state, conn, snapshot);
-    subscriber.onAttachmentSession?.(state.canonicalSessionId ?? sessionId);
+    subscriber.onCanonicalSession?.(state.canonicalSessionId ?? sessionId);
     if (canReplay && !snapshotRequired && replayEpoch && replayEpoch !== state.replayEpoch) {
       // The epoch rolled over between `events.since` and `resume`; reload instead of mixing.
       snapshotRequired = true;
@@ -1615,31 +1843,7 @@ export class HermesPaAdapter implements PaEngineInstance {
     }
 
     // The snapshot is authoritative: prompts settled while detached cannot linger and be answered.
-    const authoritative = new Map<string, FeedRequest>();
-    for (const entry of snapshot.open_requests ?? []) {
-      const tracked = normalizePendingRequest(
-        entry.id ?? entry.request_id ?? "",
-        entry.method,
-        entry.params,
-        "server_request",
-        state.executionGeneration,
-      );
-      if (tracked) authoritative.set(tracked.request.requestId, { ...tracked, connection: conn });
-    }
-    for (const prompt of snapshot.prompts ?? []) {
-      const tracked = normalizePendingRequest(
-        prompt.prompt_id ?? prompt.id ?? "",
-        prompt.kind === "clarify" ? "clarify" : "approval",
-        prompt.payload ?? prompt.params ?? prompt,
-        "canonical",
-        typeof prompt.execution_generation === "number"
-          ? prompt.execution_generation
-          : state.executionGeneration,
-      );
-      if (tracked && !authoritative.has(tracked.request.requestId)) {
-        authoritative.set(tracked.request.requestId, tracked);
-      }
-    }
+    const authoritative = snapshotRequests(snapshot, conn, state.executionGeneration);
     state.requests.clear();
     for (const [requestId, tracked] of authoritative) state.requests.set(requestId, tracked);
 
@@ -1899,7 +2103,8 @@ export class HermesPaAdapter implements PaEngineInstance {
       profile,
       include_disabled: true,
     });
-    return normalizeCronJobs(res);
+    // Hermes appends jobs in creation order and omits created_at from cron.manage.
+    return normalizeCronJobs(res).reverse();
   }
 
   readonly lifecycle = {

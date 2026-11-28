@@ -139,6 +139,7 @@ export const PaBotSummary = Schema.Struct({
   provider: Schema.NullOr(Schema.String),
   online: Schema.Boolean,
   running: Schema.Boolean,
+  awaiting: Schema.optionalKey(Schema.Boolean),
   unread: Schema.Boolean,
   lastMessagePreview: Schema.NullOr(Schema.String),
   lastActivityAt: Schema.NullOr(Schema.Number),
@@ -287,6 +288,13 @@ export const PaBotConfig = Schema.Struct({
 });
 export type PaBotConfig = typeof PaBotConfig.Type;
 
+export function paProfileDescription(config: PaBotConfig) {
+  const profile = config.sections.find((section) => section.id === "profile");
+  if (profile?.kind !== "options") return undefined;
+  const field = profile.fields.find((field) => field.id === "description");
+  return field?.kind === "text" ? field.value : undefined;
+}
+
 export const PaConfigSectionValue = Schema.Union([
   Schema.Struct({
     kind: Schema.Literal("document"),
@@ -324,6 +332,8 @@ export const PaUpdateBotMetaInput = Schema.Struct({
   avatarShape: Schema.optionalKey(PaAvatarShape),
   pinned: Schema.optionalKey(Schema.Boolean),
   markRead: Schema.optionalKey(Schema.Boolean),
+  /** Chat acknowledges the row it rendered. An explicit roster action acknowledges the whole Bot. */
+  seenReply: Schema.optionalKey(Schema.Struct({ sessionId: PaSessionId, id: Schema.String })),
 });
 export type PaUpdateBotMetaInput = typeof PaUpdateBotMetaInput.Type;
 
@@ -513,6 +523,18 @@ export const PaMessage = Schema.Struct({
 });
 export type PaMessage = typeof PaMessage.Type;
 
+export function latestPaAssistantReply(messages: ReadonlyArray<PaMessage>) {
+  return messages.findLast(
+    (row) =>
+      row.role === "assistant" &&
+      row.rowKind === "message" &&
+      !row.commentary &&
+      !row.toolName &&
+      !row.toolCallId &&
+      row.text.trim().length > 0,
+  );
+}
+
 export const PaGetMessagesInput = Schema.Struct({
   botId: PaBotId,
   sessionId: PaSessionId,
@@ -556,6 +578,8 @@ export const PaSendResult = Schema.Struct({
   admissionId: Schema.optionalKey(Schema.String),
   /** A retried `inputId` whose turn already ended: nothing streams, reload the transcript. */
   settled: Schema.optionalKey(Schema.Boolean),
+  /** The engine cannot confirm the admission started. */
+  unknown: Schema.optionalKey(Schema.Boolean),
   output: Schema.optionalKey(Schema.String),
   notice: Schema.optionalKey(Schema.String),
   /** Waiting behind the running turn: shown from `queuedItems` until its own turn starts. */
@@ -789,6 +813,7 @@ export const PaStreamEvent = Schema.Union([
     type: Schema.Literal("turn.completed"),
     ...PaEventBase,
     status: Schema.Literals(["complete", "error", "interrupted"]),
+    replyId: Schema.optionalKey(Schema.String),
     /** The final answer, for engines that do not stream it as deltas. */
     text: Schema.optionalKey(Schema.String),
     error: Schema.optionalKey(Schema.String),

@@ -150,6 +150,27 @@ describe("PaSessionHub", () => {
     expect(foreign.events[0]!.resumeToken).toBe(resumed.events.at(-1)!.resumeToken);
   });
 
+  it("keeps unknown admissions actionable during the idle linger", async () => {
+    const { hub, emit, clock, isDisposed } = makeHub();
+    const detach = await hub.attach(listen().listener);
+    const unknown = { id: "lost", status: "unknown" as const, text: "retry?", canSteer: false };
+    emit({
+      type: "queue.updated",
+      sessionId: "s-1",
+      items: [unknown, { ...unknown, id: "next", status: "queued" }],
+    });
+    detach();
+    hub.reconcileDetached("idle", true);
+    expect(clock.pendingDelays()).toEqual([1000]);
+    const viewer = listen();
+    const leave = await hub.attach(viewer.listener);
+    expect(viewer.events[0]).toMatchObject({ queuedItems: [unknown] });
+    emit({ type: "queue.updated", sessionId: "s-1", items: [] });
+    leave();
+    clock.fireAll();
+    expect(isDisposed()).toBe(true);
+  });
+
   it("tracks running state and open requests for late joiners", async () => {
     const { hub, emit } = makeHub();
     await hub.attach(listen().listener);
@@ -170,6 +191,24 @@ describe("PaSessionHub", () => {
     const later = listen();
     await hub.attach(later.listener);
     expect(later.events[0]).toMatchObject({ running: false, openRequests: [] });
+  });
+
+  it("shows an admitted turn in the roster without replaying a start or reviving a completed turn", async () => {
+    const { hub, emit } = makeHub();
+    const viewer = listen();
+    await hub.attach(viewer.listener);
+    const before = hub.currentTurnRevision;
+    hub.admittedTurn(before);
+    expect(hub.isRunning).toBe(true);
+    emit({ type: "turn.started", sessionId: "s-1" });
+    emit({ type: "turn.completed", sessionId: "s-1", status: "complete" });
+    hub.admittedTurn(before);
+    expect(hub.isRunning).toBe(false);
+    expect(viewer.events.map((event) => event.type)).toEqual([
+      "snapshot",
+      "turn.started",
+      "turn.completed",
+    ]);
   });
 
   it("publishes persistent notices for output the engine does not keep", async () => {
@@ -200,6 +239,19 @@ describe("PaSessionHub", () => {
     expect(hub2.isDisposed()).toBe(true);
     expect(hub2.feeds[0]!.released).toBe(true);
     expect(feeds[0]!.released).toBe(false);
+  });
+
+  it("keeps a working feed after the last viewer leaves, then releases it after completion", async () => {
+    const { hub, clock, emit, isDisposed } = makeHub();
+    const detach = await hub.attach(listen().listener);
+    emit({ type: "turn.started", sessionId: "s-1" });
+    detach();
+    clock.fireAll();
+    expect(isDisposed()).toBe(false);
+    emit({ type: "turn.completed", sessionId: "s-1", status: "complete" });
+    expect(clock.pendingDelays()).toEqual([1000]);
+    clock.fireAll();
+    expect(isDisposed()).toBe(true);
   });
 
   it("reopens a dropped feed with resume, and fails listeners once retries run out", async () => {

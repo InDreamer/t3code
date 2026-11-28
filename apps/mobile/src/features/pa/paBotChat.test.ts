@@ -125,6 +125,45 @@ async function startedChat(client: PaClient) {
 }
 
 describe("createPaBotChat", () => {
+  it("reports a detached completion to the roster and marks it read on returning to chat", async () => {
+    const { api, feeds } = fakeClient();
+    vi.mocked(api.getMessages).mockResolvedValue({
+      messages: [stored("row-1", "assistant", "Earlier", 1)],
+    });
+    const onActivity = vi.fn();
+    const chat = createPaBotChat({ api, botId: "bot", onActivity });
+    const leave = chat.holdVisible();
+    await chat.setContext(context);
+    const feed = feeds.get("s1")!;
+    feed.onEvent(snapshot("s1"));
+    await chat.send("work");
+    expect(onActivity).toHaveBeenCalledWith({ running: true });
+    leave();
+    feed.onEvent({
+      type: "text.delta",
+      role: "commentary",
+      text: "Working",
+      sessionId: "s1",
+      resumeToken: "2",
+    });
+    feed.onEvent({
+      type: "turn.completed",
+      status: "complete",
+      replyId: "row-3",
+      sessionId: "s1",
+      resumeToken: "3",
+    });
+    expect(onActivity).toHaveBeenLastCalledWith(undefined);
+    await chat.setContext({ ...context, unread: true });
+    expect(api.markRead).not.toHaveBeenCalled();
+    const release = chat.holdVisible();
+    expect(vi.mocked(api.markRead).mock.calls).toEqual([
+      ["bot", { sessionId: "s1", id: "row-1" }],
+      ["bot", { sessionId: "s1", id: "row-3" }],
+    ]);
+    release();
+    chat.dispose();
+  });
   it("creates the primary conversation once for a Bot that has none", async () => {
     const { api: client, feeds } = fakeClient({
       listSessions: vi.fn(async () => ({ primarySessionId: null, sessions: [] })),
@@ -165,6 +204,17 @@ describe("createPaBotChat", () => {
     expect(chat.getState().activeSessionId).toBe("s1");
   });
 
+  it("leaves the chat idle when the engine cannot confirm admission", async () => {
+    const { api, feeds } = fakeClient({
+      sendMessage: async () => ({ kind: "turn", sessionId: "s1", unknown: true }),
+    });
+    const chat = await startedChat(api);
+    feeds.get("s1")!.onEvent(snapshot("s1"));
+    expect(await chat.send("hello")).toBe(true);
+    expect(paBotChatView(chat.getState()).running).toBe(false);
+    expect(chat.getState().localBySession.s1).toEqual([]);
+    chat.dispose();
+  });
   it("shows a sent message at once and keeps one row once the engine stores it", async () => {
     const { api: client, feeds } = fakeClient();
     const chat = await startedChat(client);
@@ -189,14 +239,18 @@ describe("createPaBotChat", () => {
     vi.mocked(client.getMessages).mockResolvedValueOnce({
       messages: [stored("m1", "user", "hello", 10), stored("m2", "assistant", "hi", 11)],
     });
-    feeds
-      .get("s1")!
-      .onEvent({ type: "turn.completed", sessionId: "s1", resumeToken: "t2" } as PaStreamEvent);
+    feeds.get("s1")!.onEvent({
+      type: "turn.completed",
+      sessionId: "s1",
+      status: "complete",
+      replyId: "m2",
+      resumeToken: "t2",
+    });
     await until(chat, () => chat.getState().localBySession.s1?.length === 0);
     const view = paBotChatView(chat.getState());
     expect(view.transcript.messages.map((item) => item.id)).toEqual(["m1", "m2"]);
     expect(chat.getState().localBySession.s1).toEqual([]);
-    expect(client.markRead).toHaveBeenCalledWith("bot");
+    expect(client.markRead).toHaveBeenCalledWith("bot", { sessionId: "s1", id: "m2" });
   });
 
   it("keeps an idle recovery snapshot when the admission reply arrives after a rewritten prompt", async () => {

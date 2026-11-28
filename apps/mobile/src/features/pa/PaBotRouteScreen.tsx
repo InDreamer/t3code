@@ -148,11 +148,13 @@ function PaBotRoute({
     : null;
   const subtitle = !bot
     ? null
-    : view.running
-      ? view.liveTurn.statusText || gt("Working…")
-      : !bot.online
-        ? gt("{engine} · Offline", { engine: bot.engineLabel })
-        : (sessionLabel ?? bot.engineLabel);
+    : view.liveTurn.openRequests.length
+      ? gt("Waiting for input")
+      : view.running
+        ? view.liveTurn.statusText || gt("Working…")
+        : !bot.online
+          ? gt("{engine} · Offline", { engine: bot.engineLabel })
+          : (sessionLabel ?? bot.engineLabel);
   const showsModel = canSelectModel && capabilities?.models.supported === true;
   const catalogKey = showsModel
     ? {
@@ -353,6 +355,10 @@ function PaBotRoute({
                     color={bot.avatarColor}
                     shape={bot.avatarShape}
                     size="lg"
+                    online={bot.online}
+                    running={view.running}
+                    visible={visible}
+                    awaiting={view.liveTurn.openRequests.length > 0}
                     starred={bot.isDefault}
                   />
                   <Text className="text-base font-t3-bold text-foreground">{bot.name}</Text>

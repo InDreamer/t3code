@@ -1,7 +1,8 @@
 import { useAtomValue } from "@effect/atom-react";
 import { EnvironmentId, type PaBotSummary } from "@t3tools/contracts";
-import { useGT } from "gt-react-native";
-import { memo } from "react";
+import { paBotStatusLabels } from "@t3tools/client-runtime/pa/roster";
+import { useGT, useMessages } from "gt-react-native";
+import { memo, useSyncExternalStore } from "react";
 import { Pressable, View } from "react-native";
 
 import { AppText as Text } from "../../components/ui/AppText";
@@ -12,6 +13,7 @@ import {
   THREAD_LIST_V2_SIDEBAR_ROW_CONTAINER_STYLE,
   THREAD_LIST_V2_SIDEBAR_ROW_STYLE,
 } from "../threads/thread-list-v2-row-appearance";
+import type { PaRowVisibility } from "./paRowVisibility";
 import { BotAvatar } from "./BotAvatar";
 import { paUpdateMetaPermissionAtom } from "./paApi";
 
@@ -30,11 +32,17 @@ export const PaBotRow = memo(function PaBotRow(props: {
   readonly time: string;
   readonly selected: boolean;
   readonly sidebar: boolean;
+  readonly visible: boolean;
+  readonly rowVisibility: PaRowVisibility;
   readonly onSelect: (bot: PaRosterBot) => void;
   readonly onAction: (bot: PaRosterBot, action: PaBotRowAction) => void;
 }) {
   const gt = useGT();
   const { bot } = props;
+  const inViewport = useSyncExternalStore(
+    (listener) => props.rowVisibility.subscribe(bot.key, listener),
+    () => props.rowVisibility.has(bot.key),
+  );
   const canEdit = useAtomValue(paUpdateMetaPermissionAtom(EnvironmentId.make(bot.environmentId)));
   const foreground = props.selected
     ? selectedThreadRowColors.foregroundClassName
@@ -46,7 +54,7 @@ export const PaBotRow = memo(function PaBotRow(props: {
     : props.sidebar
       ? "text-drawer-foreground-muted"
       : "text-foreground-muted";
-  const status = bot.running ? gt("Working") : bot.online ? gt("Online") : gt("Offline");
+  const messages = useMessages();
   const actions = [
     { id: "settings", title: gt("Bot settings"), image: "gearshape" },
     ...(canEdit
@@ -76,8 +84,7 @@ export const PaBotRow = memo(function PaBotRow(props: {
           accessibilityLabel={[
             bot.name,
             bot.engineLabel,
-            status,
-            bot.unread ? gt("Unread") : null,
+            ...paBotStatusLabels(bot, messages),
             bot.pinned ? gt("Pinned") : null,
             props.preview,
           ]
@@ -97,8 +104,12 @@ export const PaBotRow = memo(function PaBotRow(props: {
             color={bot.avatarColor}
             shape={bot.avatarShape}
             size={props.sidebar ? "sm" : "md"}
-            starred={bot.isDefault}
+            online={bot.online}
+            visible={props.visible && inViewport}
+            running={bot.running}
+            awaiting={bot.awaiting ?? false}
             unread={bot.unread}
+            starred={bot.isDefault}
           />
           <View
             className={cn(
@@ -107,18 +118,6 @@ export const PaBotRow = memo(function PaBotRow(props: {
             )}
           >
             <View className="flex-row items-center gap-1.5">
-              <View
-                accessibilityElementsHidden
-                importantForAccessibility="no"
-                className={cn(
-                  "size-1.5 rounded-full",
-                  bot.running
-                    ? "bg-warning"
-                    : bot.online
-                      ? "bg-emerald-500"
-                      : "bg-foreground-tertiary",
-                )}
-              />
               <Text
                 className={cn("min-w-0 flex-1 text-base font-t3-medium", foreground)}
                 numberOfLines={1}
@@ -136,13 +135,6 @@ export const PaBotRow = memo(function PaBotRow(props: {
                 : bot.engineLabel}
             </Text>
           </View>
-          {bot.unread ? (
-            <View
-              accessibilityElementsHidden
-              importantForAccessibility="no"
-              className="size-2 rounded-full bg-primary"
-            />
-          ) : null}
         </Pressable>
       </Menu>
     </View>

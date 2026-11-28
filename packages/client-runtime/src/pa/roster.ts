@@ -1,10 +1,55 @@
 // @effect-diagnostics globalDate:off - Local calendar-day labels for roster rows, computed outside an Effect runtime.
-import type { PaBotSummary, PaInstanceStatus } from "@t3tools/contracts";
+import type { PaBotSummary, PaInstanceStatus, PaListBotsResult } from "@t3tools/contracts";
 import { mFallback, msg } from "gt-i18n";
 import type { MFunctionType } from "gt-i18n/types";
 
 /** Pinned Bots show as large avatars; more than this would push the list off screen. */
 const PA_MAX_PINNED_SHOWN = 6;
+
+export const PA_ROSTER_REFRESH_MS = 5_000;
+
+/** Offline instances cannot confirm deletions, including after their server restarts. */
+export function reconcilePaRoster(previous: ReadonlyArray<PaBotSummary>, result: PaListBotsResult) {
+  const offline = new Set(
+    result.instances.filter((instance) => !instance.online).map((instance) => instance.instanceId),
+  );
+  if (!offline.size && result.bots.every((bot) => bot.online)) return result.bots;
+  const cached = new Map(previous.map((bot) => [bot.botId, bot]));
+  const listed = new Set(result.bots.map((bot) => bot.botId));
+  const retained = previous.filter((bot) => offline.has(bot.instanceId) && !listed.has(bot.botId));
+  const bots = result.bots.map((bot) => {
+    if (bot.online && !offline.has(bot.instanceId)) return bot;
+    const saved = cached.get(bot.botId);
+    return saved
+      ? {
+          ...bot,
+          online: false,
+          name: saved.name,
+          avatarColor: saved.avatarColor,
+          avatarShape: saved.avatarShape,
+          pinned: saved.pinned,
+          description: saved.description,
+          model: saved.model,
+          provider: saved.provider,
+        }
+      : bot;
+  });
+  return [...bots, ...retained.map((bot) => ({ ...bot, online: false }))];
+}
+
+export function paBotStatusLabels(bot: PaBotSummary, resolve: MFunctionType = mFallback) {
+  return [
+    !bot.online
+      ? resolve(msg("Offline"))
+      : bot.awaiting
+        ? resolve(msg("Waiting for input"))
+        : bot.running
+          ? resolve(msg("Working"))
+          : resolve(msg("Online")),
+    bot.unread && (!bot.running || bot.awaiting) ? resolve(msg("Unread")) : null,
+    bot.isDefault ? resolve(msg("Default bot")) : null,
+  ].filter((label) => label !== null);
+}
 
 /** Bots whose name, agent, description or last message contains `query`. */
 export function filterPaBots<Bot extends PaBotSummary>(

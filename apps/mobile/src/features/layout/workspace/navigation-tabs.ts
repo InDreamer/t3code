@@ -32,7 +32,7 @@ export const NAVIGATION_TAB_ICONS = {
   issues: "git.issue",
   workflows: "point.3.connected.trianglepath.dotted",
   usage: "chart.bar.xaxis",
-  bots: "brain",
+  bots: "pa.bots",
 } as const satisfies Readonly<Record<NavigationTab, AppSymbolName>>;
 
 export function useNavigationTabOrder() {

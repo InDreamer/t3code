@@ -144,6 +144,7 @@ import IconX from "@tabler/icons-react-native/IconX";
 import type { AndroidSymbol, SFSymbol, SymbolViewProps } from "expo-symbols";
 import { StyleSheet, View } from "react-native";
 import { withUniwind } from "uniwind";
+import { PaBotsMark } from "./PaBotsMark";
 
 const ANDROID_ICON_BY_SF_SYMBOL = {
   plusminus: IconPlusMinus,
@@ -287,6 +288,7 @@ const ANDROID_ICON_BY_SF_SYMBOL = {
   "plus.bubble": IconMessagePlus,
   "ellipsis.bubble": IconMessageDots,
   robot: IconRobot,
+  "pa.bots": PaBotsMark,
   "text.word.spacing": IconLetterSpacing,
   "textformat.size": IconTypography,
   "textformat.size.larger": IconTextIncrease,
@@ -307,7 +309,8 @@ const ANDROID_ICON_BY_SF_SYMBOL = {
     | "git.commit"
     | "git.issue"
     | "file.diff"
-    | "robot",
+    | "robot"
+    | "pa.bots",
     Icon
   >
 >;
@@ -319,7 +322,8 @@ const SF_ICON_LOOKUP: Partial<
     | "git.commit"
     | "git.issue"
     | "file.diff"
-    | "robot",
+    | "robot"
+    | "pa.bots",
     Icon
   >
 > = ANDROID_ICON_BY_SF_SYMBOL;

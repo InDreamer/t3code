@@ -1,17 +1,23 @@
 import { T, useGT, useMessages } from "gt-react";
 import { Loader2Icon, Settings2Icon } from "lucide-react";
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
 
 import { isElectron } from "~/env";
 import { useSoftwareKeyboardOpen } from "~/hooks/useSoftwareKeyboardOpen";
 import { useStableCallback } from "~/hooks/useStableCallback";
+import { getDocumentActivity, subscribeDocumentActivity } from "../../lib/documentActivity";
+import { useMobileSidebarSheetMounted } from "../ui/sidebar";
 import { observeResize } from "~/lib/observeResize";
 import { cn } from "../../lib/utils";
 import { usePrimaryEnvironmentId } from "../../state/environments";
 import { useAtomValue } from "@effect/atom-react";
 import * as Schema from "effect/Schema";
 import { toastManager } from "../ui/toast";
-import { EnvironmentAuthorizationError, type PaAttachment } from "@t3tools/contracts";
+import {
+  latestPaAssistantReply,
+  EnvironmentAuthorizationError,
+  type PaAttachment,
+} from "@t3tools/contracts";
 import { ScrollToEndButton } from "../chat/TimelineOverlays";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
@@ -96,6 +102,7 @@ export function BotChatPane({
   capabilities,
   selectedSessionId,
   settingsVersion = 0,
+  obscured = false,
   onSelectSession,
   onOpenSettings,
   onActivity,
@@ -103,10 +110,11 @@ export function BotChatPane({
   readonly bot: PaBotSummary;
   readonly capabilities: PaCapabilities | null;
   readonly selectedSessionId: string | null;
+  readonly obscured?: boolean;
   readonly settingsVersion?: number;
   readonly onSelectSession: (sessionId: string) => void;
   readonly onOpenSettings: () => void;
-  readonly onActivity: () => void;
+  readonly onActivity: (patch?: { running?: true; awaiting?: true }) => void;
 }) {
   const gt = useGT();
   const m = useMessages();
@@ -183,6 +191,7 @@ export function BotChatPane({
   const [respondingIds, setRespondingIds] = useState<ReadonlySet<string>>(() => new Set());
   const [queueBusyIds, setQueueBusyIds] = useState<ReadonlySet<string>>(() => new Set());
 
+  const completedReplyIds = useRef(new Map<string, string>());
   const settleTokensRef = useRef(new Map<string, number>());
   const transcriptRequestRef = useRef(0);
   const failedSendRef = useRef(
@@ -232,7 +241,15 @@ export function BotChatPane({
   const getSelectedSessionProp = useStableCallback(() => selectedSessionId);
   const stableSelectSession = useStableCallback(onSelectSession);
   const stableOnActivity = useStableCallback(onActivity);
-  const stableBotUnread = useStableCallback(() => bot.unread);
+  const documentActivity = useSyncExternalStore(
+    subscribeDocumentActivity,
+    getDocumentActivity,
+    getDocumentActivity,
+  );
+  const sidebarMounted = useMobileSidebarSheetMounted();
+  const covered = obscured || sidebarMounted;
+  const reading = documentActivity.visible && documentActivity.focused && !covered;
+  const isReading = useStableCallback(() => reading);
 
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- tracks the floating composer height so the timeline bottom clearance and scroll-to-end pill stay aligned
   useLayoutEffect(() => {
@@ -343,7 +360,30 @@ export function BotChatPane({
     };
   }, [bot.botId, commandsSupported]);
 
-  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- loads this Bot's sessions once per Bot mount, and marks unread bots read
+  const latestReplyId = latestPaAssistantReply(messages)?.id;
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- a visible conversation acknowledges an unread completion, including on return from the list or a hidden tab
+  useEffect(() => {
+    if (activeSessionId && reading && canMarkRead && bot.unread) {
+      const ids = new Set([latestReplyId, completedReplyIds.current.get(activeSessionId)]);
+      for (const id of ids) {
+        if (!id) continue;
+        void paApi.markRead(bot.botId, { sessionId: activeSessionId, id }).then(
+          () => stableOnActivity(),
+          () => undefined,
+        );
+      }
+    }
+  }, [
+    activeSessionId,
+    latestReplyId,
+    reading,
+    canMarkRead,
+    bot.unread,
+    bot.botId,
+    stableOnActivity,
+  ]);
+
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- loads this Bot's sessions once per Bot mount
   useEffect(() => {
     const controller = new AbortController();
     paApi
@@ -372,12 +412,6 @@ export function BotChatPane({
         if (targetId !== initialProp) {
           stableSelectSession(targetId);
         }
-        if (canMarkRead && stableBotUnread()) {
-          void paApi
-            .markRead(bot.botId)
-            .then(() => stableOnActivity())
-            .catch(() => undefined);
-        }
       })
       .catch((err) => {
         if (!controller.signal.aborted) {
@@ -395,13 +429,10 @@ export function BotChatPane({
   }, [
     bot.botId,
     canCreateSession,
-    canMarkRead,
     gt,
     getSelectedSessionProp,
     updateLiveTurn,
     stableSelectSession,
-    stableBotUnread,
-    stableOnActivity,
   ]);
 
   /** A session the engine no longer has (often a stale primary): move to one it does have. */
@@ -509,6 +540,11 @@ export function BotChatPane({
         case "snapshot": {
           const ended = runningRef.current && !event.running;
           if (ended) endTurn();
+          if (event.running || event.openRequests.length || ended)
+            stableOnActivity({
+              ...(event.running ? { running: true } : {}),
+              ...(event.openRequests.length ? { awaiting: true } : {}),
+            });
           runningRef.current = event.running;
           updateLiveTurn(sessionId, (prev) => reducePaStreamEvent(prev, event, Date.now()));
           if (!transcriptRead || event.snapshotRequired || ended) readTranscript();
@@ -537,6 +573,13 @@ export function BotChatPane({
           return;
         case "turn.started":
           runningRef.current = true;
+          stableOnActivity({ running: true });
+          break;
+        case "request.opened":
+          stableOnActivity({ awaiting: true });
+          break;
+        case "request.resolved":
+          stableOnActivity();
           break;
         case "turn.completed":
         case "error": {
@@ -548,15 +591,15 @@ export function BotChatPane({
             settleToken: token,
           }));
           void loadTranscript(sessionId, false, token);
-          if (event.type === "turn.completed") {
-            if (!canMarkRead) {
-              stableOnActivity();
-              return;
-            }
+          if (event.type === "turn.completed" && event.replyId)
+            completedReplyIds.current.set(sessionId, event.replyId);
+          if (event.type === "turn.completed" && event.replyId && canMarkRead && isReading()) {
             void paApi
-              .markRead(bot.botId)
+              .markRead(bot.botId, { sessionId, id: event.replyId })
               .catch(() => undefined)
               .finally(() => stableOnActivity());
+          } else {
+            stableOnActivity();
           }
           return;
         }
@@ -600,6 +643,7 @@ export function BotChatPane({
     bot.botId,
     activeSessionId,
     canMarkRead,
+    isReading,
     appendLocalMessage,
     getSettingsVersion,
     gt,
@@ -893,6 +937,12 @@ export function BotChatPane({
       if (attachments.length && res.kind === "turn") {
         setDraft((current) => (current.trim() === text ? "" : current));
       }
+      if (res.unknown) {
+        removeLocalMessage(sessionId, optimisticMsg.id);
+        onActivity();
+        setSending(false);
+        return true;
+      }
       if (res.kind === "turn" && res.queued === true) {
         // Waiting behind the running turn, which keeps streaming untouched.
         setSending(false);
@@ -935,6 +985,7 @@ export function BotChatPane({
       } else {
         if (activeSessionIdRef.current === sessionId) runningRef.current = true;
         updateLiveTurn(sessionId, (prev) => startPaLiveTurnLocally(prev, Date.now()));
+        onActivity({ running: true });
       }
     } catch (err) {
       removeLocalMessage(sessionId, optimisticMsg.id);
@@ -1134,7 +1185,16 @@ export function BotChatPane({
         className="justify-between gap-2 border-b border-border/60"
       >
         <div className="flex min-w-0 items-center gap-2.5">
-          <BotAvatar color={bot.avatarColor} shape={bot.avatarShape} size="sm" running={running} />
+          <BotAvatar
+            color={bot.avatarColor}
+            shape={bot.avatarShape}
+            size="sm"
+            online={bot.online}
+            running={running}
+            visible={!covered}
+            awaiting={openRequests.length > 0}
+            starred={bot.isDefault}
+          />
           <div className="min-w-0">
             <div className="flex items-center gap-1.5">
               <span className="truncate text-sm font-semibold">{bot.name}</span>
@@ -1146,15 +1206,15 @@ export function BotChatPane({
               <span
                 className={cn(
                   "inline-block size-1.5 rounded-full",
-                  running
-                    ? "bg-warning animate-pulse"
-                    : bot.online
-                      ? "bg-success"
-                      : "bg-muted-foreground/40",
+                  running ? "bg-warning" : bot.online ? "bg-success" : "bg-muted-foreground/40",
                 )}
               />
               <span className="truncate">
-                {running ? liveTurn.statusText || gt("Working…") : bot.model || bot.agentRef}
+                {openRequests.length
+                  ? gt("Waiting for input")
+                  : running
+                    ? liveTurn.statusText || gt("Working…")
+                    : bot.model || bot.agentRef}
               </span>
             </div>
           </div>
@@ -1234,6 +1294,10 @@ export function BotChatPane({
                   color={bot.avatarColor}
                   shape={bot.avatarShape}
                   size={keyboardOpen ? "md" : "lg"}
+                  online={bot.online}
+                  running={running}
+                  visible={!covered}
+                  awaiting={openRequests.length > 0}
                   starred={bot.isDefault}
                 />
                 <div className="space-y-1">

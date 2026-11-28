@@ -14,7 +14,7 @@ export interface ClockStore<A> {
 // setTimeout fires immediately for delays beyond a signed 32-bit int.
 const MAX_TIMEOUT_MS = 2_147_483_647;
 
-function makeTickStore<A>(read: () => A, periodMs: number): ClockStore<A> {
+export function makeTickStore<A>(read: () => A, periodMs: number): ClockStore<A> {
   let value = read();
   let timer: ReturnType<typeof setTimeout> | undefined;
   const listeners = new Set<() => void>();

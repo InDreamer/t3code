@@ -12,6 +12,7 @@ import {
   type PaMessage,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Exit from "effect/Exit";
 import * as Stream from "effect/Stream";
 import { afterEach, describe, expect, it } from "@effect/vitest";
@@ -68,7 +69,7 @@ function makeEngine(overrides: Partial<PaEngineInstance> = {}) {
     isValidAgentRef: (ref) => /^[a-z]+$/.test(ref),
     listAgents: async () => [
       row("main", { isDefault: true, lastActivityAt: 10 }),
-      row("helper", { name: "Helper", lastActivityAt: 50 }),
+      row("helper", { name: "Helper", lastActivityAt: 50, lastReplyAt: 45 }),
     ],
     listSessions: async () => ({ sessions: [], nextCursor: null }),
     createSession: async () => ({
@@ -535,6 +536,162 @@ describe("PaService", () => {
     }),
   );
 
+  it.effect(
+    "coalesces roster reads, keeps offline bots and disposes their feeds only on a confirmed removal",
+    () =>
+      Effect.gen(function* () {
+        const gate = Promise.withResolvers<ReadonlyArray<PaAgentRow>>();
+        const started = Promise.withResolvers<void>();
+        const listAgents = vi.fn(() => {
+          started.resolve();
+          return gate.promise;
+        });
+        const released = vi.fn();
+        const { engine } = makeEngine({
+          listAgents,
+          subscribeSession: async () => released,
+          config: {
+            get: async () => ({ sections: [] }),
+            patch: async () => ({
+              sections: [
+                {
+                  id: "profile",
+                  label: "Profile",
+                  kind: "options",
+                  fields: [
+                    {
+                      id: "description",
+                      label: "Description",
+                      kind: "text",
+                      value: "Saved description",
+                    },
+                  ],
+                },
+              ],
+            }),
+          },
+          models: {
+            getCatalog: async () => {
+              throw new Error("unused");
+            },
+            select: async () => ({
+              status: "applied",
+              current: { model: "saved-model", provider: "p" },
+            }),
+          },
+        });
+        const { service } = makeService([engine]);
+        const first = yield* service.listBots().pipe(Effect.forkChild({ startImmediately: true }));
+        yield* Effect.promise(() => started.promise);
+        const second = yield* service.listBots().pipe(Effect.forkChild({ startImmediately: true }));
+        gate.resolve([row("main")]);
+        yield* Fiber.join(first);
+        yield* Fiber.join(second);
+        expect(listAgents).toHaveBeenCalledTimes(1);
+        yield* service
+          .subscribeSession({ botId: "fake:main", sessionId: "s" })
+          .pipe(Stream.take(1), Stream.runDrain);
+        yield* service.updateBotMeta({ botId: "fake:main", name: "Saved", avatarColor: "#223344" });
+        yield* service.selectBotModel({ botId: "fake:main", model: "saved-model", provider: "p" });
+        yield* service.patchBotConfig({
+          botId: "fake:main",
+          sectionId: "profile",
+          value: { kind: "options", values: { description: "Saved description" } },
+        });
+        listAgents.mockRejectedValueOnce(new Error("temporarily offline"));
+        expect((yield* service.listBots()).bots).toMatchObject([
+          {
+            botId: "fake:main",
+            online: false,
+            name: "Saved",
+            description: "Saved description",
+            avatarColor: "#223344",
+            model: "saved-model",
+            provider: "p",
+          },
+        ]);
+        expect(released).not.toHaveBeenCalled();
+        listAgents.mockResolvedValueOnce([]);
+        expect((yield* service.listBots()).bots).toEqual([]);
+        expect(released).toHaveBeenCalledOnce();
+        service.dispose();
+      }),
+  );
+
+  it.effect(
+    "settles every alias of a request and reclaims unknown or authoritatively idle detached turns",
+    () =>
+      Effect.gen(function* () {
+        const pending = new Set<() => void>();
+        const releases = vi.fn();
+        const { engine } = makeEngine({
+          sendMessage: async (_ref, sessionId, text) => ({
+            kind: "turn",
+            sessionId,
+            unknown: text === "lost",
+          }),
+          requests: { respond: async () => {} },
+          listAgents: async () => [
+            row("main", { activeSessions: new Map([["canonical", "idle"]]) }),
+          ],
+          subscribeSession: async (_ref, sessionId, subscriber) => {
+            subscriber.onCanonicalSession?.("canonical");
+            subscriber.onEvent({
+              type: "snapshot",
+              snapshotRequired: false,
+              sessionId,
+              running: false,
+              openRequests: [
+                { requestId: "r", title: "Answer", detail: "", kind: "approval", scope: "session" },
+              ],
+            });
+            return releases;
+          },
+        });
+        const { store } = makeService([]);
+        const service = makePaService({
+          store,
+          instances: [engine],
+          hub: {
+            capacity: 4,
+            lingerMs: 1,
+            reconnectDelaysMs: [],
+            timers: {
+              set: (fn) => {
+                pending.add(fn);
+                return fn;
+              },
+              clear: (fn) => pending.delete(fn as () => void),
+            },
+          },
+        });
+        const botId = "fake:main";
+        for (const sessionId of ["root", "canonical"])
+          yield* service
+            .subscribeSession({ botId, sessionId })
+            .pipe(Stream.take(1), Stream.runDrain);
+        const bot = () => service.listBots().pipe(Effect.map((result) => result.bots[0]));
+        expect(yield* bot()).toMatchObject({ awaiting: true });
+        yield* service.respondRequest({
+          botId,
+          sessionId: "root",
+          requestId: "r",
+          decision: "once",
+        });
+        expect(yield* bot()).toMatchObject({ awaiting: false });
+        expect(pending.size).toBe(2);
+        yield* service.sendMessage({ botId, sessionId: "root", text: "lost" });
+        expect(pending.size).toBe(2);
+        yield* service.sendMessage({ botId, sessionId: "canonical", text: "go" });
+        expect(pending.size).toBe(1);
+        expect(yield* bot()).toMatchObject({ running: false });
+        expect(pending.size).toBe(2);
+        for (const dispose of pending) dispose();
+        expect(releases).toHaveBeenCalledTimes(2);
+        service.dispose();
+      }),
+  );
+
   it.effect("reports an engine that does not answer as offline without failing the roster", () =>
     Effect.gen(function* () {
       const { engine: healthy } = makeEngine();
@@ -720,6 +877,110 @@ describe("PaService", () => {
         expect(resumed[0]).toMatchObject({ type: "snapshot", snapshotRequired: false });
         expect(resumed).toHaveLength(1_201);
         expect(resumed.at(-1)).toMatchObject({ type: "reasoning.delta" });
+      }),
+  );
+
+  it.effect(
+    "keeps detached turns and requests in the roster and marks only completions unread",
+    () =>
+      Effect.gen(function* () {
+        const { engine, feeds } = makeEngine();
+        const { service, store } = makeService([engine]);
+        const botId = "fake:main";
+        const summary = () =>
+          service
+            .listBots()
+            .pipe(Effect.map((result) => result.bots.find((bot) => bot.botId === botId)));
+        store.updateBotMeta(botId, { lastReadAt: 1 });
+        for (const sessionId of ["s1", "s2"]) {
+          yield* service
+            .subscribeSession({ botId, sessionId })
+            .pipe(Stream.take(1), Stream.runDrain);
+        }
+        expect(yield* summary()).toMatchObject({ running: false, awaiting: false, unread: false });
+        yield* service.sendMessage({ botId, sessionId: "s1", text: "start" });
+        expect(yield* summary()).toMatchObject({ running: true, unread: false });
+        feeds[0]!.onEvent({
+          type: "text.delta",
+          role: "commentary",
+          text: "thinking",
+          sessionId: "s1",
+        });
+        feeds[1]!.onEvent({ type: "turn.started", sessionId: "s2" });
+        for (const kind of ["approval", "clarify", "secret"] as const) {
+          feeds[0]!.onEvent({
+            type: "request.opened",
+            sessionId: "s1",
+            request: { requestId: "r", kind, title: "Input", detail: "" },
+          });
+          expect(yield* summary()).toMatchObject({ running: true, awaiting: true, unread: false });
+          feeds[0]!.onEvent({ type: "request.resolved", requestId: "r", sessionId: "s1" });
+        }
+        feeds[0]!.onEvent({
+          type: "turn.completed",
+          status: "complete",
+          sessionId: "s1",
+          replyId: "s1-turn",
+        });
+        expect(yield* summary()).toMatchObject({ running: true, awaiting: false, unread: false });
+        feeds[1]!.onEvent({
+          type: "turn.completed",
+          status: "complete",
+          sessionId: "s2",
+          replyId: "s2-turn",
+        });
+        expect(yield* summary()).toMatchObject({ running: false, awaiting: false, unread: true });
+        yield* service.updateBotMeta({ botId, markRead: true });
+        expect(yield* summary()).toMatchObject({ unread: false });
+        service.dispose();
+      }),
+  );
+
+  it.effect(
+    "uses transcript identities for a legacy feed that replays unaddressed completions",
+    () =>
+      Effect.gen(function* () {
+        let rowId = 1;
+        const { engine, feeds } = makeEngine({
+          getMessages: async () => ({
+            messages: [
+              {
+                id: "row-" + rowId,
+                role: "assistant",
+                text: "Done",
+                timestamp: rowId * 1_000,
+                rowKind: "message",
+              },
+            ],
+            nextCursor: null,
+            reset: false,
+          }),
+        });
+        const { service } = makeService([engine]);
+        const input = { botId: "fake:main", sessionId: "s1" };
+        const unread = () =>
+          service.listBots().pipe(Effect.map((result) => result.bots[0]?.unread));
+        yield* service.subscribeSession(input).pipe(Stream.take(1), Stream.runDrain);
+        yield* service.getMessages(input);
+        expect(yield* unread()).toBe(true);
+        yield* service.updateBotMeta({
+          botId: input.botId,
+          markRead: true,
+          seenReply: { sessionId: input.sessionId, id: "row-1" },
+        });
+        const complete = () =>
+          feeds[0]!.onEvent({
+            type: "turn.completed",
+            sessionId: input.sessionId,
+            status: "complete",
+            text: "Done",
+          });
+        complete();
+        expect(yield* unread()).toBe(false);
+        rowId = 2;
+        complete();
+        expect(yield* unread()).toBe(true);
+        service.dispose();
       }),
   );
 

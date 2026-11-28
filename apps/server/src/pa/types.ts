@@ -1,3 +1,4 @@
+import { latestPaAssistantReply } from "@t3tools/contracts";
 import type {
   PaAttachment,
   PaError,
@@ -22,6 +23,29 @@ import type {
   PaStreamEvent,
 } from "@t3tools/contracts";
 
+export interface PaReply {
+  readonly sessionId: string;
+  readonly ids: ReadonlyArray<string>;
+  readonly timestamp: number;
+}
+
+export function latestTranscriptReply(
+  sessionId: string,
+  messages: ReadonlyArray<PaMessage>,
+): PaReply | null {
+  const row = latestPaAssistantReply(messages);
+  if (!row || row.timestamp === null) return null;
+  const user = messages
+    .slice(0, messages.indexOf(row))
+    .findLast((message) => message.role === "user");
+  const submission = row.submissionId ?? user?.submissionId;
+  return {
+    sessionId,
+    ids: submission ? [row.id, "submission:" + submission] : [row.id],
+    timestamp: row.timestamp,
+  };
+}
+
 /** What an engine reports about one of its agents; `PaService` adds the T3-local metadata. */
 export interface PaAgentRow {
   readonly agentRef: string;
@@ -32,6 +56,11 @@ export interface PaAgentRow {
   readonly provider: string | null;
   readonly running: boolean;
   readonly lastActivityAt: number | null;
+  readonly completeActivity?: boolean;
+  /** null means the probe failed; an empty map means it answered. */
+  readonly activeSessions?: ReadonlyMap<string, "working" | "waiting" | "starting" | "idle"> | null;
+  readonly replies?: ReadonlyArray<PaReply>;
+  readonly lastReplyAt?: number | null;
   readonly lastMessagePreview: string | null;
 }
 
@@ -52,7 +81,9 @@ export interface PaMessagePage {
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
 
 /** A stream event before `PaService` stamps it with its resume token. */
-export type PaAdapterEvent = DistributiveOmit<PaStreamEvent, "resumeToken">;
+export type PaAdapterEvent = DistributiveOmit<PaStreamEvent, "resumeToken"> & {
+  readonly replyAliases?: ReadonlyArray<string>;
+};
 
 export function isPaInputRefusal(error: PaError, newClaim = true) {
   return (
@@ -65,7 +96,7 @@ export function isPaInputRefusal(error: PaError, newClaim = true) {
 }
 
 export interface PaSessionSubscriber {
-  readonly onAttachmentSession?: (ownerId: string) => void;
+  readonly onCanonicalSession?: (ownerId: string) => void;
   readonly onUserRowPersisted?: (inputId: string, userRowId: number) => void;
   readonly onEvent: (event: PaAdapterEvent) => void;
   /** The upstream subscription ended; `reason` is set when it failed. */
@@ -117,6 +148,11 @@ export interface PaEngineInstance {
       readonly limit: number;
     },
   ) => Promise<PaSessionPage>;
+  readonly refreshSessionActivity?: (
+    agentRef: string,
+    sessionId: string,
+    stillDetached: () => boolean,
+  ) => Promise<{ running: boolean; openRequests: ReadonlyArray<PaPendingRequest> } | undefined>;
   readonly createSession: (
     agentRef: string,
     options: { readonly title?: string | undefined; readonly requestId?: string | undefined },

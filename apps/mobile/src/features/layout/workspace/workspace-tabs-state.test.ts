@@ -208,6 +208,7 @@ const mocks = vi.hoisted(() => ({
   split: false,
   floating: false,
   sidebar: false,
+  foreground: true,
   top: "Home",
   canCreate: true,
   rosterError: false,
@@ -252,7 +253,9 @@ vi.mock("@react-navigation/native", () => ({
 }));
 vi.mock("../adaptive-workspace-context", () => ({
   useAdaptiveWorkspaceLayout: () => ({ openWorkspaceTab: mocks.openWorkspaceTab }),
+  useWorkspacePaneState: () => ({ panes: { primarySidebarVisible: mocks.sidebar } }),
 }));
+vi.mock("../../../lib/appState", () => ({ useAppActive: () => mocks.foreground }));
 vi.mock("./navigation-tabs", () => ({
   useEnabledNavigationTabs: () => ["threads", "pullRequests", "usage"],
 }));
@@ -309,6 +312,7 @@ vi.mock("../../../native/native-layout-metrics", () => ({
 }));
 vi.mock("../../../native/v5-workspace-context", () => ({
   NativePrimaryColumnContext: createContext(null),
+  NativeWorkspaceTabActivityContext: createContext(null),
 }));
 vi.mock("../../../state/workspace", () => ({
   useWorkspaceEnvironments: () => [
@@ -320,7 +324,8 @@ vi.mock("./useSelectWorkspaceDetail", () => ({ useSelectWorkspaceDetail: () => v
 vi.mock("../../threads/useMessageTimeFormatter", () => ({ useMessageTimeFormatter: () => String }));
 vi.mock("../../pa/paApi", () => ({}));
 vi.mock("../../pa/PaBotRow", () => ({
-  PaBotRow: ({ bot }: { bot: { name: string } }) => createElement("div", null, bot.name),
+  PaBotRow: ({ bot, visible }: { bot: { name: string }; visible: boolean }) =>
+    createElement("div", { "data-avatar-visible": String(visible) }, bot.name),
 }));
 vi.mock("../../pa/paRosterStore", () => ({
   usePaCreatableEngines: () => (mocks.canCreate ? ["engine"] : []),
@@ -382,6 +387,7 @@ vi.mock("../../../components/ui/WorkspaceAppBar.android", () => ({
 
 function setup(split: boolean, floating: boolean, state = selected("usage")) {
   mocks.sidebar = false;
+  mocks.foreground = true;
   mocks.canCreate = true;
   mocks.rosterError = false;
   mocks.top = "Home";
@@ -453,11 +459,19 @@ it.each([false, true])(
     const show = () =>
       act(() =>
         root.render(
-          createElement(WorkspaceRootScreen, { key: String(mocks.canCreate) + mocks.rosterError }),
+          createElement(WorkspaceRootScreen, {
+            key: String(mocks.canCreate) + mocks.rosterError + mocks.foreground,
+          }),
         ),
       );
     show();
     expect(container.textContent).toContain("Helper bot");
+    expect(container.querySelector('[data-avatar-visible="true"]')).not.toBeNull();
+    mocks.foreground = false;
+    show();
+    expect(container.querySelector('[data-avatar-visible="false"]')).not.toBeNull();
+    mocks.foreground = true;
+    show();
     const create = [...container.querySelectorAll("button")].find(
       (button) => button.textContent === "Create bot",
     );

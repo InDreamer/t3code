@@ -1,10 +1,13 @@
 import { useAtomValue } from "@effect/atom-react";
 import { Atom } from "effect/reactivity";
-import { paCreatableInstances } from "@t3tools/client-runtime/pa/roster";
+import {
+  PA_ROSTER_REFRESH_MS,
+  paCreatableInstances,
+  reconcilePaRoster,
+} from "@t3tools/client-runtime/pa/roster";
 import type { PaBotSummary, PaCapabilities, PaInstanceStatus } from "@t3tools/contracts";
 import { msg } from "gt-react-native";
 import { useEffect, useSyncExternalStore } from "react";
-import { AppState } from "react-native";
 
 import { m } from "../../i18n/messages";
 import { workspaceConnections } from "../../state/workspace";
@@ -32,6 +35,7 @@ const EMPTY_ENTRY: PaRosterEntry = {
 };
 
 let entries: ReadonlyMap<string, PaRosterEntry> = new Map();
+const dirty = new Set<string>();
 const inFlight = new Map<string, Promise<void>>();
 const listeners = new Set<() => void>();
 
@@ -53,6 +57,7 @@ const getEntries = () => entries;
 
 export function clearPaRosterEnvironment(environmentId: string) {
   inFlight.delete(environmentId);
+  dirty.delete(environmentId);
   const next = new Map(entries);
   if (!next.delete(environmentId)) return;
   entries = next;
@@ -64,23 +69,24 @@ export function readPaRosterEntry(environmentId: string): PaRosterEntry {
 }
 
 /** Reads one environment's roster again; concurrent asks share one read. */
-export function refreshPaRoster(environmentId: string): Promise<void> {
+export function refreshPaRoster(environmentId: string, background = false): Promise<void> {
   const running = inFlight.get(environmentId);
   if (running) return running;
-  setEntry(environmentId, (entry) => ({
-    ...entry,
-    refreshing: entry.loadedAt !== null,
-    loading: entry.loadedAt === null,
-    error: null,
-  }));
+  if (!background || !entries.has(environmentId))
+    setEntry(environmentId, (entry) => ({
+      ...entry,
+      refreshing: entry.loadedAt !== null,
+      loading: entry.loadedAt === null,
+      error: null,
+    }));
   const read = paClient(environmentId)
     .listBots()
     .then(
       (result) => {
-        if (inFlight.get(environmentId) !== read) return;
-        setEntry(environmentId, () => ({
+        if (inFlight.get(environmentId) !== read || dirty.has(environmentId)) return;
+        setEntry(environmentId, (entry) => ({
           instances: result.instances,
-          bots: result.bots,
+          bots: reconcilePaRoster(entry.bots, result),
           loading: false,
           refreshing: false,
           error: null,
@@ -88,7 +94,7 @@ export function refreshPaRoster(environmentId: string): Promise<void> {
         }));
       },
       (error: unknown) => {
-        if (inFlight.get(environmentId) !== read) return;
+        if (inFlight.get(environmentId) !== read || dirty.has(environmentId)) return;
         setEntry(environmentId, (entry) => ({
           ...entry,
           loading: false,
@@ -98,7 +104,9 @@ export function refreshPaRoster(environmentId: string): Promise<void> {
       },
     )
     .finally(() => {
-      if (inFlight.get(environmentId) === read) inFlight.delete(environmentId);
+      if (inFlight.get(environmentId) !== read) return;
+      inFlight.delete(environmentId);
+      if (dirty.delete(environmentId)) void refreshPaRoster(environmentId, true);
     });
   inFlight.set(environmentId, read);
   return read;
@@ -113,6 +121,8 @@ export function patchPaBot(
       PaBotSummary,
       | "pinned"
       | "unread"
+      | "running"
+      | "awaiting"
       | "name"
       | "description"
       | "avatarColor"
@@ -123,17 +133,26 @@ export function patchPaBot(
   >,
 ) {
   if (!entries.has(environmentId)) return;
-  const stale = inFlight.delete(environmentId);
+  if (inFlight.has(environmentId)) dirty.add(environmentId);
   setEntry(environmentId, (entry) => ({
     ...entry,
     bots: entry.bots.map((bot) => (bot.botId === botId ? { ...bot, ...patch } : bot)),
   }));
-  if (stale) void refreshPaRoster(environmentId);
+}
+
+export function notePaBotActivity(
+  environmentId: string,
+  botId: string,
+  patch?: { running?: true; awaiting?: true },
+) {
+  if (patch) patchPaBot(environmentId, botId, patch);
+  if (inFlight.has(environmentId)) dirty.add(environmentId);
+  else void refreshPaRoster(environmentId, true);
 }
 
 export function addPaBot(environmentId: string, bot: PaBotSummary) {
   if (!entries.has(environmentId)) return;
-  inFlight.delete(environmentId);
+  if (inFlight.has(environmentId)) dirty.add(environmentId);
   setEntry(environmentId, (entry) => ({
     ...entry,
     bots: [bot, ...entry.bots.filter((item) => item.botId !== bot.botId)],
@@ -159,22 +178,24 @@ export function usePaBot(environmentId: string, botId: string) {
   return { bot, capabilities, instances: entry.instances, entry };
 }
 
-/** Keeps the given environments' rosters current: now, and whenever the app comes back. */
+/** The list supplies only its visible, connected environments. */
 export function usePaRosterRefresh(environmentIds: ReadonlyArray<string>) {
   const key = environmentIds.join("\u0000");
-  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- the engines change Bots outside this app, so rosters reread on mount and on return to the foreground
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- a visible list observes turns that continue after their chat feed unmounts
   useEffect(() => {
-    const ids = key ? key.split("\u0000") : [];
-    for (const id of ids) void refreshPaRoster(id);
-    const subscription = AppState.addEventListener("change", (state) => {
-      if (state === "active") for (const id of ids) void refreshPaRoster(id);
-    });
-    return () => subscription.remove();
+    if (!key) return;
+    const ids = key.split("\u0000");
+    const read = () => {
+      for (const id of ids) void refreshPaRoster(id, true);
+    };
+    read();
+    const timer = setInterval(read, PA_ROSTER_REFRESH_MS);
+    return () => clearInterval(timer);
   }, [key]);
 }
 
 export function refreshPaRosters(environmentIds: ReadonlyArray<string>) {
-  return Promise.all(environmentIds.map(refreshPaRoster)).then(() => undefined);
+  return Promise.all(environmentIds.map((id) => refreshPaRoster(id))).then(() => undefined);
 }
 
 const permittedEnginesAtom = Atom.make((get) =>

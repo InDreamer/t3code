@@ -1,6 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import { PaError } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Stream from "effect/Stream";
 import { createPendingAttachmentId } from "../../../attachmentStore.ts";
 import { PaAttachmentStore } from "../../PaAttachmentStore.ts";
 import { PaStore } from "../../PaStore.ts";
@@ -171,6 +172,341 @@ function collect() {
 const LIVE = { resume: false } as const;
 
 describe("HermesPaAdapter profile routing", () => {
+  it("reads live work and completed replies independently of profile activity timestamps", async () => {
+    await using dir = await NodeFSP.mkdtempDisposable(NodePath.join(NodeOS.tmpdir(), "pa-roster-"));
+    const store = new PaStore(dir.path);
+    store.updateBotMeta("hermes:default", { lastReadAt: 1 });
+    const conn = new FakeHermesConnection("default");
+    const { adapter } = makeAdapter({ default: conn }, store);
+    let running = true;
+    let role = "tool";
+    let activity = 10;
+    conn.onMethod("profiles.list", () => ({
+      profiles: [
+        { name: "default", model: "m", last_session: { id: "s", last_active: activity } },
+        { name: "archived", model: "m", last_session: { id: "old", last_active: 2 } },
+      ],
+    }));
+    conn.onMethod("session.list", () => ({ sessions: [{ id: "s", running }] }));
+    conn.onMethod("session.transcript", () => ({
+      rows: [{ role, text: "result", timestamp: activity }],
+    }));
+    expect((await adapter.listAgents())[0]).toMatchObject({ running: true });
+    expect(conn.callsOf("session.active_list")).toHaveLength(1);
+    running = false;
+    expect((await adapter.listAgents())[0]).toMatchObject({ running: false, replies: [] });
+    role = "user";
+    activity++;
+    expect((await adapter.listAgents())[0]?.replies).toEqual([]);
+    role = "assistant";
+    activity++;
+    expect((await adapter.listAgents())[0]?.replies).toMatchObject([
+      { sessionId: "s", timestamp: activity * 1000 },
+    ]);
+    await adapter.listAgents();
+    expect(conn.callsOf("session.transcript")).toHaveLength(3);
+    expect(conn.callsOf("session.active_list")).toHaveLength(5);
+  });
+
+  it.effect(
+    "restores an unread reply across interleaved sessions and restart and deduplicates an alias replay",
+    () =>
+      Effect.gen(function* () {
+        const dir = yield* Effect.acquireRelease(
+          Effect.promise(() =>
+            NodeFSP.mkdtempDisposable(NodePath.join(NodeOS.tmpdir(), "pa-history-")),
+          ),
+          (temp) => Effect.promise(() => temp.remove()),
+        );
+        const conn = new FakeHermesConnection("default");
+        const botId = "hermes:default";
+        let state = "waiting";
+        let listHistory = true;
+        conn.onMethod("profiles.list", () => ({
+          profiles: [{ name: "default", model: "m", last_session: { id: "B", last_active: 11 } }],
+        }));
+        conn.onMethod("session.active_list", () => ({ sessions: [{ id: "A", status: state }] }));
+        conn.onMethod("session.list", (params) => ({
+          sessions:
+            listHistory && params.scope === "stored" && params.cursor === "older"
+              ? [{ session_id: "A", message_count: 3 }]
+              : [],
+          next_cursor: listHistory && params.scope === "stored" && !params.cursor ? "older" : null,
+        }));
+        conn.onMethod("session.transcript", ({ session_id, cursor }) => ({
+          rows:
+            session_id === "A" && cursor
+              ? [{ role: "assistant", row_id: 7, text: "reply", timestamp: 9 }]
+              : [{ role: "user", row_id: 8, text: "next", timestamp: 11 }],
+          next_cursor: session_id === "A" && !cursor ? "before-user" : null,
+        }));
+        conn.onMethod("session.resume", () => ({
+          session_id: "A",
+          running: false,
+          last_sequence: 0,
+        }));
+        const start = () => {
+          const store = new PaStore(dir.path);
+          return makePaService({
+            store,
+            instances: [makeAdapter({ default: conn }, store).adapter],
+          });
+        };
+        const first = start();
+        const summary = (service: ReturnType<typeof start>) =>
+          service.listBots().pipe(Effect.map((result) => result.bots[0]));
+        expect(yield* summary(first)).toMatchObject({
+          running: true,
+          awaiting: true,
+          unread: true,
+        });
+        const reads = conn.callsOf("session.transcript").length;
+        state = "working";
+        expect(yield* summary(first)).toMatchObject({ running: true, awaiting: false });
+        expect(conn.callsOf("session.transcript")).toHaveLength(reads);
+        first.dispose();
+        listHistory = false;
+        state = "idle";
+        conn.onMethod("session.transcript", () => ({ rows: [] }));
+        const restarted = start();
+        expect(yield* summary(restarted)).toMatchObject({ running: false, unread: true });
+        yield* restarted
+          .subscribeSession({ botId, sessionId: "root" })
+          .pipe(Stream.take(1), Stream.runDrain);
+        yield* restarted.updateBotMeta({
+          botId,
+          markRead: true,
+          seenReply: { sessionId: "root", id: "row-7" },
+        });
+        const complete = (row: number, admission: string) =>
+          conn.emitEvent({
+            event: "message.complete",
+            session_id: "A",
+            admission_id: admission,
+            payload: {
+              status: "complete",
+              text: "reply",
+              persisted_turn: { final_assistant_row_id: row },
+            },
+          });
+        const beforeReplay = conn.callsOf("session.transcript").length;
+        const checked = Promise.withResolvers<void>();
+        conn.onMethod("session.transcript", () => {
+          checked.resolve();
+          return { rows: [{ role: "assistant", row_id: 7, text: "reply", timestamp: 9 }] };
+        });
+        conn.emitEvent({
+          event: "message.complete",
+          session_id: "A",
+          replay_epoch: "late",
+          seq: 1,
+          payload: { text: "reply" },
+        });
+        yield* Effect.promise(() => checked.promise);
+        expect(conn.callsOf("session.transcript")).toHaveLength(beforeReplay + 1);
+        expect(yield* summary(restarted)).toMatchObject({ unread: false });
+        complete(7, "one");
+        expect(yield* summary(restarted)).toMatchObject({ unread: false });
+        conn.emitEvent({
+          event: "message.complete",
+          session_id: "A",
+          admission_id: "cancel",
+          payload: { status: "interrupted", text: "" },
+        });
+        expect(yield* summary(restarted)).toMatchObject({ unread: false });
+        complete(8, "two");
+        yield* restarted.updateBotMeta({
+          botId,
+          markRead: true,
+          seenReply: { sessionId: "A", id: "row-7" },
+        });
+        expect(yield* summary(restarted)).toMatchObject({ unread: true });
+        yield* restarted.updateBotMeta({ botId, markRead: true });
+        state = "starting";
+        expect(yield* summary(restarted)).toMatchObject({
+          running: true,
+          awaiting: false,
+          unread: false,
+        });
+        state = "waiting";
+        expect(yield* summary(restarted)).toMatchObject({ running: true, awaiting: true });
+        restarted.dispose();
+      }),
+  );
+
+  it("bounds a cold poll over 401 stored sessions and finds an earlier compacted reply", async () => {
+    const conn = new FakeHermesConnection("default");
+    const { adapter } = makeAdapter({ default: conn });
+    const sessions = Array.from({ length: 401 }, (_, i) => ({
+      session_id: "s-" + i,
+      updated_at: 401 - i,
+      message_count: 2,
+      last_reply: i === 0 ? null : "ok",
+    }));
+    conn.onMethod("profiles.list", () => ({ profiles: [{ name: "default", model: "m" }] }));
+    conn.onMethod("session.active_list", () => ({ sessions: [] }));
+    conn.onMethod("session.list", ({ scope, limit, cursor }) => {
+      const start = Number(cursor ?? 0),
+        end = start + Number(limit);
+      return scope === "stored"
+        ? {
+            sessions: sessions.slice(start, end),
+            next_cursor: end < sessions.length ? String(end) : null,
+          }
+        : { sessions: [] };
+    });
+    conn.onMethod("session.transcript", ({ session_id, cursor }) =>
+      session_id === "s-0"
+        ? cursor
+          ? { rows: [{ role: "assistant", row_id: 7, text: "old segment", timestamp: 399 }] }
+          : {
+              rows: [{ role: "user", text: "current segment", timestamp: 401 }],
+              next_cursor: "prior",
+            }
+        : { rows: [{ role: "assistant", row_id: 10, text: "ok", timestamp: 100 }] },
+    );
+    const [agent] = await adapter.listAgents();
+    expect(agent?.replies).toContainEqual({ sessionId: "s-0", ids: ["row-7"], timestamp: 399_000 });
+    expect(
+      conn.callsOf("session.list").filter((call) => call.params.scope === "stored"),
+    ).toHaveLength(1);
+    expect(conn.callsOf("session.transcript").length).toBeLessThanOrEqual(10);
+    expect(
+      conn.callsOf("session.transcript").some((call) => call.params.session_id === "s-400"),
+    ).toBe(false);
+    adapter.dispose();
+  });
+
+  it.effect(
+    "retains confirmed waiting through a probe timeout until an authoritative empty list",
+    () =>
+      Effect.gen(function* () {
+        const conn = new FakeHermesConnection("default");
+        const dir = yield* Effect.acquireRelease(
+          Effect.promise(() =>
+            NodeFSP.mkdtempDisposable(NodePath.join(NodeOS.tmpdir(), "pa-wait-")),
+          ),
+          (temp) => Effect.promise(() => temp.remove()),
+        );
+        const store = new PaStore(dir.path);
+        const service = makePaService({
+          store,
+          instances: [makeAdapter({ default: conn }, store).adapter],
+        });
+        conn.onMethod("profiles.list", () => ({ profiles: [{ name: "default", model: "m" }] }));
+        conn.onMethod("session.active_list", () => ({
+          sessions: [{ id: "s", status: "waiting" }],
+        }));
+        conn.onMethod("session.list", () => ({ sessions: [] }));
+        const bot = () => service.listBots().pipe(Effect.map((result) => result.bots[0]));
+        expect(yield* bot()).toMatchObject({ running: true, awaiting: true });
+        conn.onMethod("session.active_list", () => {
+          throw new HermesConnectionError("timed out");
+        });
+        expect(yield* bot()).toMatchObject({ online: true, running: true, awaiting: true });
+        conn.onMethod("session.active_list", () => ({ sessions: [] }));
+        expect(yield* bot()).toMatchObject({ running: false, awaiting: false });
+        service.dispose();
+      }),
+  );
+
+  it.effect(
+    "verifies a detached session omitted by the legacy live list and expires its stale session request",
+    () =>
+      Effect.gen(function* () {
+        const conn = new FakeHermesConnection("default");
+        const dir = yield* Effect.acquireRelease(
+          Effect.promise(() =>
+            NodeFSP.mkdtempDisposable(NodePath.join(NodeOS.tmpdir(), "pa-detached-")),
+          ),
+          (temp) => Effect.promise(() => temp.remove()),
+        );
+        const timers = new Set<() => void>();
+        const store = new PaStore(dir.path);
+        const service = makePaService({
+          store,
+          instances: [makeAdapter({ default: conn }, store).adapter],
+          hub: {
+            capacity: 4,
+            lingerMs: 60_000,
+            reconnectDelaysMs: [],
+            timers: {
+              set: (fn) => {
+                timers.add(fn);
+                return fn;
+              },
+              clear: (fn) => timers.delete(fn as () => void),
+            },
+          },
+        });
+        conn.onMethod("profiles.list", () => ({ profiles: [{ name: "default", model: "m" }] }));
+        conn.onMethod("session.list", () => ({ sessions: [] }));
+        let running = true;
+        let requested = true;
+        conn.onMethod("session.resume", () => ({
+          session_id: "s",
+          running,
+          subscription_id: "live",
+          prompts: [],
+          open_requests: requested
+            ? [{ id: "q", method: "secret", params: { env_var: "TEST" } }]
+            : [],
+        }));
+        const input = { botId: "hermes:default", sessionId: "s" };
+        yield* service.subscribeSession(input).pipe(Stream.take(1), Stream.runDrain);
+        const bot = () => service.listBots().pipe(Effect.map((result) => result.bots[0]));
+        expect(yield* bot()).toMatchObject({ running: true, awaiting: true });
+        running = false;
+        expect(yield* bot()).toMatchObject({ running: false, awaiting: true });
+        expect(timers.size).toBe(0);
+        requested = false;
+        conn.onMethod("session.active_list", () => ({ sessions: [{ id: "s", status: "idle" }] }));
+        expect(yield* bot()).toMatchObject({ running: false, awaiting: false });
+        expect(timers.size).toBe(1);
+        for (const expire of timers) expire();
+        expect(conn.callsOf("session.detach")).toHaveLength(1);
+        service.dispose();
+      }),
+  );
+
+  it("bounds simultaneous profile probes", async () => {
+    const profiles = Array.from({ length: 8 }, (_, i) => ({
+      name: i ? "bot" + i : "default",
+      model: "m",
+    }));
+    const connections = Object.fromEntries(
+      profiles.map(({ name }) => [name, new FakeHermesConnection(name)]),
+    );
+    const release = Promise.withResolvers<void>();
+    const started = Promise.withResolvers<void>();
+    let active = 0;
+    let peak = 0;
+    for (const conn of Object.values(connections)) {
+      conn.onMethod("session.active_list", async () => {
+        peak = Math.max(peak, ++active);
+        if (active === 3) started.resolve();
+        await release.promise;
+        active--;
+        return { sessions: [] };
+      });
+      conn.onMethod("session.list", () => ({ sessions: [] }));
+    }
+    connections.default!.onMethod("profiles.list", () => ({ profiles }));
+    const pending = makeAdapter(connections).adapter.listAgents();
+    await started.promise;
+    release.resolve();
+    expect(await pending).toHaveLength(8);
+    expect(peak).toBe(3);
+  });
+
+  it("preserves an unknown prompt admission", async () => {
+    const conn = makeFeedbotConn();
+    conn.onMethod("prompt.submit", () => ({ status: "unknown", admission_id: "lost" }));
+    expect(
+      await makeAdapter({ feedbot: conn }).adapter.sendMessage("feedbot", "s", "send", {}),
+    ).toMatchObject({ unknown: true, submissionId: "lost" });
+  });
+
   it("routes profile-bound RPCs through the agent's own socket", async () => {
     const defaultConn = new FakeHermesConnection("default");
     const feedbotConn = new FakeHermesConnection("feedbot");

@@ -99,7 +99,7 @@ const ACTION_ICONS: Record<string, AppSymbolName> = {
   appearance: "paintbrush",
   environments: "desktopcomputer",
   usage: "chart.bar.xaxis",
-  bots: "brain",
+  bots: "pa.bots",
   createBot: "plus",
   archive: "archivebox",
   files: "doc.text",

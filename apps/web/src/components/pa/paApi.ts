@@ -85,7 +85,8 @@ export const paApi = {
   listBots: () => call(pa.listBots, {}),
   createBot: (input: PaCreateBotInput) => call(pa.createBot, input),
   updateBotMeta: (input: PaUpdateBotMetaInput) => call(pa.updateBotMeta, input),
-  markRead: (botId: string) => call(pa.updateBotMeta, { botId, markRead: true }),
+  markRead: (botId: string, seenReply?: PaUpdateBotMetaInput["seenReply"]) =>
+    call(pa.updateBotMeta, { botId, markRead: true, ...(seenReply ? { seenReply } : {}) }),
   getBotModels: (environmentId: EnvironmentId, botId: string, sessionId?: string | null) =>
     call(pa.getBotModels, { botId, ...(sessionId ? { sessionId } : {}) }, { environmentId }),
   selectBotModel: (environmentId: EnvironmentId, input: PaSelectBotModelInput) =>

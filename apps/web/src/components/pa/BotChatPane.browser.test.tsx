@@ -46,6 +46,7 @@ vi.mock(import("./paApi"), async (original) => {
   return {
     ...api,
     paSendPermissionAtom: vi.fn(() => allowed),
+    paUpdateMetaPermissionAtom: () => allowed,
     paSelectModelPermissionAtom: vi.fn(api.paSelectModelPermissionAtom),
   };
 });
@@ -168,10 +169,11 @@ function setup(spies: DisposableStack) {
     .mockResolvedValue({ kind: "turn", sessionId: "deep", queued: true });
   const ack = Promise.withResolvers<PaSteerSessionResult>();
   const steer = spies.use(vi.spyOn(paApi, "steerSession")).mockReturnValue(ack.promise);
-  const view = (sessionId: string, caps = capabilities) => (
+  const view = (sessionId: string, caps = capabilities, unread = false, obscured = false) => (
     <GTProvider locale="en" translations={translations}>
       <BotChatPane
-        bot={bot}
+        bot={{ ...bot, unread }}
+        obscured={obscured}
         capabilities={caps}
         selectedSessionId={sessionId}
         onSelectSession={select}
@@ -193,6 +195,46 @@ function setup(spies: DisposableStack) {
     emit: (event: PaStreamEvent) => emit(event),
   };
 }
+
+it("marks the observed completion only when the chat is uncovered, visible and focused", async () => {
+  using spies = new DisposableStack();
+  const flow = setup(spies);
+  flow.read.mockResolvedValue({
+    messages: [
+      { id: "row-1", role: "assistant", rowKind: "message", text: "Earlier", timestamp: 1 },
+    ],
+    nextCursor: null,
+  });
+  let visibility: DocumentVisibilityState = "hidden";
+  let focused = false;
+  spies.use(vi.spyOn(document, "visibilityState", "get")).mockImplementation(() => visibility);
+  spies.use(vi.spyOn(document, "hasFocus")).mockImplementation(() => focused);
+  await using screen = await render(flow.view("deep"));
+  const complete = () =>
+    flow.emit({
+      type: "turn.completed",
+      replyId: "row-3",
+      status: "complete",
+      sessionId: "deep",
+      resumeToken: "2",
+    });
+  await act(complete);
+  await screen.rerender(flow.view("deep", capabilities, true));
+  visibility = "visible";
+  await act(() => document.dispatchEvent(new Event("visibilitychange")));
+  await act(complete);
+  expect(paApi.markRead).not.toHaveBeenCalled();
+  await screen.rerender(flow.view("deep", capabilities, true, true));
+  focused = true;
+  await act(() => window.dispatchEvent(new Event("focus")));
+  await act(complete);
+  expect(paApi.markRead).not.toHaveBeenCalled();
+  await screen.rerender(flow.view("deep", capabilities, true));
+  expect(vi.mocked(paApi.markRead).mock.calls).toEqual([
+    [bot.botId, { sessionId: "deep", id: "row-1" }],
+    [bot.botId, { sessionId: "deep", id: "row-3" }],
+  ]);
+});
 it.each(["complete", "switched", "queued", "voice"] as const)(
   "handles a pending steer when the session is %s",
   async (scenario) => {

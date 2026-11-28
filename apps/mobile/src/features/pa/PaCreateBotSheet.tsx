@@ -1,5 +1,6 @@
 import { useNavigation, type StaticScreenProps } from "@react-navigation/native";
 import {
+  isPaAvatarObsidian,
   PA_AVATAR_COLORS,
   PA_AVATAR_SHAPES,
   PA_DEFAULT_AVATAR,
@@ -315,7 +316,13 @@ export function PaCreateBotSheet({
                         avatarColor === color && "border-2 border-foreground",
                       )}
                     >
-                      <View className="size-7 rounded-full" style={{ backgroundColor: color }} />
+                      <View
+                        className={cn(
+                          "size-7 rounded-full",
+                          isPaAvatarObsidian(color) && "bg-foreground",
+                        )}
+                        style={isPaAvatarObsidian(color) ? undefined : { backgroundColor: color }}
+                      />
                     </Pressable>
                   ))}
                 </View>

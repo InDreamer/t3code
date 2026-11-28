@@ -5,11 +5,12 @@ import {
   formatPaRosterTime,
   groupPaBots,
   paBotPreview,
+  paBotStatusLabels,
   paOfflineInstances,
   resolveActivePaBot,
 } from "@t3tools/client-runtime/pa/roster";
 import { T, useGT, useMessages, Var } from "gt-react";
-import { BotIcon, PlusIcon, RefreshCwIcon, SearchIcon, Settings2Icon } from "lucide-react";
+import { PlusIcon, RefreshCwIcon, SearchIcon, Settings2Icon } from "lucide-react";
 import { useState } from "react";
 
 import { usePrimaryEnvironmentId } from "../../state/environments";
@@ -17,7 +18,7 @@ import { cn } from "../../lib/utils";
 import { Button } from "../ui/button";
 import { SidebarContent, SidebarGroup, useSidebar } from "../ui/sidebar";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
-import { BotAvatar } from "./BotAvatar";
+import { BotAvatar, BotAvatarTrio } from "./BotAvatar";
 import { paCreateBotPermissionAtom } from "./paApi";
 import {
   loadPaBots,
@@ -35,8 +36,10 @@ export function PaBotsSidebarContent() {
   const navigate = useNavigate();
   const rawSearch = useSearch({ strict: false }) as { readonly bot?: unknown };
   const routeBotId = typeof rawSearch.bot === "string" && rawSearch.bot ? rawSearch.bot : null;
-  const { isMobile, setOpenMobile } = useSidebar();
-  const { instances, bots, loading, refreshing, error, nowMs, lastBotId } = usePaBotsStore();
+  const { isMobile, openMobile, open, setOpenMobile } = useSidebar();
+  const { instances, bots, loading, refreshing, error, nowMs, lastBotId } = usePaBotsStore(
+    isMobile ? openMobile : open,
+  );
   const [query, setQuery] = useState("");
 
   const m = useMessages();
@@ -183,21 +186,20 @@ export function PaBotsSidebarContent() {
                       onClick={() => selectBot(bot.botId)}
                       className="flex w-full min-w-0 flex-col items-center gap-1.5"
                     >
+                      <span className="sr-only">{paBotStatusLabels(bot, m).join(", ")}</span>
                       <BotAvatar
                         color={bot.avatarColor}
                         shape={bot.avatarShape}
                         size="md"
-                        starred={bot.isDefault}
-                        unread={bot.unread}
+                        online={bot.online}
                         running={bot.running}
+                        visible={isMobile ? openMobile : open}
+                        awaiting={bot.awaiting ?? false}
+                        unread={bot.unread}
+                        starred={bot.isDefault}
                         className="transition-transform group-hover:scale-105"
                       />
-                      <div className="flex max-w-full items-center gap-1">
-                        <span className="truncate text-xs font-medium">{bot.name}</span>
-                        {bot.unread ? (
-                          <span className="inline-block size-1.5 shrink-0 rounded-full bg-info" />
-                        ) : null}
-                      </div>
+                      <span className="max-w-full truncate text-xs font-medium">{bot.name}</span>
                     </button>
                     <button
                       type="button"
@@ -216,10 +218,7 @@ export function PaBotsSidebarContent() {
           {loading ? (
             <div className="space-y-2 pt-1">
               {SKELETON_KEYS.map((key) => (
-                <div
-                  key={key}
-                  className="flex animate-pulse items-center gap-2.5 rounded-lg bg-muted/40 p-2"
-                >
+                <div key={key} className="flex items-center gap-2.5 rounded-lg bg-muted/40 p-2">
                   <div className="size-8 rounded-full bg-muted" />
                   <div className="flex-1 space-y-1.5">
                     <div className="h-3 w-20 rounded bg-muted" />
@@ -230,9 +229,7 @@ export function PaBotsSidebarContent() {
             </div>
           ) : filteredBots.length === 0 ? (
             <div className="flex flex-col items-center justify-center gap-2 py-10 text-center">
-              <div className="flex size-10 items-center justify-center rounded-xl bg-muted/60 text-sidebar-muted-foreground">
-                <BotIcon className="size-5" />
-              </div>
+              <BotAvatarTrio size="sm" />
               <div className="space-y-0.5">
                 <div className="text-xs font-medium text-sidebar-foreground">
                   <T>No matching bots</T>
@@ -263,12 +260,17 @@ export function PaBotsSidebarContent() {
                       onClick={() => selectBot(bot.botId)}
                       className="flex min-w-0 flex-1 items-center gap-2.5 text-left"
                     >
+                      <span className="sr-only">{paBotStatusLabels(bot, m).join(", ")}</span>
                       <BotAvatar
                         color={bot.avatarColor}
                         shape={bot.avatarShape}
                         size="sm"
-                        starred={bot.isDefault}
+                        online={bot.online}
                         running={bot.running}
+                        visible={isMobile ? openMobile : open}
+                        awaiting={bot.awaiting ?? false}
+                        unread={bot.unread}
+                        starred={bot.isDefault}
                       />
                       <div className="min-w-0 flex-1">
                         <div className="flex items-center justify-between gap-1.5">
@@ -279,14 +281,9 @@ export function PaBotsSidebarContent() {
                             {formatRelativeTime(bot.lastActivityAt)}
                           </span>
                         </div>
-                        <div className="mt-0.5 flex items-center justify-between gap-1.5">
-                          <p className="truncate text-2xs text-sidebar-muted-foreground">
-                            {paBotPreview(bot)}
-                          </p>
-                          {bot.unread ? (
-                            <span className="inline-block size-2 shrink-0 rounded-full bg-info" />
-                          ) : null}
-                        </div>
+                        <p className="mt-0.5 truncate text-2xs text-sidebar-muted-foreground">
+                          {paBotPreview(bot)}
+                        </p>
                       </div>
                     </button>
 

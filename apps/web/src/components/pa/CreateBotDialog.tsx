@@ -23,6 +23,7 @@ import { Switch } from "../ui/switch";
 import { Textarea } from "../ui/textarea";
 import { PaNativeSelect } from "./PaNativeSelect";
 import {
+  isPaAvatarObsidian,
   PA_AVATAR_COLORS,
   PA_AVATAR_SHAPES,
   PA_DEFAULT_AVATAR,
@@ -134,7 +135,7 @@ export function CreateBotDialog({
 
           <DialogPanel>
             <div className="flex items-center gap-4 rounded-xl border border-border/60 bg-muted/30 p-3">
-              <BotAvatar color={avatarColor} shape={avatarShape} size="md" starred={pinned} />
+              <BotAvatar color={avatarColor} shape={avatarShape} size="md" />
               <div className="min-w-0 flex-1">
                 <div className="truncate font-medium text-sm">
                   {name.trim() || derivedSlug || gt("New bot")}
@@ -252,10 +253,15 @@ export function CreateBotDialog({
                     onClick={() => setAvatarColor(swatch.value)}
                     className={cn(
                       "size-6 rounded-full transition-transform pointer-coarse:size-8",
+                      isPaAvatarObsidian(swatch.value) && "bg-foreground",
                       avatarColor === swatch.value &&
                         "scale-110 ring-2 ring-foreground ring-offset-2 ring-offset-background",
                     )}
-                    style={{ backgroundColor: swatch.value }}
+                    style={
+                      isPaAvatarObsidian(swatch.value)
+                        ? undefined
+                        : { backgroundColor: swatch.value }
+                    }
                   />
                 ))}
               </div>

@@ -118,12 +118,13 @@ final class T3SidebarTabBarView: ExpoView, UITabBarDelegate {
       "bots": "Bots", "usage": "Usage", "settings": "Settings",
     ]
     let issueIcon = UIImage(named: "issue", in: iconBundle, compatibleWith: nil)?.withRenderingMode(.alwaysTemplate)
+    let botsIcon = UIImage(named: "bots", in: iconBundle, compatibleWith: nil)?.withRenderingMode(.alwaysTemplate)
     let symbols = [
       "threads": "text.bubble", "workflows": "point.3.connected.trianglepath.dotted",
-      "bots": "brain", "usage": "chart.bar.xaxis", "settings": "gearshape",
+      "usage": "chart.bar.xaxis", "settings": "gearshape",
     ]
     for (tab, label) in labels {
-      let icon = tab == "pullRequests" ? pullRequestIcon : tab == "issues" ? issueIcon : UIImage(systemName: symbols[tab] ?? "circle")
+      let icon = tab == "pullRequests" ? pullRequestIcon : tab == "issues" ? issueIcon : tab == "bots" ? botsIcon : UIImage(systemName: symbols[tab] ?? "circle")
       let item = UITabBarItem(title: nil, image: tabIcon(icon), tag: 0)
       item.accessibilityLabel = label
       item.accessibilityIdentifier = "workspace-tab-\(tab)"

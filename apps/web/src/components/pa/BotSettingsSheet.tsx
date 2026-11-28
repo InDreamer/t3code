@@ -1,13 +1,14 @@
 import { useAtomValue } from "@effect/atom-react";
-import type {
-  PaAvatarShape,
-  PaBotConfig,
-  PaBotSummary,
-  PaCapabilities,
-  PaConfigSection,
-  PaConfigSectionValue,
-  PaModelCatalog,
-  PaSchedule,
+import {
+  paProfileDescription,
+  type PaAvatarShape,
+  type PaBotConfig,
+  type PaBotSummary,
+  type PaCapabilities,
+  type PaConfigSection,
+  type PaConfigSectionValue,
+  type PaModelCatalog,
+  type PaSchedule,
 } from "@t3tools/contracts";
 import { T, useGT, useMessages, Var } from "gt-react";
 import {
@@ -27,7 +28,7 @@ import {
   Trash2Icon,
   UserRoundIcon,
 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { usePrimaryEnvironmentId } from "../../state/environments";
 import { useStableCallback } from "~/hooks/useStableCallback";
@@ -56,7 +57,11 @@ import { Sheet, SheetDescription, SheetHeader, SheetPopup, SheetTitle } from "..
 import { Switch } from "../ui/switch";
 import { Textarea } from "../ui/textarea";
 import { PaNativeSelect } from "./PaNativeSelect";
-import { PA_AVATAR_COLORS, PA_AVATAR_SHAPES } from "@t3tools/client-runtime/pa/avatar";
+import {
+  isPaAvatarObsidian,
+  paAvatarColorOptions,
+  PA_AVATAR_SHAPES,
+} from "@t3tools/client-runtime/pa/avatar";
 import { BotAvatar } from "./BotAvatar";
 import {
   paApi,
@@ -348,7 +353,7 @@ function BotSettingsBody({
   readonly bot: PaBotSummary;
   readonly capabilities: PaCapabilities | null;
   readonly onClose: () => void;
-  readonly onSaved: () => void;
+  readonly onSaved: (patch?: Partial<PaBotSummary>) => void;
 }) {
   const gt = useGT();
   const m = useMessages();
@@ -368,7 +373,14 @@ function BotSettingsBody({
   const [loading, setLoading] = useState(configSupported || modelsSupported || schedulesSupported);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [savedNotice, setSavedNotice] = useState<string | null>(null);
+  const mounted = useRef(false);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- a late save must not close a subsequently opened Bot's sheet
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
   /** The model pick the engine asked to confirm; confirming resends exactly that pick. */
   const [pendingConfirm, setPendingConfirm] = useState<{
     readonly message: string;
@@ -397,6 +409,8 @@ function BotSettingsBody({
   const getModelDraft = useStableCallback(() => ({ provider, model }));
 
   const [schedules, setSchedules] = useState<ReadonlyArray<PaSchedule>>([]);
+  const [schedulePage, setSchedulePage] = useState(1);
+  const scheduleSlice = paginateItems(schedules, schedulePage, 5);
   const [scheduleBusy, setScheduleBusy] = useState(false);
   const [newScheduleName, setNewScheduleName] = useState("");
   const [newScheduleSpec, setNewScheduleSpec] = useState("every 1h");
@@ -469,12 +483,15 @@ function BotSettingsBody({
   const handleSave = async (
     confirmed: { readonly provider: string; readonly model: string } | null = null,
   ) => {
+    if (saving) return;
     const nextName = name.trim() || bot.agentRef;
     const metaPatch = !canEditMeta
       ? {}
       : {
           ...(nextName !== savedMeta.name ? { name: nextName } : {}),
-          ...(avatarColor !== savedMeta.avatarColor ? { avatarColor } : {}),
+          ...(avatarColor.toLowerCase() !== savedMeta.avatarColor.toLowerCase()
+            ? { avatarColor }
+            : {}),
           ...(avatarShape !== savedMeta.avatarShape ? { avatarShape } : {}),
           ...(pinned !== savedMeta.pinned ? { pinned } : {}),
         };
@@ -509,7 +526,7 @@ function BotSettingsBody({
       !modelChanged &&
       !reasoningChanged
     ) {
-      setSavedNotice(gt("No changes to save"));
+      onClose();
       return;
     }
     if (modelChanged && !submittedProvider) {
@@ -529,7 +546,6 @@ function BotSettingsBody({
 
     setSaving(true);
     setError(null);
-    setSavedNotice(null);
     setPendingConfirm(null);
     // Each block that lands becomes the new baseline at once, so a later failure cannot leave
     // saved edits looking unsaved; drafts typed during the save are kept, not overwritten.
@@ -539,7 +555,7 @@ function BotSettingsBody({
         setSavedMeta({ name: nextName, avatarColor, avatarShape, pinned });
         const submittedName = name;
         setName((current) => (current === submittedName ? nextName : current));
-        onSaved();
+        onSaved(metaPatch);
       }
       let baseline = config;
       for (const section of changedSections) {
@@ -551,7 +567,8 @@ function BotSettingsBody({
         setDrafts((prev) =>
           rebasePaConfigDrafts(prev, previous, nextConfig, section.id, submitted),
         );
-        onSaved();
+        const description = paProfileDescription(nextConfig);
+        onSaved(description === undefined ? undefined : { description });
       }
       if (
         (modelChanged || reasoningChanged) &&
@@ -596,9 +613,9 @@ function BotSettingsBody({
             current === reasoningField ? (nextCurrent.reasoningEffort ?? "") : current,
           );
         }
-        onSaved();
+        onSaved({ model: nextCurrent.model, provider: nextCurrent.provider });
       }
-      setSavedNotice(gt("Saved"));
+      if (mounted.current) onClose();
     } catch (err) {
       setError(paErrorMessage(err, gt("Could not save")));
     }
@@ -614,7 +631,9 @@ function BotSettingsBody({
     setError(null);
     let ok = false;
     try {
-      setSchedules(await paApi.mutateSchedule({ botId: bot.botId, ...input }));
+      const next = await paApi.mutateSchedule({ botId: bot.botId, ...input });
+      setSchedules(next);
+      setSchedulePage(input.action === "add" ? 1 : paginateItems(next, schedulePage, 5).page);
       ok = true;
     } catch (err) {
       setError(paErrorMessage(err, fallback));
@@ -674,7 +693,7 @@ function BotSettingsBody({
       <div className="border-b border-border/60 pt-safe">
         <SheetHeader>
           <div className="flex items-center gap-3 pr-8">
-            <BotAvatar color={avatarColor} shape={avatarShape} size="sm" starred={pinned} />
+            <BotAvatar color={avatarColor} shape={avatarShape} size="sm" starred={bot.isDefault} />
             <div className="min-w-0 flex-1">
               <SheetTitle>
                 <span className="block truncate text-base">{name || bot.name}</span>
@@ -682,6 +701,7 @@ function BotSettingsBody({
               <SheetDescription>
                 <span className="block truncate text-xs">
                   {gt("{engine} · {agent}", { engine: bot.engineLabel, agent: bot.agentRef })}
+                  {!bot.online && <> · {gt("Offline")}</>}
                 </span>
               </SheetDescription>
             </div>
@@ -724,7 +744,7 @@ function BotSettingsBody({
       </div>
 
       <ScrollArea className="min-h-0 flex-1">
-        <div className="space-y-4 p-5">
+        <div className="space-y-4 p-5" inert={saving}>
           {loading ? (
             <div className="flex items-center justify-center py-12 text-muted-foreground text-sm">
               <Loader2Icon className="mr-2 size-4 animate-spin" />
@@ -768,12 +788,6 @@ function BotSettingsBody({
                   <T>Confirm switch</T>
                 </Button>
               </div>
-            </div>
-          ) : null}
-
-          {savedNotice ? (
-            <div className="rounded-lg border border-success/40 bg-success/10 px-3 py-2 text-success text-xs">
-              {savedNotice}
             </div>
           ) : null}
 
@@ -825,26 +839,32 @@ function BotSettingsBody({
                         color={avatarColor}
                         shape={item.value}
                         size="sm"
-                        className="size-4"
+                        className="size-5"
                       />
                       <span>{m(item.label)}</span>
                     </button>
                   ))}
                 </div>
                 <div className="flex flex-wrap gap-2 pt-1">
-                  {PA_AVATAR_COLORS.map((swatch) => (
+                  {paAvatarColorOptions(bot.avatarColor).map((swatch) => (
                     <button
                       key={swatch.value}
                       type="button"
+                      aria-pressed={avatarColor.toLowerCase() === swatch.value}
                       aria-label={m(swatch.label)}
                       disabled={!canEditMeta}
                       onClick={() => setAvatarColor(swatch.value)}
                       className={cn(
                         "size-6 rounded-full pointer-coarse:size-8",
-                        avatarColor === swatch.value &&
+                        isPaAvatarObsidian(swatch.value) && "bg-foreground",
+                        avatarColor.toLowerCase() === swatch.value &&
                           "ring-2 ring-foreground ring-offset-2 ring-offset-background",
                       )}
-                      style={{ backgroundColor: swatch.value }}
+                      style={
+                        isPaAvatarObsidian(swatch.value)
+                          ? undefined
+                          : { backgroundColor: swatch.value }
+                      }
                     />
                   ))}
                 </div>
@@ -1039,6 +1059,56 @@ function BotSettingsBody({
 
           {!loading && activeTab === "schedules" ? (
             <div className="space-y-4">
+              <form
+                onSubmit={handleAddSchedule}
+                className="space-y-2.5 rounded-xl border border-border/60 p-3"
+              >
+                <Label>
+                  <T>New scheduled task</T>
+                </Label>
+                <Input
+                  placeholder={gt("Task name (e.g. daily briefing)")}
+                  value={newScheduleName}
+                  onChange={(e) => setNewScheduleName(e.target.value)}
+                />
+                <Input
+                  placeholder={gt("Schedule (e.g. every 1h or 0 9 * * *)")}
+                  value={newScheduleSpec}
+                  onChange={(e) => setNewScheduleSpec(e.target.value)}
+                />
+                <Textarea
+                  rows={2}
+                  placeholder={gt("Instructions for the bot when the task runs…")}
+                  value={newSchedulePrompt}
+                  onChange={(e) => setNewSchedulePrompt(e.target.value)}
+                />
+                <Input
+                  placeholder={gt("Delivery target (optional, e.g. local, origin or {example})", {
+                    example: "telegram:<id>",
+                  })}
+                  aria-label={gt("Delivery target")}
+                  value={newScheduleDeliver}
+                  maxLength={200}
+                  onChange={(e) => setNewScheduleDeliver(e.target.value)}
+                />
+                <Button
+                  type="submit"
+                  size="sm"
+                  variant="secondary"
+                  disabled={scheduleBusy || !newSchedulePrompt.trim() || !newScheduleSpec.trim()}
+                  className="w-full"
+                >
+                  {scheduleBusy ? (
+                    <Loader2Icon className="mr-1.5 size-3.5 animate-spin" />
+                  ) : (
+                    <PlusIcon className="mr-1.5 size-3.5" />
+                  )}
+                  <T>Add scheduled task</T>
+                </Button>
+              </form>
+
+              <Separator />
+
               <div className="space-y-2">
                 <Label>
                   <T>
@@ -1051,7 +1121,7 @@ function BotSettingsBody({
                   </div>
                 ) : (
                   <div className="space-y-2">
-                    {schedules.map((job) => (
+                    {scheduleSlice.items.map((job) => (
                       <div
                         key={job.id}
                         className={cn(
@@ -1131,54 +1201,35 @@ function BotSettingsBody({
                     ))}
                   </div>
                 )}
+                {scheduleSlice.totalPages > 1 && (
+                  <div className="flex items-center justify-between gap-2">
+                    <Button
+                      size="icon-xs"
+                      variant="ghost"
+                      aria-label={gt("Previous page")}
+                      disabled={scheduleSlice.page <= 1}
+                      onClick={() => setSchedulePage(scheduleSlice.page - 1)}
+                    >
+                      <ChevronLeftIcon />
+                    </Button>
+                    <span className="text-xs tabular-nums text-muted-foreground">
+                      {gt("{page} of {total}", {
+                        page: scheduleSlice.page,
+                        total: scheduleSlice.totalPages,
+                      })}
+                    </span>
+                    <Button
+                      size="icon-xs"
+                      variant="ghost"
+                      aria-label={gt("Next page")}
+                      disabled={scheduleSlice.page >= scheduleSlice.totalPages}
+                      onClick={() => setSchedulePage(scheduleSlice.page + 1)}
+                    >
+                      <ChevronRightIcon />
+                    </Button>
+                  </div>
+                )}
               </div>
-
-              <Separator />
-
-              <form onSubmit={handleAddSchedule} className="space-y-2.5">
-                <Label>
-                  <T>New scheduled task</T>
-                </Label>
-                <Input
-                  placeholder={gt("Task name (e.g. daily briefing)")}
-                  value={newScheduleName}
-                  onChange={(e) => setNewScheduleName(e.target.value)}
-                />
-                <Input
-                  placeholder={gt("Schedule (e.g. every 1h or 0 9 * * *)")}
-                  value={newScheduleSpec}
-                  onChange={(e) => setNewScheduleSpec(e.target.value)}
-                />
-                <Textarea
-                  rows={3}
-                  placeholder={gt("Instructions for the bot when the task runs…")}
-                  value={newSchedulePrompt}
-                  onChange={(e) => setNewSchedulePrompt(e.target.value)}
-                />
-                <Input
-                  placeholder={gt("Delivery target (optional, e.g. local, origin or {example})", {
-                    example: "telegram:<id>",
-                  })}
-                  aria-label={gt("Delivery target")}
-                  value={newScheduleDeliver}
-                  maxLength={200}
-                  onChange={(e) => setNewScheduleDeliver(e.target.value)}
-                />
-                <Button
-                  type="submit"
-                  size="sm"
-                  variant="secondary"
-                  disabled={scheduleBusy || !newSchedulePrompt.trim() || !newScheduleSpec.trim()}
-                  className="w-full"
-                >
-                  {scheduleBusy ? (
-                    <Loader2Icon className="mr-1.5 size-3.5 animate-spin" />
-                  ) : (
-                    <PlusIcon className="mr-1.5 size-3.5" />
-                  )}
-                  <T>Add scheduled task</T>
-                </Button>
-              </form>
             </div>
           ) : null}
         </div>
@@ -1200,7 +1251,7 @@ function BotSettingsBody({
             ) : (
               <SaveIcon className="mr-1.5 size-3.5" />
             )}
-            <T>Save changes</T>
+            {gt("Save & Close")}
           </Button>
         </div>
       ) : null}
@@ -1219,7 +1270,7 @@ export function BotSettingsSheet({
   readonly capabilities: PaCapabilities | null;
   readonly open: boolean;
   readonly onOpenChange: (open: boolean) => void;
-  readonly onSaved: () => void;
+  readonly onSaved: (patch?: Partial<PaBotSummary>) => void;
 }) {
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>

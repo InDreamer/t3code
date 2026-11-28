@@ -31,21 +31,27 @@ export interface HermesProfileRow {
   readonly running?: boolean;
   readonly last_session?: {
     readonly id?: string;
+    readonly resolved_id?: string;
     readonly title?: string;
     readonly preview?: string;
     readonly started_at?: number | null;
     readonly last_active?: number | null;
     readonly running?: boolean;
+    readonly message_count?: number;
   } | null;
   readonly canonical_session?: {
     readonly id?: string;
+    readonly resolved_id?: string;
     readonly title?: string;
     readonly preview?: string;
     readonly last_active?: number | null;
+    readonly message_count?: number;
   } | null;
 }
 
 export interface HermesSessionRow {
+  readonly status?: string;
+  readonly last_reply?: string | null;
   readonly session_id?: string;
   readonly id?: string;
   readonly title?: string | null;
@@ -67,6 +73,7 @@ export interface HermesTranscriptRow {
   readonly timestamp?: number | null;
   readonly submission_id?: string;
   readonly row_id?: number | null;
+  readonly message_id?: string;
   readonly name?: string | null;
   readonly context?: string | null;
   readonly tool_call_id?: string | null;
@@ -373,6 +380,7 @@ function transcriptRowId(
   submissionId: string | undefined,
 ): string {
   if (typeof row.row_id === "number" && Number.isFinite(row.row_id)) return `row-${row.row_id}`;
+  if (row.message_id) return "message:" + row.message_id;
   const base = `h-${contentDigest(
     JSON.stringify([
       role,
@@ -478,7 +486,7 @@ export function normalizeTranscriptRows(
       id,
       role,
       text: media?.text ?? text,
-      ...(role === "user" && submissionId ? { submissionId } : {}),
+      ...(submissionId ? { submissionId } : {}),
       ...(media?.attachments.length ? { attachments: media.attachments } : {}),
       ...(pendingReasoning ? { reasoning: pendingReasoning } : {}),
       ...(toolCallId ? { toolCallId } : {}),

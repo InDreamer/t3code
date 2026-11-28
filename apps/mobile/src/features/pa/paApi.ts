@@ -67,7 +67,12 @@ export function paClient(environmentIdValue: string) {
     listBots: () => call(pa.listBots, environmentId, {}),
     createBot: (input: PaCreateBotInput) => call(pa.createBot, environmentId, input),
     updateBotMeta: (input: PaUpdateBotMetaInput) => call(pa.updateBotMeta, environmentId, input),
-    markRead: (botId: string) => call(pa.updateBotMeta, environmentId, { botId, markRead: true }),
+    markRead: (botId: string, seenReply?: PaUpdateBotMetaInput["seenReply"]) =>
+      call(pa.updateBotMeta, environmentId, {
+        botId,
+        markRead: true,
+        ...(seenReply ? { seenReply } : {}),
+      }),
     getBotModels: (botId: string, sessionId?: string | null) =>
       call(pa.getBotModels, environmentId, { botId, ...(sessionId ? { sessionId } : {}) }),
     selectBotModel: (input: PaSelectBotModelInput) => call(pa.selectBotModel, environmentId, input),

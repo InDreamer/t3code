@@ -1,123 +1,136 @@
 import {
-  PA_AVATAR_EYES,
-  PA_AVATAR_ROTATION_ORIGIN,
   PA_AVATAR_VIEWBOX,
-  paAvatarPrimitives,
-  sanitizePaAvatarColor,
+  paAvatarAnimates,
+  paAvatarFrameTick,
+  paAvatarLayers,
+  paAvatarPalette,
+  type PaAvatarTone,
 } from "@t3tools/client-runtime/pa/avatar";
 import type { PaAvatarShape } from "@t3tools/contracts";
-import { StarIcon } from "lucide-react";
+import { useId, useState, useSyncExternalStore } from "react";
 
+import { useMediaQuery } from "../../hooks/useMediaQuery";
+import { getDocumentActivity, subscribeDocumentActivity } from "../../lib/documentActivity";
+import { observeIntersection } from "../../lib/observeIntersection";
 import { cn } from "../../lib/utils";
 
-function ShapePath({ shape, color }: { readonly shape: PaAvatarShape; readonly color: string }) {
-  const fill = sanitizePaAvatarColor(color);
-  const { x, y } = PA_AVATAR_ROTATION_ORIGIN;
-  return paAvatarPrimitives(shape).map((primitive) => {
-    switch (primitive.kind) {
-      case "path":
-        return primitive.paint === "stem" ? (
-          <path
-            key={primitive.d}
-            d={primitive.d}
-            className="text-muted-foreground"
-            stroke="currentColor"
-            strokeWidth={primitive.strokeWidth}
-            strokeLinecap="round"
-            fill="none"
-          />
-        ) : (
-          <path key={primitive.d} d={primitive.d} fill={fill} />
-        );
-      case "rect":
-        return (
-          <rect
-            key="rect"
-            x={primitive.x}
-            y={primitive.y}
-            width={primitive.width}
-            height={primitive.height}
-            rx={primitive.rx}
-            transform={`rotate(${primitive.rotate} ${x} ${y})`}
-            fill={fill}
-          />
-        );
-      case "circle":
-        return (
-          <circle key="circle" cx={primitive.cx} cy={primitive.cy} r={primitive.r} fill={fill} />
-        );
-    }
-  });
+const STILL = () => () => {};
+const documentVisible = () => getDocumentActivity().visible;
+const FIRST_FRAME = () => 0;
+
+const THEMED_TONES: Partial<Record<PaAvatarTone, string>> = {
+  warn: "fill-warning-foreground",
+  info: "fill-info",
+  muted: "fill-muted-foreground/60",
+};
+const OBSIDIAN_TONES: Partial<Record<PaAvatarTone, string>> = {
+  body: "fill-foreground/75",
+  glow: "fill-foreground/55 dark:fill-foreground/90",
+  glint: "fill-foreground/40 dark:fill-foreground",
+};
+
+/** The current frame of a working avatar; still when reduced motion is on or it is off screen. */
+function useAvatarFrame(working: boolean) {
+  const reducedMotion = useMediaQuery("(prefers-reduced-motion: reduce)");
+  const [onScreen, setOnScreen] = useState(true);
+  const visible = useSyncExternalStore(
+    working ? subscribeDocumentActivity : STILL,
+    documentVisible,
+    () => true,
+  );
+  const animate = working && visible && onScreen && !reducedMotion;
+  const frame = useSyncExternalStore(
+    animate ? paAvatarFrameTick.subscribe : STILL,
+    animate ? paAvatarFrameTick.getSnapshot : FIRST_FRAME,
+    FIRST_FRAME,
+  );
+  const ref = working
+    ? (node: SVGSVGElement | null) => {
+        if (!node) return;
+        return observeIntersection(node, (entry) => setOnScreen(entry.isIntersecting));
+      }
+    : undefined;
+  return { frame, ref };
 }
 
 export function BotAvatar({
   color,
   shape,
   size = "md",
-  starred = false,
-  unread = false,
+  online = true,
   running = false,
+  visible = true,
+  awaiting = false,
+  unread = false,
+  starred = false,
   className,
 }: {
   readonly color: string;
   readonly shape: PaAvatarShape;
   readonly size?: "sm" | "md" | "lg";
-  readonly starred?: boolean;
-  readonly unread?: boolean;
+  readonly online?: boolean;
   readonly running?: boolean;
+  readonly visible?: boolean;
+  readonly awaiting?: boolean;
+  readonly unread?: boolean;
+  /** The default Bot, drawn with a small crown. */
+  readonly starred?: boolean;
   readonly className?: string;
 }) {
+  const status = { online, working: running, awaiting, unread, isDefault: starred };
+  const { frame, ref } = useAvatarFrame(visible && paAvatarAnimates(status));
+  const gradientId = `pa-avatar-${useId().replace(/[^\w-]/gu, "")}`;
+  const palette = paAvatarPalette(color);
   const dimension = size === "lg" ? "size-20" : size === "sm" ? "size-8" : "size-11";
 
+  const toneFill = (tone: PaAvatarTone) => {
+    if (THEMED_TONES[tone]) return { className: THEMED_TONES[tone] };
+    if (!palette) return { className: OBSIDIAN_TONES[tone] };
+    if (tone === "body") return { fill: `url(#${gradientId})` };
+    return { fill: tone === "glow" ? palette.glow : palette.glint };
+  };
+
   return (
-    <div
-      className={cn(
-        "relative inline-flex shrink-0 items-center justify-center",
-        dimension,
-        className,
-      )}
+    <svg
+      ref={ref}
+      viewBox={PA_AVATAR_VIEWBOX}
+      className={cn("shrink-0", dimension, className)}
+      aria-hidden="true"
     >
-      <svg
-        viewBox={PA_AVATAR_VIEWBOX}
-        className={cn("size-full drop-shadow-xs", running && "animate-pulse")}
-        aria-hidden="true"
-      >
-        <ShapePath shape={shape} color={color} />
-        <g className="text-background">
-          {PA_AVATAR_EYES.map((eye) => (
-            <ellipse
-              key={eye.cx}
-              cx={eye.cx}
-              cy={eye.cy}
-              rx={eye.rx}
-              ry={eye.ry}
-              transform={`rotate(${eye.rotate} ${eye.cx} ${eye.cy})`}
-              fill="currentColor"
-              fillOpacity="0.88"
-            />
-          ))}
-        </g>
-      </svg>
-
-      {starred ? (
-        <span
-          className={cn(
-            "absolute right-0 bottom-0 flex items-center justify-center rounded-full border-2 border-background bg-warning text-warning-foreground shadow-xs",
-            size === "lg" ? "size-6" : "size-4",
-          )}
-        >
-          <StarIcon className={cn("fill-current", size === "lg" ? "size-3.5" : "size-2.5")} />
-        </span>
+      {palette ? (
+        <defs>
+          <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0" stopColor={palette.top} />
+            <stop offset="1" stopColor={palette.bottom} />
+          </linearGradient>
+        </defs>
       ) : null}
+      {paAvatarLayers(shape, status, frame).map((layer) => (
+        <path key={layer.tone} d={layer.d} {...toneFill(layer.tone)} />
+      ))}
+    </svg>
+  );
+}
 
-      {unread && !starred ? (
-        <span
-          className={cn(
-            "absolute right-0.5 bottom-0.5 rounded-full border-2 border-background bg-info",
-            size === "lg" ? "size-3.5" : "size-2.5",
-          )}
+const EMPTY_STATE_BOTS = [
+  { shape: "pumpkin", color: "#f97316" },
+  { shape: "blob", color: "#14b8a6" },
+  { shape: "cloud", color: "#8b5cf6" },
+] as const;
+
+/** Three Bots side by side, for empty states. */
+export function BotAvatarTrio({ size = "md" }: { readonly size?: "sm" | "md" }) {
+  return (
+    <div className="flex items-end" aria-hidden="true">
+      {EMPTY_STATE_BOTS.map((bot, index) => (
+        <BotAvatar
+          key={bot.shape}
+          color={bot.color}
+          shape={bot.shape}
+          size={size}
+          className={cn(index === 1 ? "-mx-1 -translate-y-1.5" : "opacity-80")}
         />
-      ) : null}
+      ))}
     </div>
   );
 }
