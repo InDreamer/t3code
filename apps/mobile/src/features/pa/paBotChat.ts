@@ -241,6 +241,11 @@ export function createPaBotChat(input: {
         [sessionId]: typeof value === "function" ? value(previous.drafts[sessionId] ?? "") : value,
       },
     }));
+  const editDraft = (sessionId: string, value: string) => {
+    if (disposed || (state.drafts[sessionId] ?? "") === value) return;
+    draftEdits.set(sessionId, (draftEdits.get(sessionId) ?? 0) + 1);
+    setDraftFor(sessionId, value);
+  };
 
   const mergedLocal = (sessionId: string) => state.localBySession[sessionId] ?? [];
 
@@ -859,11 +864,11 @@ export function createPaBotChat(input: {
       openModelPicker = handler;
     },
     setDraft(value: string) {
-      const sessionId = state.activeSessionId;
-      if (!sessionId || (state.drafts[sessionId] ?? "") === value) return;
-      draftEdits.set(sessionId, (draftEdits.get(sessionId) ?? 0) + 1);
-      setDraftFor(sessionId, value);
+      if (state.activeSessionId) editDraft(state.activeSessionId, value);
     },
+    getDraftFor: (sessionId: string) => state.drafts[sessionId] ?? "",
+    /** Edits one session's draft whichever session is shown, as a recording that outlived it does. */
+    setDraftForSession: editDraft,
     selectSession(session: PaSessionSummary) {
       set((previous) => ({
         ...previous,

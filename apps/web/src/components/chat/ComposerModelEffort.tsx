@@ -8,7 +8,13 @@ import type { ProviderOptionDescriptor, RuntimeMode } from "@t3tools/contracts";
 import type { EffortDisplay } from "@t3tools/contracts/settings";
 import { getProviderOptionCurrentLabel } from "@t3tools/shared/model";
 import { msg, T, useGT, useMessages } from "gt-react";
-import { CheckIcon, ChevronRightIcon, ChevronUpIcon, WorkflowIcon } from "lucide-react";
+import {
+  CheckIcon,
+  ChevronRightIcon,
+  ChevronUpIcon,
+  Loader2Icon,
+  WorkflowIcon,
+} from "lucide-react";
 import { type KeyboardEvent, type ReactNode, use, useRef, useState } from "react";
 
 import { m, type MessageResolver } from "~/i18n/messages";
@@ -151,20 +157,7 @@ export function describeComposerEffort(
   return {
     detail: display.label,
     suffix: (
-      <span
-        className={cn(
-          "flex shrink-0 items-center gap-1.5 text-muted-foreground group-hover/model-trigger:text-foreground group-data-pressed/model-trigger:text-foreground group-data-popup-open/model-trigger:text-foreground",
-          // A word space after the model name: the regular trigger's gap is wider than one.
-          size === "sm" && "-ms-0.5",
-        )}
-      >
-        {word ? (
-          <span data-composer-control-label className="max-w-24 truncate">
-            {word}
-          </span>
-        ) : glyph ? (
-          <EffortGlyph count={glyph.count} filled={glyph.filled} size={size} />
-        ) : null}
+      <EffortTriggerSuffix word={word} glyph={glyph} size={size}>
         {fast ? <FastBolt ultra={display.speedLabel === "Ultrafast"} /> : null}
         {display.ultracode ? (
           <WorkflowIcon aria-hidden="true" data-composer-control-icon className="size-3" />
@@ -179,16 +172,43 @@ export function describeComposerEffort(
             {contextWindow}
           </span>
         ) : null}
-      </span>
+      </EffortTriggerSuffix>
     ),
   };
+}
+
+/** The model trigger's effort, as a word or as bars, followed by any other trait marks. */
+export function EffortTriggerSuffix(props: {
+  word: string | null;
+  glyph: { count: number; filled: number } | null;
+  size: ComposerControlSize;
+  children?: ReactNode;
+}) {
+  return (
+    <span
+      className={cn(
+        "flex shrink-0 items-center gap-1.5 text-muted-foreground group-hover/model-trigger:text-foreground group-data-pressed/model-trigger:text-foreground group-data-popup-open/model-trigger:text-foreground",
+        // A word space after the model name: the regular trigger's gap is wider than one.
+        props.size === "sm" && "-ms-0.5",
+      )}
+    >
+      {props.word ? (
+        <span data-composer-control-label className="max-w-24 truncate">
+          {props.word}
+        </span>
+      ) : props.glyph ? (
+        <EffortGlyph count={props.glyph.count} filled={props.glyph.filled} size={props.size} />
+      ) : null}
+      {props.children}
+    </span>
+  );
 }
 
 const COLUMN_ROW =
   "flex h-8 w-full shrink-0 cursor-pointer items-center gap-2 rounded-sm px-2 text-left text-sm text-foreground outline-none hover:bg-foreground/[0.09] focus-visible:bg-foreground/[0.09] disabled:cursor-not-allowed disabled:opacity-64";
 const COLUMN_LABEL = "px-2 pt-1.5 pb-1 font-medium text-muted-foreground text-xs";
 
-function ColumnRow(props: {
+export function EffortColumnRow(props: {
   label: string;
   /** Shown on hover; the column is too narrow to print it under the label. */
   description?: string | undefined;
@@ -197,6 +217,8 @@ function ColumnRow(props: {
   tabStop: boolean;
   isDefault?: boolean | undefined;
   disabled?: boolean;
+  /** The pick is saving; a spinner holds the check's place. */
+  busy?: boolean;
   onPick: () => void;
 }) {
   const gt = useGT();
@@ -216,7 +238,9 @@ function ColumnRow(props: {
   const content = (
     <>
       <span className="min-w-0 flex-1 truncate">{props.label}</span>
-      {props.selected ? (
+      {props.busy ? (
+        <Loader2Icon aria-hidden="true" className="size-3.5 animate-spin" />
+      ) : props.selected ? (
         <>
           {props.isDefault ? (
             <span className="sr-only">
@@ -336,7 +360,7 @@ function EffortRows(props: { control: ColumnControl; traits: TraitsSelection; lo
     return (
       <div role="radiogroup" aria-label={descriptor.label} className="flex flex-col gap-0.5">
         {([true, false] as const).map((value) => (
-          <ColumnRow
+          <EffortColumnRow
             key={String(value)}
             label={
               value
@@ -364,7 +388,7 @@ function EffortRows(props: { control: ColumnControl; traits: TraitsSelection; lo
         </div>
       ) : null}
       {choices.map((option, index) => (
-        <ColumnRow
+        <EffortColumnRow
           key={option.id}
           label={option.label}
           selected={option.id === value}
@@ -526,7 +550,7 @@ function OptionSwitchRow(props: {
   );
 }
 
-function NoEffortRow() {
+export function NoEffortRow() {
   return (
     <div className="flex h-8 items-center px-2 text-muted-foreground text-sm">
       <T>No effort levels</T>
@@ -547,18 +571,34 @@ export function ComposerEffortColumn(props: { traits: TraitsSelectionInput | nul
       ? columnControls(visibility.selectDescriptors, visibility.booleanDescriptors)
       : null;
   return (
+    <EffortColumnFrame
+      heading={
+        controls?.effort?.descriptor.label ??
+        (controls?.others.length
+          ? gt("Options", { $context: "heading for model options" })
+          : gt("Effort", { $context: "heading for reasoning effort levels" }))
+      }
+      modelLabel={picker.modelLabel}
+    >
+      {props.traits ? <EffortLevels traits={props.traits} /> : <NoEffortRow />}
+    </EffortColumnFrame>
+  );
+}
+
+/** A docked effort column's heading over its rows, which Up, Down and a typed letter move through. */
+export function EffortColumnFrame(props: {
+  heading: string;
+  modelLabel: string;
+  children: ReactNode;
+}) {
+  return (
     <>
       {/* Matches the search row's box, so one rule runs across the top of the popup. */}
       <div className="shrink-0 px-3 pt-2.5">
         <div className="flex h-8.25 -translate-y-px items-center gap-2 border-b border-border/70 pb-1.5 text-sm">
-          <span className="text-muted-foreground">
-            {controls?.effort?.descriptor.label ??
-              (controls?.others.length
-                ? gt("Options", { $context: "heading for model options" })
-                : gt("Effort", { $context: "heading for reasoning effort levels" }))}
-          </span>
+          <span className="text-muted-foreground">{props.heading}</span>
           <span className="ms-auto min-w-0 truncate text-muted-foreground text-xs">
-            {picker.modelLabel}
+            {props.modelLabel}
           </span>
         </div>
       </div>
@@ -568,7 +608,7 @@ export function ComposerEffortColumn(props: { traits: TraitsSelectionInput | nul
         // Capture, so Up and Down on an option row move rows instead of opening its menu.
         onKeyDownCapture={moveBetweenRows}
       >
-        {props.traits ? <EffortLevels traits={props.traits} /> : <NoEffortRow />}
+        {props.children}
       </div>
     </>
   );

@@ -116,6 +116,8 @@ export interface HermesModelOptionsResult {
         {
           readonly reasoning?: boolean;
           readonly can_disable_reasoning?: boolean | null;
+          readonly label?: string | null;
+          readonly reasoning_levels?: ReadonlyArray<string> | null;
         }
       >
     >;
@@ -147,6 +149,15 @@ export function normalizeHermesReasoningEffort(value: unknown): string | undefin
   const normalized = value.trim().toLowerCase();
   if (normalized === "false" || normalized === "disabled" || normalized === "off") return "none";
   return HERMES_REASONING_EFFORT_SET.has(normalized) ? normalized : undefined;
+}
+
+/** Only levels `select` can write back survive, kept in Hermes' ascending order. */
+function normalizeModelReasoningLevels(
+  raw: ReadonlyArray<string> | null | undefined,
+): ReadonlyArray<PaReasoningLevel> | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const ids = new Set(raw.map(normalizeHermesReasoningEffort));
+  return HERMES_REASONING_LEVELS.filter((level) => ids.has(level.id));
 }
 
 export function normalizeHermesTimestamp(value: number | string | null | undefined): number | null {
@@ -1143,12 +1154,16 @@ export function normalizeModelCatalog(
       isCurrent: row.is_current === true,
       models: (row.models ?? []).map((id): PaModelOption => {
         const cap = capabilities?.[id];
+        const label = nonEmptyString(cap?.label);
+        const reasoningLevels = normalizeModelReasoningLevels(cap?.reasoning_levels);
         return {
           id,
+          ...(label ? { label } : {}),
           ...(typeof cap?.reasoning === "boolean" ? { reasoning: cap.reasoning } : {}),
           ...(typeof cap?.can_disable_reasoning === "boolean"
             ? { canDisableReasoning: cap.can_disable_reasoning }
             : {}),
+          ...(reasoningLevels ? { reasoningLevels } : {}),
         };
       }),
       rank: row.is_current ? 0 : row.is_user_defined ? 1 : tier === "primary" ? 2 : 3,

@@ -465,6 +465,47 @@ describe("Hermes sessions, profiles and models", () => {
     );
     expect(disabled.current?.reasoningEffort).toBe("none");
   });
+
+  it("passes through optional per-model labels and reasoning levels", () => {
+    const catalog = normalizeModelCatalog(
+      {
+        providers: [
+          {
+            slug: "anthropic",
+            name: "Anthropic",
+            is_current: true,
+            models: ["claude-opus", "claude-haiku", "empty", "inherits"],
+            capabilities: {
+              "claude-opus": {
+                reasoning: true,
+                label: "Claude Opus",
+                reasoning_levels: ["HIGH", "low", "turbo", "max"],
+              },
+              "claude-haiku": { reasoning: true, label: "  ", reasoning_levels: ["turbo"] },
+              empty: { reasoning_levels: [] },
+              inherits: { reasoning_levels: null },
+            },
+          },
+        ],
+      },
+      { model: { default: "claude-opus", provider: "anthropic" } },
+    );
+    expect(catalog.providers[0]?.models).toEqual([
+      {
+        id: "claude-opus",
+        label: "Claude Opus",
+        reasoning: true,
+        reasoningLevels: [
+          { id: "low", label: "Low" },
+          { id: "high", label: "High" },
+          { id: "max", label: "Max" },
+        ],
+      },
+      { id: "claude-haiku", reasoning: true, reasoningLevels: [] },
+      { id: "empty", reasoningLevels: [] },
+      { id: "inherits" },
+    ]);
+  });
 });
 
 describe("Hermes prompts and config", () => {

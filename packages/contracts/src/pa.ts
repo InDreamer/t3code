@@ -157,10 +157,20 @@ export const PaSessionInput = Schema.Struct({ botId: PaBotId, sessionId: PaSessi
 
 // Models
 
+export const PaReasoningLevel = Schema.Struct({
+  id: Schema.String,
+  label: Schema.String,
+});
+export type PaReasoningLevel = typeof PaReasoningLevel.Type;
+
 export const PaModelOption = Schema.Struct({
   id: Schema.String,
+  /** Display name from the engine; clients fall back to a short form of `id`. */
+  label: Schema.optionalKey(Schema.String),
   reasoning: Schema.optionalKey(Schema.Boolean),
   canDisableReasoning: Schema.optionalKey(Schema.Boolean),
+  /** Per-model effort levels; overrides the catalog-wide `reasoningLevels` when present. */
+  reasoningLevels: Schema.optionalKey(Schema.Array(PaReasoningLevel)),
 });
 export type PaModelOption = typeof PaModelOption.Type;
 
@@ -174,12 +184,6 @@ export const PaModelProvider = Schema.Struct({
   models: Schema.Array(PaModelOption),
 });
 export type PaModelProvider = typeof PaModelProvider.Type;
-
-export const PaReasoningLevel = Schema.Struct({
-  id: Schema.String,
-  label: Schema.String,
-});
-export type PaReasoningLevel = typeof PaReasoningLevel.Type;
 
 const PaModelSelection = Schema.Struct({
   provider: Schema.NullOr(Schema.String),

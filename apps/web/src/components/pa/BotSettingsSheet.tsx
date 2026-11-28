@@ -45,7 +45,7 @@ import {
   type ToggleFilterMode,
 } from "@t3tools/client-runtime/pa/settings";
 import { cn } from "../../lib/utils";
-import { EffortGlyph } from "../chat/EffortGlyph";
+import { EffortGlyph, resolveEffortGlyph } from "../chat/EffortGlyph";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
@@ -68,9 +68,9 @@ import {
 } from "./paApi";
 import {
   findPaModelOption,
+  buildPaReasoningDescriptor,
   formatPaReasoningLabel,
   getSelectableReasoningLevels,
-  resolvePaReasoningGlyph,
 } from "@t3tools/client-runtime/pa/reasoning";
 
 type SettingsTab = "profile" | "model" | "toggles" | "schedules";
@@ -358,7 +358,10 @@ function BotSettingsBody({
   const canSelectModel = useAtomValue(paSelectModelPermissionAtom(environmentId));
   const canMutateSchedule = useAtomValue(paMutateSchedulePermissionAtom(environmentId));
   const configSupported = canEditConfig && capabilities?.config.supported === true;
-  const modelsSupported = canSelectModel && capabilities?.models.supported === true;
+  const modelsSupported =
+    canSelectModel &&
+    capabilities?.models.supported === true &&
+    capabilities.models.scope !== "session";
   const schedulesSupported = canMutateSchedule && capabilities?.schedules.supported === true;
 
   const [tab, setTab] = useState<SettingsTab>("profile");
@@ -413,9 +416,9 @@ function BotSettingsBody({
         }),
       );
     }
-    if (modelsSupported) {
+    if (modelsSupported && environmentId) {
       loads.push(
-        paApi.getBotModels(bot.botId).then((loaded) => {
+        paApi.getBotModels(environmentId, bot.botId).then((loaded) => {
           if (cancelled) return;
           setCatalog(loaded);
           setProvider(loaded.current?.provider ?? "");
@@ -441,7 +444,7 @@ function BotSettingsBody({
     return () => {
       cancelled = true;
     };
-  }, [bot.botId, configSupported, modelsSupported, schedulesSupported, gt]);
+  }, [bot.botId, configSupported, modelsSupported, schedulesSupported, gt, environmentId]);
 
   const sections = configSupported ? (config?.sections ?? []) : [];
   const profileSections = sections.filter((s) => s.kind !== "toggleList");
@@ -455,6 +458,13 @@ function BotSettingsBody({
   const selectedProviderId = provider || activeProvider?.id || catalog?.current?.provider || null;
   const selectedModelOption = findPaModelOption(catalog, selectedProviderId, model || null);
   const reasoningLevels = getSelectableReasoningLevels(catalog, selectedProviderId, model || null);
+  const reasoningDescriptor = buildPaReasoningDescriptor(
+    catalog,
+    selectedProviderId,
+    model || null,
+    null,
+    m,
+  );
 
   const handleSave = async (
     confirmed: { readonly provider: string; readonly model: string } | null = null,
@@ -543,8 +553,13 @@ function BotSettingsBody({
         );
         onSaved();
       }
-      if ((modelChanged || reasoningChanged) && catalog) {
-        const result = await paApi.selectBotModel({
+      if (
+        (modelChanged || reasoningChanged) &&
+        catalog &&
+        catalog.scope !== "session" &&
+        environmentId
+      ) {
+        const result = await paApi.selectBotModel(environmentId, {
           botId: bot.botId,
           ...(modelChanged ? { provider: submittedProvider, model: submittedModel } : {}),
           ...(reasoningChanged ? { reasoningEffort: validReasoning } : {}),
@@ -964,7 +979,9 @@ function BotSettingsBody({
                   >
                     {reasoningLevels.map((level) => {
                       const selected = level.id.toLowerCase() === reasoningEffort.toLowerCase();
-                      const glyph = resolvePaReasoningGlyph(level.id, reasoningLevels);
+                      const glyph = reasoningDescriptor
+                        ? resolveEffortGlyph(reasoningDescriptor, level.id)
+                        : null;
                       return (
                         <button
                           key={level.id}
@@ -979,7 +996,9 @@ function BotSettingsBody({
                               : "border-border/60 text-muted-foreground hover:bg-muted/40 hover:text-foreground",
                           )}
                         >
-                          <EffortGlyph count={glyph.count} filled={glyph.filled} size="xs" />
+                          {glyph ? (
+                            <EffortGlyph count={glyph.count} filled={glyph.filled} size="xs" />
+                          ) : null}
                           <span className="truncate">
                             {formatPaReasoningLabel(level.id, level.label, m)}
                           </span>

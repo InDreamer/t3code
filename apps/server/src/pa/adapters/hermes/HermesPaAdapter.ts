@@ -230,6 +230,17 @@ function isSlashRefusal(error: unknown): boolean {
   );
 }
 
+/** Older gateways lack the method or key; anything else is a real failure worth surfacing. */
+function isUnsupportedRpc(error: unknown, method: "model.options" | "config.get"): boolean {
+  return (
+    error instanceof HermesRpcError &&
+    (error.code === -32601 ||
+      error.message === "method_not_found" ||
+      (method === "config.get" &&
+        (error.message === "unknown_key" || error.message === "not_found")))
+  );
+}
+
 const HERMES_CAPABILITIES: PaCapabilities = {
   attachments: {
     images: true,
@@ -1681,13 +1692,19 @@ export class HermesPaAdapter implements PaEngineInstance {
           defaultConn.call<HermesProfileDescription>("profiles.describe", { name: profile }),
           profileConn
             .call<HermesModelOptionsResult>("model.options", { explicit_only: true })
-            .catch((): HermesModelOptionsResult => ({ providers: [] })),
+            .catch((error: unknown) => {
+              if (isUnsupportedRpc(error, "model.options")) return { providers: [] };
+              throw error;
+            }),
           profileConn
             .call<HermesReasoningConfigResult>("config.get", {
               key: "reasoning",
               ...(canonicalSessionId ? { session_id: canonicalSessionId } : {}),
             })
-            .catch(() => null),
+            .catch((error: unknown) => {
+              if (isUnsupportedRpc(error, "config.get")) return null;
+              throw error;
+            }),
         ]);
         return normalizeModelCatalog(options, description, reasoning ?? undefined);
       }),

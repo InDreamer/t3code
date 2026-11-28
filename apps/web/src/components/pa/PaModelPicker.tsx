@@ -1,3 +1,17 @@
+import {
+  filterPaModelProviders,
+  formatPaModelLabel,
+  resolvePaModelSelection,
+  type PaModelCatalogEntry,
+  type PaModelCatalogKey,
+} from "@t3tools/client-runtime/pa/models";
+import type {
+  EnvironmentId,
+  PaBotSummary,
+  PaCapabilities,
+  PaModelProvider,
+  PaSelectBotModelInput,
+} from "@t3tools/contracts";
 import { T, useGT, useMessages } from "gt-react";
 import {
   CheckIcon,
@@ -5,444 +19,86 @@ import {
   ChevronRightIcon,
   Loader2Icon,
   RefreshCwIcon,
+  SearchIcon,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
-
-import { useStableCallback } from "~/hooks/useStableCallback";
-import { cn } from "../../lib/utils";
-import { EffortGlyph } from "../chat/EffortGlyph";
-import { Button } from "../ui/button";
-import { Input } from "../ui/input";
-import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
-import type {
-  PaBotSummary,
-  PaModelCatalog,
-  PaModelProvider,
-  PaReasoningLevel,
-} from "@t3tools/contracts";
-import { paApi, paErrorMessage } from "./paApi";
 import {
-  formatPaReasoningLabel,
-  getSelectableReasoningLevels,
-  resolvePaReasoningGlyph,
-} from "@t3tools/client-runtime/pa/reasoning";
+  type KeyboardEvent,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 
-const SEARCH_THRESHOLD = 8;
+import { useMediaQuery } from "~/hooks/useMediaQuery";
+import { useClientSettings } from "~/hooks/useSettings";
+import { useStableCallback } from "~/hooks/useStableCallback";
+import { ComposerControl } from "../chat/ComposerControl";
+import {
+  EffortColumnFrame,
+  EffortColumnRow,
+  EffortTriggerSuffix,
+  NoEffortRow,
+} from "../chat/ComposerModelEffort";
+import { resolveEffortGlyph } from "../chat/EffortGlyph";
+import { Button } from "../ui/button";
+import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
+import { paApi, paErrorMessage, paModelCatalogs } from "./paApi";
+import { PaNativeSelect } from "./PaNativeSelect";
 
-interface PendingConfirm {
-  readonly provider: string;
-  readonly model: string;
-  readonly message: string;
+type ModelChange = Pick<PaSelectBotModelInput, "provider" | "model" | "reasoningEffort">;
+
+interface PickerAction {
+  /** The Bot and session the action started in; another one hides it. */
+  readonly scope: string;
+  readonly saving: string | null;
+  readonly confirm: { readonly change: ModelChange; readonly message: string } | null;
+  readonly error: string | null;
 }
 
-function filterProvider(option: PaModelProvider, needle: string): PaModelProvider {
-  if (!needle) return option;
-  return {
-    ...option,
-    models: option.models.filter(
-      (model) =>
-        model.id.toLowerCase().includes(needle) ||
-        option.label.toLowerCase().includes(needle) ||
-        option.id.toLowerCase().includes(needle),
-    ),
-  };
+const MODEL_ROW =
+  "flex h-8 w-full shrink-0 cursor-pointer items-center gap-2 rounded-sm px-2 text-left text-sm text-foreground outline-none hover:bg-foreground/[0.09] focus-visible:bg-foreground/[0.09] disabled:cursor-not-allowed disabled:opacity-64 pointer-coarse:h-10";
+const GROUP_LABEL =
+  "flex items-center justify-between gap-2 px-2 pt-1.5 pb-1 text-xs font-medium text-muted-foreground";
+
+function changeKey(change: ModelChange): string {
+  return change.reasoningEffort !== undefined
+    ? `effort:${change.reasoningEffort}`
+    : `model:${change.provider ?? ""}/${change.model ?? ""}`;
 }
 
-function PaModelPickerContent({
-  bot,
-  sessionId,
-  cached,
-  query,
-  onQueryChange,
-  onLoaded,
-  onApplied,
-}: {
-  readonly bot: PaBotSummary;
-  readonly sessionId: string | null;
-  readonly cached: PaModelCatalog | null;
-  readonly query: string;
-  readonly onQueryChange: (value: string) => void;
-  readonly onLoaded: (catalog: PaModelCatalog) => void;
-  readonly onApplied: (current: NonNullable<PaModelCatalog["current"]>) => void;
-}) {
-  const gt = useGT();
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [savingKey, setSavingKey] = useState<string | null>(null);
-  const [confirm, setConfirm] = useState<PendingConfirm | null>(null);
-  const [showSecondary, setShowSecondary] = useState(false);
+const NO_CATALOG: PaModelCatalogEntry = { catalog: null, loading: false, error: null };
 
-  const requestRef = useRef(0);
-  const load = useStableCallback(() => {
-    const request = ++requestRef.current;
-    paApi
-      .getBotModels(bot.botId, sessionId ?? undefined)
-      .then((catalog) => {
-        if (requestRef.current !== request) return;
-        onLoaded(catalog);
-        setError(null);
-      })
-      .catch((err) => {
-        if (requestRef.current === request)
-          setError(paErrorMessage(err, gt("Could not load models")));
-      })
-      .finally(() => {
-        if (requestRef.current === request) setLoading(false);
-      });
-  });
-
-  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- reads the agent's live provider/model catalog each time the picker opens
-  useEffect(() => {
-    load();
-    return () => {
-      requestRef.current += 1;
-    };
-  }, [load]);
-
-  const catalog = cached;
-  const currentProvider = catalog?.current?.provider ?? null;
-  const currentModel = catalog?.current?.model ?? bot.model;
-  const needle = query.trim().toLowerCase();
-
-  const allOptions = (catalog?.providers ?? []).filter((option) => option.models.length > 0);
-  const rawPrimary = allOptions.filter((option) => option.tier === "primary");
-  const rawSecondary = allOptions.filter((option) => option.tier === "detected");
-  const primaryModelCount = rawPrimary.reduce((sum, option) => sum + option.models.length, 0);
-  const secondaryModelCount = rawSecondary.reduce((sum, option) => sum + option.models.length, 0);
-  const secondaryNames = rawSecondary.map((option) => option.label).join(" / ");
-
-  const searchGroups = needle
-    ? allOptions
-        .map((option) => filterProvider(option, needle))
-        .filter((option) => option.models.length > 0)
-    : [];
-  const hasVisibleGroups = needle ? searchGroups.length > 0 : rawPrimary.length > 0;
-  const showSearch = primaryModelCount > SEARCH_THRESHOLD || showSecondary || Boolean(needle);
-
-  const choose = async (provider: string, model: string, confirm = false) => {
-    if (savingKey) return;
-    setSavingKey(`${provider}/${model}`);
-    setError(null);
-    const result = await paApi
-      .selectBotModel({
-        botId: bot.botId,
-        ...(sessionId ? { sessionId } : {}),
-        provider,
-        model,
-        ...(confirm ? { confirm: true } : {}),
-      })
-      .catch((err) => {
-        setError(paErrorMessage(err, gt("Could not switch model")));
-        return null;
-      });
-    setSavingKey(null);
-    if (!result) return;
-    if (result.status === "confirmRequired") {
-      setConfirm({ provider, model, message: result.message });
-      return;
-    }
-    setConfirm(null);
-    const mergedCurrent = {
-      ...(catalog?.current?.reasoningEffort !== undefined
-        ? { reasoningEffort: catalog.current.reasoningEffort }
-        : {}),
-      ...result.current,
-    };
-    if (catalog) onLoaded({ ...catalog, current: mergedCurrent });
-    onApplied(mergedCurrent);
-  };
-
-  const renderGroup = (option: PaModelProvider) => (
-    <div key={option.id} className="pb-1.5">
-      <div className="flex items-center justify-between gap-2 px-2 py-1 text-2xs font-medium text-muted-foreground">
-        <span className="min-w-0 truncate">{option.label}</span>
-        {option.badge === "current" ? (
-          <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-2xs text-foreground/80">
-            <T>Current</T>
-          </span>
-        ) : option.badge === "custom" ? (
-          <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-2xs text-muted-foreground">
-            <T>Custom</T>
-          </span>
-        ) : option.badge === "detected" ? (
-          <span className="shrink-0 text-2xs text-muted-foreground/75">
-            <T>Auto-detect</T>
-          </span>
-        ) : null}
-      </div>
-      {option.models.map(({ id: model }) => {
-        const key = `${option.id}/${model}`;
-        const selected =
-          model === currentModel && (currentProvider === null || option.id === currentProvider);
-        return (
-          <button
-            key={key}
-            type="button"
-            disabled={savingKey !== null}
-            aria-pressed={selected}
-            onClick={() => void choose(option.id, model)}
-            className={cn(
-              "flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs transition-colors disabled:opacity-64 pointer-coarse:py-2.5",
-              selected ? "bg-accent text-accent-foreground" : "hover:bg-muted/60",
-            )}
-          >
-            <span className="min-w-0 flex-1 truncate font-mono">{model}</span>
-            {savingKey === key ? (
-              <Loader2Icon className="size-3.5 shrink-0 animate-spin" />
-            ) : selected ? (
-              <CheckIcon className="size-3.5 shrink-0" />
-            ) : null}
-          </button>
-        );
-      })}
-    </div>
-  );
-
-  return (
-    <div className="flex max-h-[min(24rem,60dvh)] min-w-0 flex-col gap-2">
-      <div className="flex items-center justify-between gap-2 px-1">
-        <span className="text-xs font-medium text-muted-foreground">
-          <T>Switch model</T>
-        </span>
-        <Button
-          type="button"
-          size="icon-xs"
-          variant="ghost"
-          aria-label={gt("Refresh models")}
-          disabled={loading}
-          onClick={() => {
-            setLoading(true);
-            load();
-          }}
-        >
-          <RefreshCwIcon className={cn("size-3.5", loading && "animate-spin")} />
-        </Button>
-      </div>
-
-      {showSearch ? (
-        <Input
-          size="sm"
-          type="search"
-          placeholder={gt("Search models or providers")}
-          value={query}
-          onChange={(event) => onQueryChange(event.target.value)}
-        />
-      ) : null}
-
-      {confirm ? (
-        <div className="space-y-2 rounded-lg border border-warning/40 bg-warning/8 p-2.5 text-xs">
-          <p className="whitespace-pre-wrap break-words text-foreground">{confirm.message}</p>
-          <div className="flex justify-end gap-1.5">
-            <Button type="button" size="xs" variant="outline" onClick={() => setConfirm(null)}>
-              <T>Cancel</T>
-            </Button>
-            <Button
-              type="button"
-              size="xs"
-              disabled={savingKey !== null}
-              onClick={() => void choose(confirm.provider, confirm.model, true)}
-            >
-              <T>Confirm switch</T>
-            </Button>
-          </div>
-        </div>
-      ) : null}
-
-      {error ? (
-        <div className="rounded-lg border border-destructive/30 bg-destructive/8 px-2.5 py-2 text-xs break-words text-destructive">
-          {error}
-        </div>
-      ) : null}
-
-      <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
-        {!catalog && loading ? (
-          <div className="flex items-center justify-center gap-2 py-6 text-xs text-muted-foreground">
-            <Loader2Icon className="size-3.5 animate-spin" />
-            <T>Loading models…</T>
-          </div>
-        ) : null}
-        {catalog && !hasVisibleGroups ? (
-          <div className="py-6 text-center text-xs text-muted-foreground">
-            {needle ? <T>No matching models</T> : <T>No models available</T>}
-          </div>
-        ) : null}
-        {needle ? (
-          searchGroups.map(renderGroup)
-        ) : (
-          <>
-            {rawPrimary.map(renderGroup)}
-            {rawSecondary.length > 0 ? (
-              <div className="mt-1 border-t border-border/50 pt-1.5">
-                <button
-                  type="button"
-                  aria-expanded={showSecondary}
-                  onClick={() => setShowSecondary((prev) => !prev)}
-                  className="flex w-full min-w-0 items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-2xs font-medium text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground pointer-coarse:py-2.5"
-                >
-                  {showSecondary ? (
-                    <ChevronDownIcon className="size-3 shrink-0" />
-                  ) : (
-                    <ChevronRightIcon className="size-3 shrink-0" />
-                  )}
-                  <span className="min-w-0 flex-1 truncate">
-                    {gt("Other detected providers ({names} · {count})", {
-                      names: secondaryNames,
-                      count: secondaryModelCount,
-                    })}
-                  </span>
-                </button>
-                {showSecondary ? <div className="pt-1">{rawSecondary.map(renderGroup)}</div> : null}
-              </div>
-            ) : null}
-          </>
-        )}
-      </div>
-    </div>
+function usePaModelCatalog(key: PaModelCatalogKey | null): PaModelCatalogEntry {
+  return useSyncExternalStore(paModelCatalogs.subscribe, () =>
+    key ? paModelCatalogs.read(key) : NO_CATALOG,
   );
 }
 
-function PaReasoningPicker({
-  botId,
-  sessionId,
-  levels,
-  currentEffort,
-  onApplied,
-}: {
-  readonly botId: string;
-  readonly sessionId: string | null;
-  readonly levels: ReadonlyArray<PaReasoningLevel>;
-  readonly currentEffort: string | null;
-  readonly onApplied: (effort: string) => void;
-}) {
-  const gt = useGT();
-  const m = useMessages();
-  const [open, setOpen] = useState(false);
-  const [savingLevel, setSavingLevel] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  const activeLevel =
-    levels.find((level) => level.id.toLowerCase() === (currentEffort ?? "").toLowerCase()) ?? null;
-  const triggerLabel = activeLevel
-    ? formatPaReasoningLabel(activeLevel.id, activeLevel.label, m)
-    : currentEffort
-      ? formatPaReasoningLabel(currentEffort, undefined, m)
-      : gt("Reasoning");
-  const triggerGlyph = resolvePaReasoningGlyph(activeLevel?.id ?? currentEffort, levels);
-
-  const pickEffort = async (level: PaReasoningLevel) => {
-    if (savingLevel) return;
-    if (level.id.toLowerCase() === (currentEffort ?? "").toLowerCase()) {
-      setOpen(false);
-      return;
-    }
-    setSavingLevel(level.id);
-    setError(null);
-    const result = await paApi
-      .selectBotModel({
-        botId,
-        ...(sessionId ? { sessionId } : {}),
-        reasoningEffort: level.id,
-      })
-      .catch((err) => {
-        setError(paErrorMessage(err, gt("Could not change reasoning effort")));
-        return null;
-      });
-    setSavingLevel(null);
-    if (!result || result.status !== "applied") return;
-    onApplied(result.current.reasoningEffort ?? level.id);
-    setOpen(false);
-  };
-
-  return (
-    <Popover
-      open={open}
-      onOpenChange={(next) => {
-        setOpen(next);
-        if (!next) setError(null);
-      }}
-    >
-      <PopoverTrigger
-        render={
-          <Button
-            type="button"
-            size="xs"
-            variant="ghost-muted"
-            className="min-w-0 shrink"
-            aria-label={gt("Reasoning effort: {level}", { level: triggerLabel })}
-          >
-            <EffortGlyph count={triggerGlyph.count} filled={triggerGlyph.filled} size="xs" />
-            <span className="truncate">{triggerLabel}</span>
-            <ChevronDownIcon className="size-3 opacity-70" />
-          </Button>
-        }
-      />
-      <PopoverPopup
-        side="top"
-        align="end"
-        padding="compact"
-        className="w-56 max-w-[calc(100vw-1.5rem)]"
-      >
-        <div className="flex flex-col gap-1.5">
-          <div className="flex items-center justify-between gap-2 px-2 py-0.5">
-            <span className="text-xs font-medium text-muted-foreground">
-              <T>Reasoning effort</T>
-            </span>
-          </div>
-
-          {error ? (
-            <div className="rounded-lg border border-destructive/30 bg-destructive/8 px-2.5 py-2 text-xs break-words text-destructive">
-              {error}
-            </div>
-          ) : null}
-
-          <div
-            role="radiogroup"
-            aria-label={gt("Reasoning effort")}
-            className="flex flex-col gap-0.5"
-          >
-            {levels.map((level) => {
-              const selected =
-                level.id.toLowerCase() === (activeLevel?.id ?? currentEffort ?? "").toLowerCase();
-              const glyph = resolvePaReasoningGlyph(level.id, levels);
-              const label = formatPaReasoningLabel(level.id, level.label, m);
-              return (
-                <button
-                  key={level.id}
-                  type="button"
-                  role="radio"
-                  aria-checked={selected}
-                  disabled={savingLevel !== null}
-                  onClick={() => void pickEffort(level)}
-                  className={cn(
-                    "flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs transition-colors disabled:opacity-64 pointer-coarse:py-2.5",
-                    selected ? "bg-accent text-accent-foreground" : "hover:bg-muted/60",
-                  )}
-                >
-                  <EffortGlyph count={glyph.count} filled={glyph.filled} size="xs" />
-                  <span className="min-w-0 flex-1 truncate font-medium">{label}</span>
-                  <span className="shrink-0 font-mono text-2xs text-muted-foreground">
-                    {level.id}
-                  </span>
-                  {savingLevel === level.id ? (
-                    <Loader2Icon className="size-3.5 shrink-0 animate-spin" />
-                  ) : selected ? (
-                    <CheckIcon className="size-3.5 shrink-0" />
-                  ) : (
-                    <span className="size-3.5 shrink-0" aria-hidden />
-                  )}
-                </button>
-              );
-            })}
-          </div>
-        </div>
-      </PopoverPopup>
-    </Popover>
+function moveBetweenModelRows(event: KeyboardEvent<HTMLElement>, onLeaveTop: () => void) {
+  if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+  const rows = Array.from(
+    event.currentTarget.querySelectorAll<HTMLButtonElement>("[data-pa-model-row]:not(:disabled)"),
   );
+  const index = rows.findIndex((row) => row === document.activeElement);
+  if (index < 0) return;
+  event.preventDefault();
+  if (event.key === "ArrowUp" && index === 0) {
+    onLeaveTop();
+    return;
+  }
+  const next = rows[Math.min(rows.length - 1, index + (event.key === "ArrowDown" ? 1 : -1))];
+  next?.focus();
+  next?.scrollIntoView({ block: "nearest" });
 }
 
+/** The Bot's model and effort in one trigger, with the levels docked beside the model list. */
 export function PaModelPicker({
+  environmentId,
   bot,
   sessionId,
+  sessionModel,
+  modelScope,
   open,
   onOpenChange,
   query,
@@ -452,8 +108,11 @@ export function PaModelPicker({
   onReasoningChanged,
   onModelChanged,
 }: {
+  readonly environmentId: EnvironmentId | null;
   readonly bot: PaBotSummary;
   readonly sessionId: string | null;
+  readonly sessionModel: string | null;
+  readonly modelScope: PaCapabilities["models"]["scope"];
   readonly open: boolean;
   readonly onOpenChange: (open: boolean) => void;
   readonly query: string;
@@ -461,116 +120,503 @@ export function PaModelPicker({
   readonly liveReasoningEffort?: string | null | undefined;
   readonly refreshVersion?: number | undefined;
   readonly onReasoningChanged?: ((effort: string) => void) | undefined;
-  readonly onModelChanged: () => void;
+  readonly onModelChanged: (model: string, sessionId: string | null) => void;
 }) {
   const gt = useGT();
-  const [cached, setCached] = useState<{
-    readonly botId: string;
-    readonly catalog: PaModelCatalog;
-  }>();
-  // Shown until the Bot list refresh carries the new model back in `bot.model`.
-  const [applied, setApplied] = useState<{
-    readonly base: string | null;
-    readonly model: string;
-  } | null>(null);
-  const [appliedEffort, setAppliedEffort] = useState<{
-    readonly base: string | null;
-    readonly effort: string;
-  } | null>(null);
-  const [localRefreshTick, setLocalRefreshTick] = useState(0);
-
-  const preloadRequestRef = useRef(0);
-  const preloadKey = `${bot.botId}\u0000${sessionId ?? ""}\u0000${bot.model ?? ""}\u0000${refreshVersion}\u0000${localRefreshTick}`;
-
-  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- loads the bot's model catalog and reasoning effort for the active session so the composer toolbar stays in sync
-  useEffect(() => {
-    if (!preloadKey) return;
-    const request = ++preloadRequestRef.current;
-    paApi
-      .getBotModels(bot.botId, sessionId ?? undefined)
-      .then((catalog) => {
-        if (preloadRequestRef.current !== request) return;
-        setCached({ botId: bot.botId, catalog });
-      })
-      .catch(() => undefined);
+  const messages = useMessages();
+  const effortDisplay = useClientSettings((settings) => settings.effortDisplay);
+  const isCoarsePointer = useMediaQuery({ pointer: "coarse" });
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const popupRef = useRef<HTMLDivElement | null>(null);
+  const key = environmentId ? { environmentId, botId: bot.botId, sessionId } : null;
+  const scope = JSON.stringify([environmentId, bot.botId, sessionId]);
+  const entry = usePaModelCatalog(key);
+  const catalog = entry.catalog;
+  const [action, setAction] = useState<PickerAction>({
+    scope,
+    saving: null,
+    confirm: null,
+    error: null,
+  });
+  const visibleAction =
+    action.scope === scope ? action : { scope, saving: null, confirm: null, error: null };
+  const currentScope = useStableCallback(() => scope);
+  const mountedRef = useRef(false);
+  const inFlightRef = useRef(false);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- a selection can finish after its composer unmounts
+  useLayoutEffect(() => {
+    mountedRef.current = true;
     return () => {
-      preloadRequestRef.current += 1;
+      mountedRef.current = false;
     };
-  }, [bot.botId, sessionId, preloadKey]);
+  }, []);
+  const [showDetected, setShowDetected] = useState(false);
+  const [customProvider, setCustomProvider] = useState<string | null>(null);
+  const [customModel, setCustomModel] = useState("");
 
-  const catalog = cached?.botId === bot.botId ? cached.catalog : null;
-  const label = applied && applied.base === bot.model ? applied.model : bot.model || bot.agentRef;
-  const currentProvider = catalog?.current?.provider ?? bot.provider;
-  const currentModel =
-    applied && applied.base === bot.model ? applied.model : (catalog?.current?.model ?? bot.model);
-  const serverEffort = liveReasoningEffort ?? catalog?.current?.reasoningEffort ?? null;
-  const currentEffort =
-    appliedEffort && appliedEffort.base === serverEffort ? appliedEffort.effort : serverEffort;
-  const reasoningLevels = getSelectableReasoningLevels(catalog, currentProvider, currentModel);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- reconciles the cached catalog with the roster and settings revision
+  useEffect(() => {
+    if (!environmentId) return;
+    const target = { environmentId, botId: bot.botId, sessionId };
+    const entry = paModelCatalogs.read(target);
+    const cached = entry.catalog?.current;
+    const drifted =
+      modelScope !== "session" &&
+      entry.catalog?.scope !== "session" &&
+      entry.catalog !== null &&
+      ((bot.model !== null && cached?.model !== bot.model) ||
+        (bot.provider !== null && cached?.provider !== bot.provider));
+    void paModelCatalogs.load(target, {
+      revision: refreshVersion,
+      force: drifted,
+    });
+  }, [environmentId, bot.botId, bot.model, bot.provider, modelScope, sessionId, refreshVersion]);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- opening revalidates changes made on another device without hiding cached options
+  useEffect(() => {
+    if (!open || !environmentId) return;
+    const target = { environmentId, botId: bot.botId, sessionId };
+    if (!paModelCatalogs.read(target).loading) void paModelCatalogs.refresh(target, refreshVersion);
+  }, [open, environmentId, bot.botId, sessionId, refreshVersion]);
 
-  return (
-    <div className="flex min-w-0 items-center gap-0.5">
-      <Popover open={open} onOpenChange={(next) => onOpenChange(next)}>
-        <PopoverTrigger
-          render={
-            <Button
-              type="button"
-              size="xs"
-              variant="ghost-muted"
-              className="min-w-0 max-w-36 shrink sm:max-w-52"
-              aria-label={gt("Switch model: {model}", { model: label })}
-            >
-              <span className="min-w-0 truncate">{label}</span>
-              <ChevronDownIcon className="size-3 opacity-70" />
-            </Button>
-          }
-        />
-        <PopoverPopup
-          side="top"
-          align="end"
-          padding="compact"
-          className="w-72 max-w-[calc(100vw-1.5rem)]"
-        >
-          <PaModelPickerContent
-            bot={bot}
-            sessionId={sessionId}
-            cached={catalog}
-            query={query}
-            onQueryChange={onQueryChange}
-            onLoaded={(nextCatalog) => setCached({ botId: bot.botId, catalog: nextCatalog })}
-            onApplied={(current) => {
-              setApplied({ base: bot.model, model: current.model });
-              onModelChanged();
-              setLocalRefreshTick((prev) => prev + 1);
-              onOpenChange(false);
+  const selection = resolvePaModelSelection({
+    catalog,
+    bot,
+    scope: modelScope,
+    sessionModel,
+    liveReasoningEffort,
+    resolve: messages,
+  });
+  const reasoning = selection.reasoning;
+  const label = selection.displayLabel ?? bot.agentRef;
+  const glyph = reasoning ? resolveEffortGlyph(reasoning, reasoning.currentValue ?? null) : null;
+  const word = glyph
+    ? (glyph.special ?? (effortDisplay === "label" ? glyph.label : null))
+    : selection.reasoningLabel;
+
+  const needle = query.trim();
+  const groups = filterPaModelProviders(catalog?.providers ?? [], needle);
+  const primary = groups.filter((group) => group.tier === "primary");
+  const detected = groups.filter((group) => group.tier === "detected");
+  const shownGroups = needle || showDetected ? groups : primary;
+  const customProviderId = customProvider ?? selection.provider;
+  const saving = visibleAction.saving;
+  const canApply =
+    key !== null &&
+    catalog !== null &&
+    (sessionId !== null || (modelScope !== "session" && catalog.scope !== "session"));
+
+  const focusSearch = () => searchInputRef.current?.focus();
+  const focusEffort = () => {
+    const column = popupRef.current?.querySelector("[data-model-picker-effort]");
+    const row =
+      column?.querySelector<HTMLElement>(
+        '[data-effort-level][aria-checked="true"]:not(:disabled)',
+      ) ?? column?.querySelector<HTMLElement>("[data-effort-row]:not(:disabled)");
+    row?.focus({ preventScroll: true });
+    row?.scrollIntoView({ block: "nearest" });
+  };
+
+  const apply = async (change: ModelChange, confirmed = false) => {
+    if (inFlightRef.current || !canApply || !key) return;
+    inFlightRef.current = true;
+    const started = scope;
+    const target = key;
+    setAction({ scope: started, saving: changeKey(change), confirm: null, error: null });
+    const result = await paApi
+      .selectBotModel(target.environmentId, {
+        botId: target.botId,
+        ...(target.sessionId ? { sessionId: target.sessionId } : {}),
+        ...change,
+        ...(confirmed ? { confirm: true } : {}),
+      })
+      .catch((cause: unknown) => {
+        if (!mountedRef.current || currentScope() !== started) return null;
+        const fallback =
+          change.reasoningEffort !== undefined
+            ? gt("Could not change reasoning effort")
+            : gt("Could not switch model");
+        setAction((prev) =>
+          prev.scope === started
+            ? { ...prev, saving: null, error: paErrorMessage(cause, fallback) }
+            : prev,
+        );
+        return null;
+      });
+    inFlightRef.current = false;
+    if (!result) return;
+    if (result.status === "applied") {
+      paModelCatalogs.applyCurrent(target, result.current);
+      if (change.reasoningEffort === undefined) {
+        if (result.current.provider !== catalog?.current?.provider) {
+          void paModelCatalogs.refresh(target, refreshVersion);
+        }
+        onModelChanged(result.current.model, target.sessionId);
+      }
+    }
+    if (!mountedRef.current || currentScope() !== started) return;
+    if (result.status === "confirmRequired") {
+      setAction((prev) =>
+        prev.scope === started
+          ? { ...prev, saving: null, confirm: { change, message: result.message } }
+          : prev,
+      );
+      return;
+    }
+    setAction((prev) => (prev.scope === started ? { ...prev, saving: null } : prev));
+    if (change.reasoningEffort !== undefined) {
+      onReasoningChanged?.(result.current.reasoningEffort ?? change.reasoningEffort);
+      return;
+    }
+    setCustomModel("");
+    // The column renders the new model's levels on commit.
+    window.requestAnimationFrame(focusEffort);
+  };
+
+  const renderGroup = (group: PaModelProvider) => (
+    <div key={group.id} role="radiogroup" aria-label={group.label} className="pb-1">
+      <div className={GROUP_LABEL}>
+        <span className="min-w-0 truncate">{group.label}</span>
+        {group.id === selection.provider ? (
+          <span className="shrink-0 text-muted-foreground/70">
+            <T>Current</T>
+          </span>
+        ) : group.badge === "custom" ? (
+          <span className="shrink-0 text-muted-foreground/70">
+            <T>Custom</T>
+          </span>
+        ) : group.badge === "detected" ? (
+          <span className="shrink-0 text-muted-foreground/70">
+            <T>Auto-detect</T>
+          </span>
+        ) : null}
+      </div>
+      {group.models.map((model) => {
+        const rowKey = changeKey({ provider: group.id, model: model.id });
+        const selected =
+          model.id === selection.model &&
+          (selection.provider === null || group.id === selection.provider);
+        const name = model.label ?? formatPaModelLabel(model.id);
+        return (
+          <button
+            key={rowKey}
+            type="button"
+            role="radio"
+            aria-checked={selected}
+            data-pa-model-row
+            disabled={!canApply || saving !== null}
+            onClick={() => {
+              if (selected) focusEffort();
+              else void apply({ provider: group.id, model: model.id });
             }}
-          />
-        </PopoverPopup>
-      </Popover>
+            className={MODEL_ROW}
+          >
+            <span className="min-w-0 flex-1 truncate">{name}</span>
+            {saving === rowKey ? (
+              <Loader2Icon aria-hidden="true" className="size-3.5 shrink-0 animate-spin" />
+            ) : selected ? (
+              <CheckIcon aria-hidden="true" className="size-3.5 shrink-0" />
+            ) : null}
+          </button>
+        );
+      })}
+    </div>
+  );
 
-      {reasoningLevels.length > 0 ? (
-        <PaReasoningPicker
-          botId={bot.botId}
-          sessionId={sessionId}
-          levels={reasoningLevels}
-          currentEffort={currentEffort}
-          onApplied={(effort) => {
-            setAppliedEffort({ base: serverEffort, effort });
-            onReasoningChanged?.(effort);
-            setCached((prev) =>
-              prev && prev.botId === bot.botId && prev.catalog.current
-                ? {
-                    botId: prev.botId,
-                    catalog: {
-                      ...prev.catalog,
-                      current: { ...prev.catalog.current, reasoningEffort: effort },
-                    },
-                  }
-                : prev,
-            );
+  const loadError = entry.error ? paErrorMessage(entry.error, gt("Could not load models")) : null;
+  const notice = visibleAction.confirm ? (
+    <div className="mx-2 mt-2 space-y-2 rounded-lg border border-warning/40 bg-warning/8 p-2.5 text-xs">
+      <p className="whitespace-pre-wrap break-words text-foreground">
+        {visibleAction.confirm.message}
+      </p>
+      <div className="flex justify-end gap-1.5">
+        <Button
+          type="button"
+          size="xs"
+          variant="outline"
+          onClick={() => setAction((prev) => ({ ...prev, confirm: null }))}
+        >
+          <T>Cancel</T>
+        </Button>
+        <Button
+          type="button"
+          size="xs"
+          disabled={!canApply || saving !== null}
+          onClick={() => {
+            const pending = visibleAction.confirm;
+            if (pending) void apply(pending.change, true);
           }}
-        />
+        >
+          <T>Confirm switch</T>
+        </Button>
+      </div>
+    </div>
+  ) : visibleAction.error || loadError ? (
+    <div className="mx-2 mt-2 flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/8 px-2.5 py-2 text-xs break-words text-destructive">
+      <span className="min-w-0 flex-1">{visibleAction.error ?? loadError}</span>
+      {!visibleAction.error && key ? (
+        <Button
+          type="button"
+          size="xs"
+          variant="outline"
+          onClick={() => void paModelCatalogs.refresh(key, refreshVersion)}
+        >
+          <T>Retry</T>
+        </Button>
       ) : null}
     </div>
+  ) : null;
+
+  return (
+    <Popover open={open} onOpenChange={(next) => onOpenChange(next)}>
+      <PopoverTrigger
+        render={
+          <ComposerControl
+            size="sm"
+            aria-label={[gt("Switch model: {model}", { model: label }), selection.reasoningLabel]
+              .filter(Boolean)
+              .join(", ")}
+            className="group/model-trigger min-w-0 max-w-48 shrink justify-between whitespace-nowrap data-popup-open:bg-accent data-popup-open:text-foreground sm:max-w-64"
+          />
+        }
+      >
+        <span className="flex min-w-0 flex-1 items-center gap-1.5">
+          <span data-chat-provider-model-picker-label="true" className="min-w-0 flex-1 truncate">
+            {label}
+          </span>
+          {reasoning ? <EffortTriggerSuffix word={word} glyph={glyph} size="sm" /> : null}
+        </span>
+      </PopoverTrigger>
+      <PopoverPopup
+        ref={popupRef}
+        initialFocus={isCoarsePointer ? popupRef : searchInputRef}
+        side="top"
+        align="end"
+        collisionAvoidance={{ side: "shift", align: "shift" }}
+        padding="none"
+        className="max-w-[calc(100vw-1.5rem)] before:hidden"
+        touchBackdrop
+      >
+        <div className="flex max-h-(--available-height) flex-col">
+          <div className="flex h-86.5 min-h-0 max-sm:h-auto max-sm:flex-col">
+            <div className="flex min-h-0 min-w-0 flex-1 flex-col sm:w-72 max-sm:h-72">
+              <div className="flex shrink-0 items-center gap-1 px-3 pt-2.5">
+                <label className="relative min-w-0 flex-1 cursor-text border-b border-border/70 pb-1.5 transition-colors focus-within:border-ring">
+                  <SearchIcon
+                    aria-hidden="true"
+                    className="pointer-events-none absolute top-1.5 left-0 size-4 text-muted-foreground/55"
+                  />
+                  <input
+                    ref={searchInputRef}
+                    type="search"
+                    aria-label={gt("Search models or providers")}
+                    placeholder={gt("Search models or providers")}
+                    value={query}
+                    onChange={(event) => onQueryChange(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.nativeEvent.isComposing || event.keyCode === 229) return;
+                      if (event.key === "ArrowDown") {
+                        event.preventDefault();
+                        popupRef.current
+                          ?.querySelector<HTMLElement>("[data-pa-model-row]:not(:disabled)")
+                          ?.focus();
+                        return;
+                      }
+                      if (
+                        event.key === "ArrowRight" &&
+                        !event.altKey &&
+                        !event.ctrlKey &&
+                        !event.metaKey &&
+                        !event.shiftKey &&
+                        event.currentTarget.selectionStart === query.length
+                      ) {
+                        event.preventDefault();
+                        focusEffort();
+                        return;
+                      }
+                      if (event.key === "Enter" && needle) {
+                        event.preventDefault();
+                        const matches = shownGroups.flatMap((group) =>
+                          group.models.map((model) => ({ provider: group.id, model })),
+                        );
+                        const exact = matches.filter(({ model }) =>
+                          [model.id, model.label ?? formatPaModelLabel(model.id)].some(
+                            (name) => name.toLowerCase() === needle.toLowerCase(),
+                          ),
+                        );
+                        const match =
+                          exact.length === 1 ? exact[0] : matches.length === 1 ? matches[0] : null;
+                        if (!match) return;
+                        if (
+                          match.model.id === selection.model &&
+                          (!selection.provider || match.provider === selection.provider)
+                        )
+                          focusEffort();
+                        else void apply({ provider: match.provider, model: match.model.id });
+                      }
+                    }}
+                    className="h-6.5 w-full min-w-0 bg-transparent ps-5 text-sm leading-6.5 outline-none placeholder:text-placeholder [&::-webkit-search-cancel-button]:appearance-none pointer-coarse:text-(length:--font-size-input-touch)"
+                  />
+                </label>
+                <Button
+                  type="button"
+                  size="icon-xs"
+                  variant="ghost"
+                  aria-label={gt("Refresh models")}
+                  disabled={!key || entry.loading}
+                  onClick={() => {
+                    if (key) void paModelCatalogs.refresh(key, refreshVersion);
+                  }}
+                >
+                  <RefreshCwIcon className="size-3.5" />
+                </Button>
+              </div>
+              {notice}
+              <div
+                data-model-picker-content
+                className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-2 pt-1.5 pb-1.5"
+                onKeyDown={(event) => {
+                  if (event.key === "ArrowRight" && !event.altKey && !event.metaKey) {
+                    event.preventDefault();
+                    focusEffort();
+                    return;
+                  }
+                  moveBetweenModelRows(event, focusSearch);
+                }}
+              >
+                {!catalog && entry.loading ? (
+                  <div className="flex items-center justify-center gap-2 py-6 text-xs text-muted-foreground">
+                    <Loader2Icon className="size-3.5 animate-spin" />
+                    <T>Loading models…</T>
+                  </div>
+                ) : null}
+                {catalog && groups.length === 0 ? (
+                  <div className="py-6 text-center text-xs text-muted-foreground">
+                    {needle ? <T>No matching models</T> : <T>No models available</T>}
+                  </div>
+                ) : null}
+                {shownGroups.map(renderGroup)}
+                {!needle && detected.length > 0 ? (
+                  <button
+                    type="button"
+                    aria-expanded={showDetected}
+                    onClick={() => setShowDetected((prev) => !prev)}
+                    className="mt-1 flex h-8 w-full min-w-0 items-center gap-1.5 rounded-sm border-t border-border/50 px-2 text-left text-xs text-muted-foreground outline-none hover:bg-foreground/[0.09] hover:text-foreground focus-visible:bg-foreground/[0.09]"
+                  >
+                    {showDetected ? (
+                      <ChevronDownIcon aria-hidden="true" className="size-3 shrink-0" />
+                    ) : (
+                      <ChevronRightIcon aria-hidden="true" className="size-3 shrink-0" />
+                    )}
+                    <span className="min-w-0 flex-1 truncate">
+                      {gt("Other detected providers ({names} · {count})", {
+                        names: detected.map((group) => group.label).join(" / "),
+                        count: detected.reduce((sum, group) => sum + group.models.length, 0),
+                      })}
+                    </span>
+                  </button>
+                ) : null}
+              </div>
+              {catalog?.allowCustom ? (
+                <form
+                  className="flex shrink-0 flex-col gap-1.5 border-t border-border/70 px-3 py-2"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    const model = customModel.trim();
+                    if (!model || !customProviderId) return;
+                    void apply({ provider: customProviderId, model });
+                  }}
+                >
+                  <span className="text-xs text-muted-foreground">
+                    <T>Custom model</T>
+                  </span>
+                  <PaNativeSelect
+                    aria-label={gt("Provider")}
+                    value={customProviderId ?? ""}
+                    onChange={(event) => setCustomProvider(event.target.value || null)}
+                  >
+                    <option value="" disabled>
+                      {gt("Choose a provider")}
+                    </option>
+                    {catalog.providers.map((provider) => (
+                      <option key={provider.id} value={provider.id}>
+                        {provider.label}
+                      </option>
+                    ))}
+                  </PaNativeSelect>
+                  <div className="flex items-center gap-1.5">
+                    <input
+                      aria-label={gt("Custom model")}
+                      placeholder={gt("Enter a model name")}
+                      value={customModel}
+                      onChange={(event) => setCustomModel(event.target.value)}
+                      autoCapitalize="none"
+                      autoCorrect="off"
+                      spellCheck={false}
+                      className="h-8 min-w-0 flex-1 rounded-md border border-input bg-background px-2 font-mono text-xs outline-none focus-visible:border-ring pointer-coarse:text-(length:--font-size-input-touch)"
+                    />
+                    <Button
+                      type="submit"
+                      size="xs"
+                      disabled={
+                        !canApply || !customModel.trim() || !customProviderId || saving !== null
+                      }
+                    >
+                      <T>Use</T>
+                    </Button>
+                  </div>
+                </form>
+              ) : null}
+            </div>
+            <div
+              data-model-picker-effort
+              className="flex min-h-0 w-48 flex-col border-l border-border/70 bg-muted/40 sm:shrink-0 max-sm:h-64 max-sm:w-full max-sm:border-t max-sm:border-l-0"
+              onKeyDown={(event) => {
+                if (event.key !== "ArrowLeft" || event.altKey || event.ctrlKey || event.metaKey)
+                  return;
+                event.preventDefault();
+                event.stopPropagation();
+                focusSearch();
+              }}
+            >
+              <EffortColumnFrame
+                heading={
+                  reasoning?.label ??
+                  gt("Effort", { $context: "heading for reasoning effort levels" })
+                }
+                modelLabel={label}
+              >
+                {reasoning ? (
+                  <div
+                    role="radiogroup"
+                    aria-label={reasoning.label}
+                    className="flex flex-col gap-0.5"
+                  >
+                    {reasoning.options.map((option, index) => {
+                      const selected = option.id === reasoning.currentValue;
+                      const rowKey = changeKey({ reasoningEffort: option.id });
+                      return (
+                        <EffortColumnRow
+                          key={option.id}
+                          label={option.label}
+                          selected={selected}
+                          tabStop={reasoning.currentValue ? selected : index === 0}
+                          disabled={!canApply || saving !== null}
+                          busy={saving === rowKey}
+                          onPick={() => {
+                            if (!selected) void apply({ reasoningEffort: option.id });
+                          }}
+                        />
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <NoEffortRow />
+                )}
+              </EffortColumnFrame>
+            </div>
+          </div>
+        </div>
+      </PopoverPopup>
+    </Popover>
   );
 }

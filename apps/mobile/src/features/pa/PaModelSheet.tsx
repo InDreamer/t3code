@@ -1,17 +1,17 @@
 import { useAtomValue } from "@effect/atom-react";
-import { useNavigation, type StaticScreenProps } from "@react-navigation/native";
+import type { StaticScreenProps } from "@react-navigation/native";
 import {
-  formatPaReasoningLabel,
-  getSelectableReasoningLevels,
-} from "@t3tools/client-runtime/pa/reasoning";
+  filterPaModelProviders,
+  formatPaModelLabel,
+  resolvePaModelSelection,
+} from "@t3tools/client-runtime/pa/models";
 import {
   EnvironmentId,
-  type PaModelCatalog,
-  type PaSelectBotModelInput,
   type PaModelProvider,
+  type PaSelectBotModelInput,
 } from "@t3tools/contracts";
 import { T, useGT, useMessages } from "gt-react-native";
-import { useEffect, useEffectEvent, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Pressable, View } from "react-native";
 
 import { AppActivityIndicator } from "../../components/ui/AppActivityIndicator";
@@ -27,23 +27,11 @@ import { paClient, paErrorMessage, paSelectModelPermissionAtom } from "./paApi";
 import type { PaBotParams } from "./paBotParams";
 import { patchPaBot, usePaBot } from "./paRosterStore";
 import { usePaBotChat } from "./usePaBotChat";
+import { paModelCatalogs, usePaModelCatalog } from "./usePaModelCatalog";
 
 type ModelSelection = Pick<PaSelectBotModelInput, "provider" | "model" | "reasoningEffort">;
 
 type PaModelParams = PaBotParams & { readonly query?: string };
-
-function filterProvider(option: PaModelProvider, needle: string): PaModelProvider {
-  if (!needle) return option;
-  return {
-    ...option,
-    models: option.models.filter(
-      (model) =>
-        model.id.toLowerCase().includes(needle) ||
-        option.label.toLowerCase().includes(needle) ||
-        option.id.toLowerCase().includes(needle),
-    ),
-  };
-}
 
 /** Switches the Bot's (or the session's) model and reasoning effort. */
 export function PaModelSheet({ route }: StaticScreenProps<PaModelParams>) {
@@ -66,87 +54,72 @@ function PaModelPicker({
 }: { readonly params: PaModelParams } & ReturnType<typeof usePaBotChat>) {
   const gt = useGT();
   const messages = useMessages();
-  const navigation = useNavigation();
   const { environmentId, botId } = params;
   const { bot, capabilities } = usePaBot(environmentId, botId);
   const sessionId = state.activeSessionId ?? params.sessionId ?? null;
   const canSelect = useAtomValue(paSelectModelPermissionAtom(EnvironmentId.make(environmentId)));
+  const catalogKey = { environmentId, botId, sessionId };
+  const entry = usePaModelCatalog(catalogKey);
+  const catalog = entry.catalog;
   const [customProvider, setCustomProvider] = useState<string | null>(null);
   const [query, setQuery] = useState(params.query ?? "");
-  const [catalog, setCatalog] = useState<PaModelCatalog | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
   const [saving, setSaving] = useState<string | null>(null);
+  const inFlightRef = useRef(false);
   const [confirm, setConfirm] = useState<{
     readonly input: ModelSelection;
     readonly message: string;
   } | null>(null);
   const [showDetected, setShowDetected] = useState(false);
   const [custom, setCustom] = useState("");
-  const request = useRef(0);
-
-  const fetchCatalog = () => {
-    const id = ++request.current;
-    paClient(environmentId)
-      .getBotModels(botId, sessionId)
-      .then(
-        (next) => {
-          if (request.current !== id) return;
-          setCatalog(next);
-          setError(null);
-        },
-        (cause: unknown) => {
-          if (request.current === id) setError(paErrorMessage(cause, gt("Could not load models")));
-        },
-      )
-      .finally(() => {
-        if (request.current === id) setLoading(false);
-      });
-  };
-  const loadOnOpen = useEffectEvent(fetchCatalog);
-  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- reads the engine's live model catalog when the sheet opens
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- revalidates the composer's cached catalog when the sheet opens without duplicating an in-flight read
   useEffect(() => {
-    loadOnOpen();
-    return () => {
-      request.current += 1;
-    };
-  }, []);
+    const target = { environmentId, botId, sessionId };
+    void paModelCatalogs.load(target, {
+      revision: state.settingsVersion,
+      force: !paModelCatalogs.read(target).loading,
+    });
+  }, [environmentId, botId, sessionId, state.settingsVersion]);
   const retry = () => {
-    setLoading(true);
-    fetchCatalog();
+    setActionError(null);
+    void paModelCatalogs.refresh(catalogKey, state.settingsVersion);
   };
 
-  const currentProvider = catalog?.current?.provider ?? null;
-  const customProviderId = customProvider ?? currentProvider;
-  const currentModel =
-    catalog?.current?.model ??
-    (capabilities?.models.scope === "session"
-      ? state.sessions.find((s) => s.sessionId === sessionId)?.model
-      : null) ??
-    bot?.model ??
-    null;
   const reasoning = sessionId ? state.sessionReasoning[sessionId] : undefined;
-  const currentEffort =
-    (reasoning?.settingsVersion === state.settingsVersion ? reasoning.effort : null) ??
-    catalog?.current?.reasoningEffort ??
-    null;
-  const levels = getSelectableReasoningLevels(catalog, currentProvider, currentModel);
-  const needle = query.trim().toLowerCase();
-  const options = (catalog?.providers ?? []).filter((option) => option.models.length > 0);
+  const selection = resolvePaModelSelection({
+    catalog,
+    bot,
+    scope: capabilities?.models.scope,
+    sessionModel: state.sessions.find((s) => s.sessionId === sessionId)?.model,
+    liveReasoningEffort:
+      reasoning?.settingsVersion === state.settingsVersion ? reasoning.effort : null,
+    resolve: messages,
+  });
+  const currentProvider = selection.provider;
+  const currentModel = selection.model;
+  const customProviderId = customProvider ?? currentProvider;
+  const descriptor = selection.reasoning;
+  const loadError = entry.error ? paErrorMessage(entry.error, gt("Could not load models")) : null;
+  const error = actionError ?? loadError;
+  const options = filterPaModelProviders(catalog?.providers ?? [], query);
+  const needle = query.trim();
   const primary = options.filter((option) => option.tier === "primary");
   const detected = options.filter((option) => option.tier === "detected");
-  const groups = needle
-    ? options.map((option) => filterProvider(option, needle)).filter((o) => o.models.length > 0)
-    : [...primary, ...(showDetected ? detected : [])];
+  const groups = needle ? options : [...primary, ...(showDetected ? detected : [])];
 
   const canApply =
     canSelect && catalog !== null && (catalog.scope !== "session" || sessionId !== null);
+  // Hermes saves a model only with its provider.
+  const canUseCustom = custom.trim().length > 0 && customProviderId !== null;
+  // The sheet is keyed by session; a late result must not touch the next session's sheet.
+  const isStale = () => chat.getState().activeSessionId !== state.activeSessionId;
   const apply = async (input: ModelSelection, confirmed = false) => {
-    if (saving || !canApply || !catalog) return;
-    const generation = request.current;
+    if (inFlightRef.current || !canApply || !catalog) return;
+    inFlightRef.current = true;
+    const target = { environmentId, botId, sessionId };
     const key = input.reasoningEffort ?? `${input.provider ?? ""}/${input.model ?? ""}`;
     setSaving(key);
-    setError(null);
+    setActionError(null);
     const result = await paClient(environmentId)
       .selectBotModel({
         botId,
@@ -155,23 +128,23 @@ function PaModelPicker({
         ...(confirmed ? { confirm: true } : {}),
       })
       .catch((cause: unknown) => {
-        if (
-          generation !== request.current ||
-          chat.getState().activeSessionId !== state.activeSessionId
-        )
-          return null;
-        setError(
-          paErrorMessage(
-            cause,
-            input.reasoningEffort
-              ? gt("Could not change reasoning effort")
-              : gt("Could not switch model"),
-          ),
-        );
+        if (!isStale()) {
+          setActionError(
+            paErrorMessage(
+              cause,
+              input.reasoningEffort
+                ? gt("Could not change reasoning effort")
+                : gt("Could not switch model"),
+            ),
+          );
+        }
         return null;
       });
+    inFlightRef.current = false;
     if (result?.status === "applied") {
+      paModelCatalogs.applyCurrent(target, result.current);
       if (input.reasoningEffort) {
+        if (catalog.scope !== "session") chat.bumpSettings();
         chat.setReasoning(sessionId, result.current.reasoningEffort ?? input.reasoningEffort);
       } else {
         if (catalog.scope === "session" && sessionId) {
@@ -185,8 +158,7 @@ function PaModelPicker({
         chat.bumpSettings();
       }
     }
-    if (generation !== request.current || chat.getState().activeSessionId !== state.activeSessionId)
-      return;
+    if (isStale()) return;
     setSaving(null);
     if (!result) return;
     if (result.status === "confirmRequired") {
@@ -194,15 +166,14 @@ function PaModelPicker({
       return;
     }
     setConfirm(null);
-    setCatalog({ ...catalog, current: { ...catalog.current, ...result.current } });
-    if (!input.reasoningEffort && navigation.isFocused()) navigation.goBack();
+    if (!input.reasoningEffort) setCustom("");
   };
 
   const renderGroup = (option: PaModelProvider) => (
     <View key={option.id} className="gap-1 pb-3">
       <View className="flex-row items-center justify-between px-1">
         <Text className="text-xs font-t3-medium text-foreground-muted">{option.label}</Text>
-        {option.badge === "current" ? (
+        {option.id === currentProvider ? (
           <Text className="text-2xs text-foreground-tertiary">
             <T>Current</T>
           </Text>
@@ -215,16 +186,20 @@ function PaModelPicker({
       {option.models.map((model, index) => {
         const selected =
           model.id === currentModel && (currentProvider === null || option.id === currentProvider);
+        const title = model.label ?? formatPaModelLabel(model.id);
         return (
           <SelectionRow
             key={model.id}
-            title={model.id}
+            title={title}
+            {...(title === model.id ? {} : { subtitle: model.id })}
             role="radio"
             selected={selected}
             disabled={!canApply || saving !== null}
             isFirst={index === 0}
             isLast={index === option.models.length - 1}
-            onPress={() => void apply({ provider: option.id, model: model.id })}
+            onPress={() => {
+              if (!selected) void apply({ provider: option.id, model: model.id });
+            }}
           />
         );
       })}
@@ -248,27 +223,34 @@ function PaModelPicker({
           keyboardDismissMode="on-drag"
           contentContainerStyle={{ paddingHorizontal: 16, paddingTop: 16, paddingBottom, gap: 12 }}
         >
-          {levels.length > 0 ? (
+          {descriptor ? (
             <View className="gap-1.5">
               <Text className="px-1 text-xs font-t3-medium text-foreground-muted">
-                <T>Reasoning effort</T>
+                {descriptor.label}
               </Text>
-              <View className="flex-row flex-wrap gap-1.5">
-                {levels.map((level) => {
-                  const selected = level.id.toLowerCase() === (currentEffort ?? "").toLowerCase();
+              <View
+                accessibilityRole="radiogroup"
+                accessibilityLabel={descriptor.label}
+                className="flex-row flex-wrap gap-1.5"
+              >
+                {descriptor.options.map((level) => {
+                  const selected = level.id === descriptor.currentValue;
                   return (
                     <Pressable
                       key={level.id}
                       accessibilityRole="radio"
+                      accessibilityLabel={level.label}
                       accessibilityState={{
                         checked: selected,
                         disabled: !canApply || saving !== null,
+                        busy: saving === level.id,
                       }}
                       disabled={!canApply || saving !== null || selected}
                       onPress={() => void apply({ reasoningEffort: level.id })}
                       className={cn(
                         "rounded-full border px-3 py-1.5 active:opacity-70",
                         selected ? "border-primary bg-subtle" : "border-border-subtle",
+                        saving === level.id && "opacity-60",
                       )}
                     >
                       <Text
@@ -277,7 +259,7 @@ function PaModelPicker({
                           selected ? "font-t3-medium text-foreground" : "text-foreground-muted",
                         )}
                       >
-                        {formatPaReasoningLabel(level.id, level.label, messages)}
+                        {level.label}
                       </Text>
                     </Pressable>
                   );
@@ -314,7 +296,7 @@ function PaModelPicker({
               <Button size="compact" tone="text" label={gt("Retry")} onPress={retry} />
             </View>
           ) : null}
-          {!catalog && loading ? <AppActivityIndicator className="my-8" /> : null}
+          {!catalog && entry.loading ? <AppActivityIndicator className="my-8" /> : null}
           {catalog && groups.length === 0 && (needle || detected.length === 0) ? (
             <Text className="py-6 text-center text-sm text-foreground-muted">
               {needle ? <T>No matching models</T> : <T>No models available</T>}
@@ -378,13 +360,11 @@ function PaModelPicker({
                 <Button
                   size="compact"
                   label={gt("Use")}
-                  disabled={!canApply || !custom.trim() || saving !== null}
-                  onPress={() =>
-                    void apply({
-                      ...(customProviderId ? { provider: customProviderId } : {}),
-                      model: custom.trim(),
-                    })
-                  }
+                  disabled={!canApply || !canUseCustom || saving !== null}
+                  onPress={() => {
+                    if (customProviderId)
+                      void apply({ provider: customProviderId, model: custom.trim() });
+                  }}
                 />
               </View>
             </View>

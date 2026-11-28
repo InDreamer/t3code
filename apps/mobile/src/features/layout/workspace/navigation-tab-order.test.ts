@@ -53,7 +53,7 @@ describe("navigation tab order", () => {
   it("fills missing sections and drops removed placeholders, duplicates, and Settings", () => {
     expect(
       resolveNavigationTabOrder(["usage", "home", "inbox", "settings", "usage", null]),
-    ).toEqual(["usage", "threads", "pullRequests", "issues", "bots"]);
+    ).toEqual(["usage", "threads", "bots", "pullRequests", "issues"]);
     expect(resolveNavigationTabOrder()).toEqual(NAVIGATION_TAB_ORDER);
   });
 
@@ -81,9 +81,9 @@ describe("navigation tab order", () => {
     const absent = ["issues"];
     expect(visibleNavigationTabs(undefined, absent)).toEqual([
       "threads",
+      "bots",
       "pullRequests",
       "usage",
-      "bots",
     ]);
     expect(overflowNavigationTabs(undefined, absent)).toEqual([]);
     expect(selectedNavigationTab(undefined, "threads", true)).toBe("settings");
@@ -96,9 +96,9 @@ describe("navigation tab order", () => {
     const hidden = toggleNavigationTabVisibility([], "usage");
     expect(enabledNavigationTabs(order, hidden)).toEqual([
       "threads",
+      "bots",
       "pullRequests",
       "issues",
-      "bots",
     ]);
     expect(toggleNavigationTabVisibility(hidden, "usage")).toEqual([]);
     expect(visibleNavigationTabs(order, [], 5)).toEqual(order);
@@ -108,7 +108,7 @@ describe("navigation tab order", () => {
   });
 
   it("falls back when the selected section is hidden, including when all are hidden", () => {
-    expect(resolveSelectedNavigationTab(undefined, ["threads"], "threads")).toBe("pullRequests");
+    expect(resolveSelectedNavigationTab(undefined, ["threads"], "threads")).toBe("bots");
     expect(resolveSelectedNavigationTab(undefined, ["threads"], "usage")).toBe("usage");
     expect(
       resolveSelectedNavigationTab(undefined, NAVIGATION_TAB_ORDER, "threads"),

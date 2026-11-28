@@ -1,6 +1,7 @@
 import { useAtomValue } from "@effect/atom-react";
 import { useIsFocused, useNavigation, type StaticScreenProps } from "@react-navigation/native";
 import { selectPaQuickCommands } from "@t3tools/client-runtime/pa/chat";
+import { resolvePaModelSelection } from "@t3tools/client-runtime/pa/models";
 import {
   summarizePaLiveActivity,
   formatPaSessionSource,
@@ -10,6 +11,7 @@ import { T, useGT, useMessages } from "gt-react-native";
 import { use, useEffect, useRef, useState } from "react";
 import { Platform, Pressable, View, type ScrollViewInstance } from "react-native";
 import { useKeyboardState, KeyboardStickyView } from "react-native-keyboard-controller";
+import { useSharedValue } from "react-native-reanimated";
 
 import { useComposerBottomInset } from "../../components/ComposerSurface";
 import { AppActivityIndicator } from "../../components/ui/AppActivityIndicator";
@@ -30,6 +32,7 @@ import { useAppActive } from "../../lib/appState";
 import { NativeWorkspaceTabActivityContext } from "../../native/v5-workspace-context";
 import { connectedEnvironmentIdsAtom } from "../../state/presentation";
 import { useAndroidWorkspaceBack } from "../layout/workspace/useAndroidWorkspaceNavigation";
+import { ComposerPopoverHost } from "../threads/ComposerPopoverHost";
 import { useMessageTimeFormatter } from "../threads/useMessageTimeFormatter";
 import { BotAvatar } from "./BotAvatar";
 import { paSelectModelPermissionAtom, paOperatePermissionAtom } from "./paApi";
@@ -47,6 +50,7 @@ import {
   PaWorkGroupRow,
 } from "./PaTimelineRows";
 import { usePaBotChat } from "./usePaBotChat";
+import { paModelCatalogs, usePaModelCatalog } from "./usePaModelCatalog";
 
 const NEAR_BOTTOM_PX = 96;
 
@@ -96,6 +100,8 @@ function PaBotRoute({
   );
   const [composerHeight, setComposerHeight] = useState(96);
   const [composerFocused, setComposerFocused] = useState(false);
+  // The Android portal measures its gesture area inside the sticky keyboard host.
+  const slashPopoverHeight = useSharedValue(0);
   const scrollRef = useRef<ScrollViewInstance>(null);
   const [nearBottom, setNearBottom] = useState(true);
   const following = useRef(true);
@@ -147,10 +153,54 @@ function PaBotRoute({
       : !bot.online
         ? gt("{engine} · Offline", { engine: bot.engineLabel })
         : (sessionLabel ?? bot.engineLabel);
-  const modelLabel =
-    ((capabilities?.models.scope === "session" ? activeSession?.model : null) ?? bot?.model ?? "")
-      .split("/")
-      .at(-1) || null;
+  const showsModel = canSelectModel && capabilities?.models.supported === true;
+  const catalogKey = showsModel
+    ? {
+        environmentId: params.environmentId,
+        botId: params.botId,
+        sessionId: state.activeSessionId,
+      }
+    : null;
+  const modelCatalog = usePaModelCatalog(catalogKey);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- reads the engine's catalog so the composer names the live model and effort before the sheet opens; the sheet reuses this read
+  useEffect(() => {
+    if (!showsModel) return;
+    const target = {
+      environmentId: params.environmentId,
+      botId: params.botId,
+      sessionId: state.activeSessionId,
+    };
+    const catalog = paModelCatalogs.read(target).catalog;
+    const cached = catalog?.current;
+    const drifted =
+      capabilities?.models.scope !== "session" &&
+      catalog?.scope !== "session" &&
+      catalog !== null &&
+      ((bot?.model != null && cached?.model !== bot.model) ||
+        (bot?.provider != null && cached?.provider !== bot.provider));
+    void paModelCatalogs.load(target, { revision: state.settingsVersion, force: drifted });
+  }, [
+    showsModel,
+    capabilities?.models.scope,
+    bot?.model,
+    bot?.provider,
+    params.environmentId,
+    params.botId,
+    state.activeSessionId,
+    state.settingsVersion,
+  ]);
+  const liveReasoning = state.activeSessionId
+    ? state.sessionReasoning[state.activeSessionId]
+    : undefined;
+  const modelSelection = resolvePaModelSelection({
+    catalog: modelCatalog.catalog,
+    bot,
+    scope: capabilities?.models.scope,
+    sessionModel: activeSession?.model,
+    liveReasoningEffort:
+      liveReasoning?.settingsVersion === state.settingsVersion ? liveReasoning.effort : null,
+    resolve: messages,
+  });
   const quickCommands = selectPaQuickCommands(
     capabilities?.commands.supported === false
       ? []
@@ -374,58 +424,62 @@ function PaBotRoute({
             style={{ position: "absolute", bottom: 0, left: 0, right: 0, top: 0 }}
             offset={{ closed: 0, opened: composerBottomInset }}
           >
-            <View
-              pointerEvents="box-none"
-              style={{
-                position: "absolute",
-                bottom: controlInsets.bottom,
-                left: controlInsets.left,
-                right: controlInsets.right,
-              }}
-            >
-              {!nearBottom && (
-                <View className="items-center">
-                  <Button
-                    size="compact"
-                    tone="secondary"
-                    icon="arrow.down"
-                    label={
-                      summarizePaLiveActivity(view.liveTurn, messages) ?? gt("Scroll to bottom")
-                    }
-                    onPress={() => followEnd(true)}
-                  />
-                </View>
-              )}
-              <PaComposer
-                environmentId={params.environmentId}
-                bot={bot}
-                capabilities={capabilities}
-                chat={chat}
-                sending={state.sending}
-                slashCommands={state.slashCommands}
-                respondingIds={state.respondingIds}
-                clarifyAnswers={state.clarifyAnswers}
-                queueBusyIds={state.queueBusyIds}
-                view={{
-                  sessionId: view.sessionId,
-                  liveTurn: view.liveTurn,
-                  running: view.running,
-                  draft: view.draft,
+            <ComposerPopoverHost hidden={!visible} popoverHeight={slashPopoverHeight}>
+              <View
+                pointerEvents="box-none"
+                style={{
+                  position: "absolute",
+                  bottom: controlInsets.bottom,
+                  left: controlInsets.left,
+                  right: controlInsets.right,
                 }}
-                canSelectModel={canSelectModel}
-                onSend={() => followEnd(false)}
-                canOperate={canOperate}
-                modelLabel={modelLabel}
-                bottomInset={composerBottomInset}
-                contentMaxWidth={contentMaxWidth}
-                onOpenModel={() => navigation.navigate("PaModel", sheetParams)}
-                onHeightChange={setComposerHeight}
-                onFocusChange={(focused) => {
-                  setComposerFocused(focused);
-                  if (focused && following.current) scrollToEnd(true);
-                }}
-              />
-            </View>
+              >
+                {!nearBottom && (
+                  <View className="items-center">
+                    <Button
+                      size="compact"
+                      tone="secondary"
+                      icon="arrow.down"
+                      label={
+                        summarizePaLiveActivity(view.liveTurn, messages) ?? gt("Scroll to bottom")
+                      }
+                      onPress={() => followEnd(true)}
+                    />
+                  </View>
+                )}
+                <PaComposer
+                  environmentId={params.environmentId}
+                  bot={bot}
+                  capabilities={capabilities}
+                  chat={chat}
+                  sending={state.sending}
+                  slashCommands={state.slashCommands}
+                  respondingIds={state.respondingIds}
+                  clarifyAnswers={state.clarifyAnswers}
+                  queueBusyIds={state.queueBusyIds}
+                  view={{
+                    sessionId: view.sessionId,
+                    liveTurn: view.liveTurn,
+                    running: view.running,
+                    draft: view.draft,
+                  }}
+                  canSelectModel={canSelectModel}
+                  onSend={() => followEnd(false)}
+                  canOperate={canOperate}
+                  modelLabel={modelSelection.displayLabel}
+                  reasoningLabel={modelSelection.reasoningLabel}
+                  bottomInset={composerBottomInset}
+                  contentMaxWidth={contentMaxWidth}
+                  onOpenModel={() => navigation.navigate("PaModel", sheetParams)}
+                  onHeightChange={setComposerHeight}
+                  hidden={!visible}
+                  onFocusChange={(focused) => {
+                    setComposerFocused(focused);
+                    if (focused && following.current) scrollToEnd(true);
+                  }}
+                />
+              </View>
+            </ComposerPopoverHost>
           </KeyboardStickyView>
         ) : null}
       </ScreenContent>

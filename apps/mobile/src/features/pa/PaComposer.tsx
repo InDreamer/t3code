@@ -1,10 +1,10 @@
+import { useAtomValue } from "@effect/atom-react";
 import { resolvePaComposerSendMode } from "@t3tools/client-runtime/pa/composer";
+import { voiceInputBlocksSubmission } from "@t3tools/client-runtime/voice-input";
 import {
-  countPaSlashTabs,
   isCompletePaSlashCommand,
   parsePaClientSlashAction,
-  selectPaSlashCommands,
-  type PaSlashTab,
+  rankPaSlashCommands,
 } from "@t3tools/client-runtime/pa/slash";
 import {
   AuthProvidersManageScope,
@@ -14,7 +14,7 @@ import {
   type PaSlashCommand,
 } from "@t3tools/contracts";
 import { useGT } from "gt-react-native";
-import { useRef, useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import { Platform, Pressable, ScrollView, View } from "react-native";
 import Animated from "react-native-reanimated";
 
@@ -32,97 +32,38 @@ import {
   useComposerChrome,
   useComposerTextStyle,
 } from "../../components/ComposerSurface";
-import { ComposerActionButton } from "../../components/ComposerToolbar";
+import {
+  ComposerActionButton,
+  ComposerInlineControl,
+  ComposerToolbarRow,
+} from "../../components/ComposerToolbar";
 import { SymbolView } from "../../components/ui/AppSymbol";
 import { AppText as Text } from "../../components/ui/AppText";
 import { FilePreviewModal, type FilePreviewSource } from "../../components/ui/FilePreviewModal";
-import { cn } from "../../lib/cn";
 import { useMountedRef } from "../../lib/useMountedRef";
 import { useEnvironmentScope } from "../../state/session";
 import { useComposerTextRole } from "../settings/appearance/useScaledTextRole";
 import { ComposerAttachmentButton } from "../threads/ComposerAttachmentButton";
+import { ComposerPopoverAnchor } from "../threads/ComposerPopoverAnchor";
+import {
+  ComposerDictationCancelAction,
+  ComposerDictationDraftContent,
+  ComposerDictationError,
+  ComposerDictationPrimaryAction,
+  ComposerDictationStartAction,
+  ComposerDictationStatus,
+  ComposerDictationToolbar,
+} from "../voice-input/ComposerDictationControl";
+import { useVoiceInputController } from "../voice-input/useVoiceInputController";
+import { voiceInputAtom } from "../voice-input/VoiceInputProvider";
+import { resolveVoiceComposerPresentation } from "../voice-input/voiceInputPresentation";
 import { paBotChatView, type PaBotChat, type PaBotChatState } from "./paBotChat";
 import { PaPendingRequestCard, PaSecretRequestCard, PaSecretRequestDenied } from "./PaRequestCards";
 import { PaContextUsageStrip, PaQueueStrip, PaTodoProgress } from "./PaSessionStatus";
+import { PaSlashCommandPopover } from "./PaSlashCommandPopover";
 import { usePaAttachments } from "./usePaAttachments";
 
 const EDITOR_LEADING_INSET = 14;
-
-function SlashMenu(props: {
-  readonly commands: ReadonlyArray<PaSlashCommand>;
-  readonly query: string;
-  readonly onPick: (command: PaSlashCommand) => void;
-}) {
-  const gt = useGT();
-  const [tab, setTab] = useState<PaSlashTab>("common");
-  const counts = countPaSlashTabs(props.commands);
-  const effectiveTab: PaSlashTab = tab === "skills" && counts.skills === 0 ? "common" : tab;
-  const matching = selectPaSlashCommands(props.commands, props.query, effectiveTab);
-  if (matching.length === 0 && props.query !== "") return null;
-  const tabs: ReadonlyArray<{ readonly id: PaSlashTab; readonly label: string }> = [
-    { id: "common", label: gt("Favorites") },
-    { id: "commands", label: gt("All commands ({count})", { count: counts.commands }) },
-    ...(counts.skills > 0
-      ? [{ id: "skills" as const, label: gt("Skills ({count})", { count: counts.skills }) }]
-      : []),
-  ];
-  return (
-    <View className="overflow-hidden rounded-2xl border border-border-subtle bg-card">
-      {props.query === "" ? (
-        <ScrollView
-          horizontal
-          showsHorizontalScrollIndicator={false}
-          keyboardShouldPersistTaps="always"
-          className="border-b border-border-subtle"
-          contentContainerStyle={{ gap: 4, padding: 6 }}
-        >
-          {tabs.map((item) => (
-            <Pressable
-              key={item.id}
-              accessibilityRole="tab"
-              accessibilityState={{ selected: effectiveTab === item.id }}
-              onPress={() => setTab(item.id)}
-              className={cn(
-                "rounded-lg px-2.5 py-1.5",
-                effectiveTab === item.id ? "bg-subtle-strong" : "active:bg-subtle",
-              )}
-            >
-              <Text
-                className={cn(
-                  "text-xs font-t3-medium",
-                  effectiveTab === item.id ? "text-foreground" : "text-foreground-muted",
-                )}
-              >
-                {item.label}
-              </Text>
-            </Pressable>
-          ))}
-        </ScrollView>
-      ) : null}
-      <ScrollView style={{ maxHeight: 220 }} keyboardShouldPersistTaps="always">
-        {matching.map((command) => (
-          <Pressable
-            key={command.name}
-            accessibilityRole="button"
-            accessibilityLabel={`${command.name}, ${command.description}`}
-            onPress={() => props.onPick(command)}
-            className="flex-row items-center gap-3 px-3 py-2.5 active:bg-subtle"
-          >
-            <Text className="shrink-0 font-mono text-sm text-foreground">{command.name}</Text>
-            {command.group === "skill" || command.group === "plugin" ? (
-              <Text className="shrink-0 rounded bg-subtle-strong px-1.5 text-2xs text-foreground-muted">
-                {command.group === "skill" ? gt("Skill") : gt("Plugin")}
-              </Text>
-            ) : null}
-            <Text className="min-w-0 flex-1 text-xs text-foreground-muted" numberOfLines={1}>
-              {command.description}
-            </Text>
-          </Pressable>
-        ))}
-      </ScrollView>
-    </View>
-  );
-}
 
 /**
  * The Bot page's foot: the session's status, open requests and errors above a composer that
@@ -146,11 +87,14 @@ export function PaComposer(props: {
   readonly onSend: () => void;
   readonly canOperate: boolean;
   readonly modelLabel: string | null;
+  readonly reasoningLabel: string | null;
   readonly bottomInset: number;
   readonly contentMaxWidth?: number;
   readonly onOpenModel: () => void;
   readonly onHeightChange: (height: number) => void;
   readonly onFocusChange: (focused: boolean) => void;
+  /** True while the page stays mounted out of sight, so it does not claim the microphone. */
+  readonly hidden: boolean;
 }) {
   const gt = useGT();
   const { chat, view, capabilities } = props;
@@ -160,7 +104,6 @@ export function PaComposer(props: {
   const [preview, setPreview] = useState<FilePreviewSource | null>(null);
   const [selection, setSelection] = useState<ComposerEditorSelection>({ start: 0, end: 0 });
   const [focused, setFocused] = useState(false);
-  const [slashDismissed, setSlashDismissed] = useState(false);
   const bodyText = useComposerTextRole();
   const textStyle = useComposerTextStyle(bodyText);
   const chrome = useComposerChrome();
@@ -173,15 +116,69 @@ export function PaComposer(props: {
   );
   const disabled = view.sessionId === null || !props.canOperate;
   const busy = props.sending || uploads.uploading;
+  // A recording belongs to the session it started in, even after the page shows another one.
+  const voiceSessionId = view.sessionId;
+  const ownerKey = voiceSessionId
+    ? JSON.stringify(["pa", props.environmentId, props.bot.botId, voiceSessionId])
+    : null;
+  const { session: recording } = useAtomValue(voiceInputAtom);
+  const startableOwner = disabled || busy || props.hidden ? null : ownerKey;
+  const startableOwnerRef = useRef(startableOwner);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- native input may finish flushing after the owner or its permission changes
+  useLayoutEffect(() => {
+    startableOwnerRef.current = startableOwner;
+  }, [startableOwner]);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- the global recorder outlives a hidden or unmounted Bot chat that owns its draft
+  useLayoutEffect(() => {
+    if (props.hidden && voiceInputBlocksSubmission(recording.controller.currentState)) {
+      recording.cancel(ownerKey);
+    }
+    return () => {
+      if (voiceInputBlocksSubmission(recording.controller.currentState)) recording.cancel(ownerKey);
+    };
+  }, [recording, ownerKey, props.hidden]);
+  const voiceInput = useVoiceInputController({
+    ownerKey,
+    label: props.bot.name,
+    readDraftMessage: () =>
+      voiceSessionId === null || chat.isDisposed() ? null : chat.getDraftFor(voiceSessionId),
+    selection,
+    disabled: disabled || busy || props.hidden,
+    hidden: props.hidden,
+    onChangeDraftMessage: (text) => {
+      if (voiceSessionId !== null) chat.setDraftForSession(voiceSessionId, text);
+    },
+    onChangeSelection: setSelection,
+  });
+  const startDictation = async () => {
+    await editorRef.current?.flushPendingInput();
+    if (
+      !mounted.current ||
+      ownerKey !== startableOwnerRef.current ||
+      !voiceSessionId ||
+      chat.isDisposed() ||
+      chat.getState().activeSessionId !== voiceSessionId
+    )
+      return;
+    voiceInput.start();
+  };
+  const voicePresentation = resolveVoiceComposerPresentation(
+    voiceInput.state,
+    voiceInput.elapsedSeconds,
+  );
+  const isVoiceInputPresented = voicePresentation.statusKind === "active";
+  const locked = voiceInput.blocksSubmission || voiceInput.freezesEditor;
   const hasAttachments = uploads.items.length > 0;
   const commands = capabilities?.commands.supported === false ? [] : props.slashCommands;
   const slashCommands = commands.filter(
     (command) => props.canSelectModel || command.handling !== "client:model-picker",
   );
   const slashQuery =
-    !hasAttachments && !slashDismissed && draft.startsWith("/") && !/\s/.test(draft)
+    focused && !hasAttachments && !locked && draft.startsWith("/") && !/\s/.test(draft)
       ? draft.slice(1)
       : null;
+  const matchingCommands =
+    slashQuery === null ? [] : rankPaSlashCommands(slashCommands, slashQuery);
   const clientAction = hasAttachments ? null : parsePaClientSlashAction(draft, commands);
   const isClientCommand = clientAction !== null;
   const liveTurn = view.liveTurn;
@@ -199,6 +196,7 @@ export function PaComposer(props: {
     sendMode !== "blocked" &&
     !disabled &&
     !busy &&
+    !locked &&
     hasDraft &&
     (props.canSelectModel || clientAction?.kind !== "model-picker");
   const canInterrupt = capabilities?.execution.interrupt !== false;
@@ -244,28 +242,39 @@ export function PaComposer(props: {
   };
   const send = (steer = false) => {
     if (!view.sessionId || !canSend || inFlight.current) return;
-    setSlashDismissed(false);
     inFlight.current = true;
     return sendToSession(view.sessionId, steer).finally(() => {
       inFlight.current = false;
     });
   };
-  const completeCommand = (command: PaSlashCommand) => {
-    chat.setDraft(`${command.name} `);
-    editorRef.current?.focus();
-  };
-  const toggleSlash = () => {
-    if (slashQuery !== null) {
-      setSlashDismissed(true);
-      if (draft === "/") chat.setDraft("");
+  const pickCommand = (command: PaSlashCommand) => {
+    // Opening the picker has no side effect, so it runs on pick; every other command only completes.
+    if (
+      command.handling === "client:model-picker" &&
+      props.canSelectModel &&
+      capabilities?.models.supported
+    ) {
+      chat.setDraft("");
+      props.onOpenModel();
       return;
     }
-    setSlashDismissed(false);
-    if (!draft.startsWith("/")) chat.setDraft(draft ? `/${draft}` : "/");
+    const completion = `${command.name} `;
+    chat.setDraft(completion);
+    setSelection({ start: completion.length, end: completion.length });
     editorRef.current?.focus();
   };
 
   const error = liveTurn.error ?? uploads.error;
+  const stopButton = (
+    <ComposerActionButton
+      size={chrome.controlSize}
+      accessibilityLabel={gt("Stop generating")}
+      icon="stop.fill"
+      variant={showStopOnly ? "danger" : undefined}
+      disabled={disabled}
+      onPress={() => void chat.interrupt()}
+    />
+  );
 
   return (
     <Animated.View
@@ -347,163 +356,229 @@ export function PaComposer(props: {
             </Pressable>
           </View>
         ) : null}
-        {slashQuery !== null && slashCommands.length > 0 ? (
-          <SlashMenu commands={slashCommands} query={slashQuery} onPick={completeCommand} />
-        ) : null}
-        <ComposerSurface
-          animateLayout={false}
-          style={{
-            borderRadius: chrome.borderRadius,
-            borderCurve: "circular",
-            overflow: "hidden",
-            paddingVertical: chrome.paddingVertical,
-          }}
-        >
-          {hasAttachments ? (
-            <View className="px-2 pt-2">
-              <ComposerAttachmentStrip
-                environmentId={EnvironmentId.make(props.environmentId)}
-                attachments={uploads.items}
-                removalDisabled={busy}
-                onRemove={(id) => {
-                  if (!inFlight.current) uploads.remove(id);
-                }}
-                onPressPreview={setPreview}
-                onPressDocument={(attachment) =>
-                  setPreview({
-                    kind: attachment.mimeType === "application/pdf" ? "pdf" : "document",
-                    attachment,
-                    name: attachment.name,
-                    mimeType: attachment.mimeType,
-                  })
-                }
-                imageSize={56}
-              />
-            </View>
+        <View>
+          {matchingCommands.length > 0 ? (
+            <ComposerPopoverAnchor>
+              <PaSlashCommandPopover commands={matchingCommands} onSelect={pickCommand} />
+            </ComposerPopoverAnchor>
           ) : null}
-          <View onLayout={compactEditor.onRowLayout} className="flex-row items-end">
-            {uploads.enabled ? (
-              <ComposerAttachmentButton
-                size={chrome.controlSize}
-                disabled={disabled || busy}
-                supportsImages={
-                  capabilities?.attachments?.images === true &&
-                  uploads.imageCount < (capabilities.attachments.maxImages ?? Infinity)
-                }
-                supportsFiles={capabilities?.attachments?.files === true}
-                onPickMedia={() => uploads.pick("media")}
-                onPickFiles={() => uploads.pick("files")}
-              />
-            ) : (
-              <View style={{ width: EDITOR_LEADING_INSET - 8 }} />
-            )}
-            <Animated.View
-              className="min-w-0 flex-1"
-              onLayout={compactEditor.onEditorLayout}
-              style={[
-                { minWidth: compactEditor.isExpanded ? 0 : INLINE_EDITOR_MIN_WIDTH },
-                compactEditor.containerStyle,
-                compactEditor.isExpanded ? { flex: 0, width: 0 } : undefined,
-              ]}
+          <ComposerSurface
+            animateLayout={false}
+            style={{
+              borderRadius: chrome.borderRadius,
+              borderCurve: "circular",
+              overflow: "hidden",
+              paddingVertical: chrome.paddingVertical,
+            }}
+          >
+            <ComposerDictationError
+              error={voiceInput.state.phase === "error" ? voiceInput.state.error : null}
+              onDismiss={voiceInput.cancel}
             />
-            <Animated.View style={compactEditor.editorStyle}>
-              <ComposerEditor
-                ref={editorRef}
-                multiline
-                value={draft}
-                readOnly={disabled || (busy && hasAttachments)}
-                selection={selection}
-                onChangeText={(text) => {
-                  chat.setDraft(text);
-                  setSlashDismissed(false);
-                }}
-                onSelectionChange={setSelection}
-                placeholder={gt("Message {name}", { name: props.bot.name })}
-                onFocus={() => {
-                  setFocused(true);
-                  props.onFocusChange(true);
-                }}
-                onBlur={() => {
-                  setFocused(false);
-                  props.onFocusChange(false);
-                }}
-                onSubmit={() => {
-                  const first =
-                    slashQuery !== null
-                      ? selectPaSlashCommands(slashCommands, slashQuery, "common")[0]
-                      : undefined;
-                  if (first && !isCompletePaSlashCommand(draft, slashCommands))
-                    completeCommand(first);
-                  else void send();
-                }}
-                submitTitle={sendMode === "queue" ? gt("Queue") : gt("Send")}
-                {...compactEditor.editorProps}
-                textStyle={textStyle}
-              />
-            </Animated.View>
-            <View
-              className="min-w-0 shrink flex-row items-center"
-              style={compactEditor.isExpanded ? { flex: 1, justifyContent: "flex-end" } : undefined}
-            >
-              {!hasAttachments && slashCommands.length > 0 ? (
-                <ComposerActionButton
-                  size={chrome.controlSize}
-                  accessibilityLabel={gt("Commands and skills")}
-                  icon="slash.circle"
-                  disabled={disabled}
-                  onPress={toggleSlash}
+            {hasAttachments ? (
+              <View className="px-2 pt-2">
+                <ComposerAttachmentStrip
+                  environmentId={EnvironmentId.make(props.environmentId)}
+                  attachments={uploads.items}
+                  removalDisabled={busy || locked}
+                  onRemove={(id) => {
+                    if (!inFlight.current && !locked) uploads.remove(id);
+                  }}
+                  onPressPreview={setPreview}
+                  onPressDocument={(attachment) =>
+                    setPreview({
+                      kind: attachment.mimeType === "application/pdf" ? "pdf" : "document",
+                      attachment,
+                      name: attachment.name,
+                      mimeType: attachment.mimeType,
+                    })
+                  }
+                  imageSize={56}
                 />
-              ) : null}
-              {props.canSelectModel && capabilities?.models.supported ? (
-                <Pressable
-                  accessibilityRole="button"
-                  accessibilityLabel={gt("Model and reasoning")}
-                  onPress={props.onOpenModel}
-                  className="h-[44px] max-w-[120px] flex-row items-center gap-1 px-1.5 active:opacity-70"
+              </View>
+            ) : null}
+            <View onLayout={compactEditor.onRowLayout}>
+              <ComposerDictationDraftContent
+                className="flex-row items-end"
+                compact
+                hidden={isVoiceInputPresented}
+              >
+                {uploads.enabled ? (
+                  <ComposerAttachmentButton
+                    size={chrome.controlSize}
+                    disabled={disabled || busy || locked}
+                    supportsImages={
+                      capabilities?.attachments?.images === true &&
+                      uploads.imageCount < (capabilities.attachments.maxImages ?? Infinity)
+                    }
+                    supportsFiles={capabilities?.attachments?.files === true}
+                    onPickMedia={() => uploads.pick("media")}
+                    onPickFiles={() => uploads.pick("files")}
+                  />
+                ) : (
+                  <View style={{ width: EDITOR_LEADING_INSET - 8 }} />
+                )}
+                <Animated.View
+                  className="min-w-0 flex-1"
+                  onLayout={compactEditor.onEditorLayout}
+                  style={[
+                    { minWidth: compactEditor.isExpanded ? 0 : INLINE_EDITOR_MIN_WIDTH },
+                    compactEditor.containerStyle,
+                    compactEditor.isExpanded ? { flex: 0, width: 0 } : undefined,
+                  ]}
+                />
+                {/* TalkBack orders siblings by position; outside this row the editor reads after Send. */}
+                <Animated.View
+                  style={[
+                    compactEditor.editorStyle,
+                    // iOS destroys a view under display: none; the editor would lose its focus and caret.
+                    Platform.OS === "android" && isVoiceInputPresented
+                      ? { display: "none" }
+                      : undefined,
+                  ]}
                 >
-                  <SymbolView name="brain" size={14} tintColorClassName="accent-icon-muted" />
-                  {props.modelLabel ? (
-                    <Text
-                      className="min-w-0 shrink text-xs text-foreground-muted"
-                      numberOfLines={1}
-                    >
-                      {props.modelLabel}
-                    </Text>
+                  <ComposerEditor
+                    ref={editorRef}
+                    multiline
+                    value={draft}
+                    readOnly={disabled || (busy && hasAttachments) || locked}
+                    selection={selection}
+                    onChangeText={(text) => {
+                      if (!locked && voiceSessionId !== null) {
+                        chat.setDraftForSession(voiceSessionId, text);
+                      }
+                    }}
+                    onSelectionChange={setSelection}
+                    placeholder={
+                      slashCommands.length > 0
+                        ? gt("Message {name}, or type / for commands…", { name: props.bot.name })
+                        : gt("Message {name}", { name: props.bot.name })
+                    }
+                    onFocus={() => {
+                      setFocused(true);
+                      props.onFocusChange(true);
+                    }}
+                    onBlur={() => {
+                      setFocused(false);
+                      props.onFocusChange(false);
+                    }}
+                    onSubmit={() => {
+                      const first = matchingCommands[0];
+                      if (first && !isCompletePaSlashCommand(draft, slashCommands))
+                        pickCommand(first);
+                      else void send();
+                    }}
+                    submitTitle={sendMode === "queue" ? gt("Queue") : gt("Send")}
+                    {...compactEditor.editorProps}
+                    textStyle={textStyle}
+                  />
+                </Animated.View>
+                <View
+                  className="min-w-0 shrink flex-row items-center"
+                  style={
+                    compactEditor.isExpanded ? { flex: 1, justifyContent: "flex-end" } : undefined
+                  }
+                >
+                  {props.canSelectModel && capabilities?.models.supported ? (
+                    <ComposerInlineControl
+                      accessibilityLabel={[
+                        gt("Model and reasoning"),
+                        props.modelLabel,
+                        props.reasoningLabel,
+                      ]
+                        .filter(Boolean)
+                        .join(", ")}
+                      icon="brain"
+                      label={props.modelLabel ?? gt("Choose model")}
+                      iconOnly={!compactEditor.isExpanded}
+                      suffix={
+                        props.reasoningLabel ? (
+                          <Text className="text-xs text-foreground-muted" numberOfLines={1}>
+                            {`· ${props.reasoningLabel}`}
+                          </Text>
+                        ) : undefined
+                      }
+                      maxWidth={200}
+                      onPress={props.onOpenModel}
+                    />
                   ) : null}
-                </Pressable>
-              ) : null}
-              {view.running && !isClientCommand && canInterrupt ? (
-                <ComposerActionButton
-                  size={chrome.controlSize}
-                  accessibilityLabel={gt("Stop generating")}
-                  icon="stop.fill"
-                  variant={showStopOnly ? "danger" : undefined}
-                  disabled={disabled}
-                  onPress={() => void chat.interrupt()}
-                />
-              ) : null}
-              {canSteer && hasDraft ? (
-                <ComposerActionButton
-                  size={chrome.controlSize}
-                  accessibilityLabel={gt("Steer the current turn")}
-                  icon="arrow.turn.left.up"
-                  disabled={!canSend}
-                  onPress={() => void send(true)}
-                />
-              ) : null}
-              {showStopOnly ? null : (
-                <ComposerActionButton
-                  size={chrome.controlSize}
-                  accessibilityLabel={sendMode === "queue" ? gt("Queue message") : gt("Send")}
-                  icon={sendMode === "queue" ? "tray.and.arrow.down" : "arrow.up"}
-                  variant="primary"
-                  disabled={!canSend}
-                  onPress={() => void send()}
-                />
-              )}
+                  <ComposerDictationStartAction
+                    size={chrome.controlSize}
+                    state={voiceInput.state}
+                    isAvailable={voiceInput.isAvailable}
+                    disabled={disabled || busy || locked}
+                    onStart={() => void startDictation()}
+                    onCancel={voiceInput.cancel}
+                  />
+                  {view.running && !isClientCommand && canInterrupt ? stopButton : null}
+                  {canSteer && hasDraft ? (
+                    <ComposerActionButton
+                      size={chrome.controlSize}
+                      accessibilityLabel={gt("Steer the current turn")}
+                      icon="arrow.turn.left.up"
+                      disabled={!canSend}
+                      onPress={() => void send(true)}
+                    />
+                  ) : null}
+                  {showStopOnly ? null : (
+                    <ComposerActionButton
+                      size={chrome.controlSize}
+                      accessibilityLabel={sendMode === "queue" ? gt("Queue message") : gt("Send")}
+                      icon={sendMode === "queue" ? "tray.and.arrow.down" : "arrow.up"}
+                      variant="primary"
+                      disabled={!canSend}
+                      onPress={() => void send()}
+                    />
+                  )}
+                </View>
+              </ComposerDictationDraftContent>
             </View>
-          </View>
-        </ComposerSurface>
+            <Animated.View
+              accessibilityElementsHidden={!isVoiceInputPresented}
+              collapsable={false}
+              importantForAccessibility={isVoiceInputPresented ? "auto" : "no-hide-descendants"}
+              pointerEvents={isVoiceInputPresented ? "auto" : "none"}
+              style={{ position: "absolute", bottom: chrome.paddingVertical, left: 0, right: 0 }}
+            >
+              <ComposerDictationToolbar
+                showsDictation={isVoiceInputPresented}
+                visible={isVoiceInputPresented}
+              >
+                <ComposerToolbarRow
+                  paddingBottom={0}
+                  paddingHorizontal={0}
+                  paddingTop={0}
+                  style={{ gap: 0 }}
+                >
+                  <ComposerDictationCancelAction
+                    size={chrome.controlSize}
+                    presentation={voicePresentation}
+                    onCancel={voiceInput.cancel}
+                  />
+                  <ComposerDictationStatus
+                    audioLevels={voiceInput.audioLevels}
+                    elapsedSeconds={voiceInput.elapsedSeconds}
+                    phase={voiceInput.state.phase}
+                    presentation={voicePresentation}
+                  />
+                  <View className="shrink-0 flex-row items-center">
+                    <ComposerDictationPrimaryAction
+                      size={chrome.controlSize}
+                      state={voiceInput.state}
+                      presentation={voicePresentation}
+                      isAvailable={voiceInput.isAvailable}
+                      disabled={disabled || busy}
+                      onStart={() => void startDictation()}
+                      onConfirm={voiceInput.stop}
+                      onCancel={voiceInput.cancel}
+                    />
+                    {view.running && !isClientCommand && canInterrupt ? stopButton : null}
+                  </View>
+                </ComposerToolbarRow>
+              </ComposerDictationToolbar>
+            </Animated.View>
+          </ComposerSurface>
+        </View>
       </View>
     </Animated.View>
   );

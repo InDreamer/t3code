@@ -6,6 +6,7 @@ import {
   EnvironmentId,
   PaError,
   type PaCapabilities,
+  type PaModelCatalog,
   type PaStreamEvent,
   type PaSteerSessionResult,
 } from "@t3tools/contracts";
@@ -14,17 +15,91 @@ import { act, render } from "../../../test/render";
 import { BotChatPane } from "./BotChatPane";
 import { attachmentEnvironment } from "../../state/attachments";
 import { SecretRequestField } from "../chat/SecretRequestField";
-import { paApi, paSendPermissionAtom } from "./paApi";
+import { paApi, paModelCatalogs, paSelectModelPermissionAtom, paSendPermissionAtom } from "./paApi";
 import { toastManager } from "../ui/toast";
+import type { useEnvironmentSpeechInput } from "../../speech/useEnvironmentSpeechInput";
+
+const voice = vi.hoisted(() => {
+  const listeners = new Set<() => void>();
+  const store = {
+    available: false,
+    phase: "idle" as "idle" | "recording",
+    input: null as Parameters<typeof useEnvironmentSpeechInput>[0] | null,
+    queued: null as ((text: string) => void) | null,
+    subscribe: (listener: () => void) => {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+    setPhase: (phase: "idle" | "recording") => {
+      store.phase = phase;
+      for (const listener of listeners) listener();
+    },
+  };
+  return store;
+});
 
 vi.mock(import("./paApi"), async (original) => {
   const allowed = Atom.make(true);
-  return { ...(await original()), paSendPermissionAtom: vi.fn(() => allowed) };
+  const api = await original();
+  return {
+    ...api,
+    paSendPermissionAtom: vi.fn(() => allowed),
+    paSelectModelPermissionAtom: vi.fn(api.paSelectModelPermissionAtom),
+  };
 });
 vi.mock(import("../../state/environments"), async (original) => ({
   ...(await original()),
   usePrimaryEnvironmentId: () => EnvironmentId.make("pa-browser"),
 }));
+
+// The recording itself is the speech hook's to test; here only the composer's side of it matters.
+vi.mock(import("../../speech/useEnvironmentSpeechInput"), async (original) => {
+  const { useSyncExternalStore } = await import("react");
+  return {
+    ...(await original()),
+    useEnvironmentSpeechInput: (input: Parameters<typeof useEnvironmentSpeechInput>[0]) => {
+      voice.input = input;
+      const phase = useSyncExternalStore(voice.subscribe, () => voice.phase);
+      const active = phase !== "idle";
+      return {
+        available: voice.available,
+        status: null,
+        transcriptionEnvironmentId: null,
+        transcriptionEnvironmentLabel: null,
+        setup: {
+          open: false,
+          step: 0,
+          model: null,
+          language: null,
+          downloading: false,
+          catalogFailed: false,
+          error: null,
+          setOpen: () => undefined,
+          retryCatalog: null,
+          download: async () => undefined,
+          cancelDownload: async () => undefined,
+          startRecording: async () => undefined,
+        },
+        state: { phase, error: null, errorAction: null },
+        preview: active ? { committed: "there", tentative: "" } : null,
+        level: 0,
+        recordingStartedAt: null,
+        preparing: false,
+        blocksSubmission: active,
+        freezesEditor: active,
+        start: async () => voice.setPhase("recording"),
+        submitAfterDictation: (submit: (text: string) => void) => {
+          voice.queued = submit;
+        },
+        stop: async () => undefined,
+        cancel: () => voice.setPhase("idle"),
+        skipPostProcessing: () => undefined,
+      };
+    },
+  };
+});
 
 vi.mock(import("../../state/session"), async (original) => ({
   ...(await original()),
@@ -360,6 +435,83 @@ it("keeps an operate-only user's model command in the composer", async () => {
   expect(flow.send).not.toHaveBeenCalled();
 });
 
+it("confirms the exact cross-provider search match in the composer's environment, not an IME Enter", async () => {
+  using spies = new DisposableStack();
+  const flow = setup(spies);
+  const allowed = Atom.make(true);
+  vi.mocked(paSelectModelPermissionAtom).mockReturnValue(allowed);
+  spies.defer(() => vi.mocked(paSelectModelPermissionAtom).mockReset());
+  spies.defer(() => paModelCatalogs.clear());
+  const catalog: PaModelCatalog = {
+    scope: "agent",
+    allowCustom: false,
+    current: { provider: "p1", model: "old" },
+    providers: [
+      {
+        id: "p1",
+        label: "First",
+        isCurrent: true,
+        badge: "current",
+        tier: "primary",
+        models: [{ id: "old" }, { id: "fast-preview" }],
+      },
+      { id: "p2", label: "Second", isCurrent: false, tier: "primary", models: [{ id: "fast" }] },
+    ],
+  };
+  const read = spies.use(vi.spyOn(paApi, "getBotModels")).mockResolvedValue(catalog);
+  const current = { provider: "p2", model: "fast" };
+  const write = spies
+    .use(vi.spyOn(paApi, "selectBotModel"))
+    .mockResolvedValueOnce({ status: "confirmRequired", message: "Confirm this model" })
+    .mockResolvedValueOnce({ status: "applied", current });
+  await using screen = await render(
+    flow.view("deep", {
+      ...capabilities,
+      models: { supported: true, scope: "agent", allowCustom: false },
+    }),
+  );
+  const refreshed = Promise.withResolvers<PaModelCatalog>();
+  read.mockReturnValueOnce(refreshed.promise);
+  await screen.getByRole("button", { name: "Switch model: old" }).click();
+  const search = page.getByRole("searchbox", { name: "Search models or providers" });
+  await search.fill("fast");
+  await expect.element(page.getByRole("radio", { name: "fast", exact: true })).toBeVisible();
+  expect(read).toHaveBeenCalledTimes(2);
+  await act(async () => {
+    refreshed.resolve(catalog);
+    await refreshed.promise;
+  });
+  await act(() => {
+    for (const composition of [{ isComposing: true }, { keyCode: 229 }]) {
+      search
+        .element()
+        .dispatchEvent(
+          new KeyboardEvent("keydown", { key: "Enter", bubbles: true, ...composition }),
+        );
+    }
+  });
+  expect(write).not.toHaveBeenCalled();
+  await userEvent.keyboard("{Enter}");
+  await expect.element(page.getByText("Confirm this model")).toBeVisible();
+  const change = { botId: bot.botId, sessionId: "deep", ...current };
+  expect(write).toHaveBeenCalledExactlyOnceWith(EnvironmentId.make("pa-browser"), change);
+  const switched = Promise.withResolvers<PaModelCatalog>();
+  read.mockReturnValueOnce(switched.promise);
+  await page.getByRole("button", { name: "Confirm switch" }).click();
+  await expect
+    .element(page.getByRole("radiogroup", { name: "Second" }).getByText("Current"))
+    .toBeVisible();
+  expect(write).toHaveBeenLastCalledWith(EnvironmentId.make("pa-browser"), {
+    ...change,
+    confirm: true,
+  });
+  expect(read).toHaveBeenCalledTimes(3);
+  await act(async () => {
+    switched.resolve({ ...catalog, current });
+    await switched.promise;
+  });
+});
+
 it("drops clarify answers after the request resolves or the session changes", async () => {
   using spies = new DisposableStack();
   const flow = setup(spies);
@@ -597,3 +749,107 @@ it.each(["empty", "duplicate", "stale", "prepend"] as const)(
     expect(scroll.mock.calls.length > 0).toBe(scenario !== "prepend");
   },
 );
+
+function enableVoice(spies: DisposableStack) {
+  voice.available = true;
+  spies.defer(() => {
+    voice.available = false;
+    voice.input = null;
+    voice.queued = null;
+    voice.phase = "idle";
+  });
+}
+
+/** What the speech session does when a recording ends: commit the transcript, then go idle. */
+function finishDictation(text: string, caret: number) {
+  voice.input?.commitDraft(text, { start: caret, end: caret });
+  voice.setPhase("idle");
+}
+
+it("dictates at the caret and freezes the draft while recording", async () => {
+  using spies = new DisposableStack();
+  const flow = setup(spies);
+  enableVoice(spies);
+  await using screen = await render(flow.view("deep"));
+  expect(voice.input?.offerSetup).toBe(true);
+  await screen.getByRole("textbox").fill("hello world");
+  const field = screen.container.querySelector("textarea");
+  if (!field) throw new Error("The composer has no textarea");
+  field.setSelectionRange(5, 5);
+  expect(voice.input?.ownerKey).toBe(JSON.stringify(["pa", "pa-browser", bot.botId, "deep"]));
+  expect(voice.input?.label).toBe(bot.name);
+  expect(voice.input?.offerSetup).toBe(false);
+  expect(voice.input?.persistentDraft).toBeUndefined();
+  expect(voice.input?.readDraft()).toEqual({
+    text: "hello world",
+    selection: { start: 5, end: 5 },
+  });
+
+  await screen.getByRole("button", { name: "Start voice input" }).click();
+  await expect.element(screen.getByRole("textbox")).toHaveAttribute("readonly");
+  await expect
+    .element(screen.getByRole("status", { name: "Live transcription" }))
+    .toHaveTextContent("there");
+
+  await act(() => finishDictation("hello there world", 11));
+  await expect.element(screen.getByRole("textbox")).toHaveValue("hello there world");
+  await expect.element(screen.getByRole("textbox")).not.toHaveAttribute("readonly");
+  await vi.waitFor(() => {
+    expect(document.activeElement).toBe(field);
+    expect([field.selectionStart, field.selectionEnd]).toEqual([11, 11]);
+  });
+  expect(flow.send).not.toHaveBeenCalled();
+});
+
+it("only fills the draft when dictation finishes, even with a command", async () => {
+  using spies = new DisposableStack();
+  const flow = setup(spies);
+  enableVoice(spies);
+  const interrupt = spies.use(vi.spyOn(paApi, "interruptSession")).mockResolvedValue(undefined);
+  spies.use(vi.spyOn(paApi, "listCommands")).mockResolvedValue([
+    {
+      name: "/stop",
+      description: "Stop",
+      group: "command",
+      featured: false,
+      handling: "client:interrupt",
+      requiredScope: "operate",
+    },
+  ]);
+  await using screen = await render(
+    flow.view("deep", { ...capabilities, commands: { supported: true } }),
+  );
+  await screen.getByRole("button", { name: "Start voice input" }).click();
+  await act(() => finishDictation("/stop", 5));
+  const draft = screen.getByRole("combobox");
+  await expect.element(draft).toHaveValue("/stop");
+  const activeId = draft.element().getAttribute("aria-activedescendant");
+  expect(document.getElementById(activeId ?? "")?.textContent).toContain("/stop");
+  expect(flow.send).not.toHaveBeenCalled();
+  expect(interrupt).not.toHaveBeenCalled();
+});
+
+it("sends the finished transcript when Send is pressed mid-recording", async () => {
+  using spies = new DisposableStack();
+  const flow = setup(spies);
+  enableVoice(spies);
+  await using screen = await render(flow.view("deep"));
+  await screen.getByRole("button", { name: "Start voice input" }).click();
+  await screen.getByRole("button", { name: "Send" }).click();
+  expect(voice.queued).not.toBeNull();
+  expect(flow.send).not.toHaveBeenCalled();
+
+  await act(() => {
+    finishDictation("plan the release", 16);
+    voice.queued?.("plan the release");
+  });
+  expect(flow.send).toHaveBeenCalledWith(
+    bot.botId,
+    "deep",
+    "plan the release",
+    expect.any(String),
+    true,
+    [],
+  );
+  await expect.element(screen.getByRole("textbox")).toHaveValue("");
+});

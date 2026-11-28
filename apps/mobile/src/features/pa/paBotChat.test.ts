@@ -232,6 +232,24 @@ describe("createPaBotChat", () => {
     expect(chat.getState().drafts).toEqual({ s1: "from A", s2: "from B" });
   });
 
+  it("lands dictation in the session it started in after the page shows another", async () => {
+    const { api: client } = fakeClient();
+    const chat = await startedChat(client);
+    chat.setDraft("typed in A");
+    chat.selectSession(session("s2"));
+    expect(chat.getState().activeSessionId).toBe("s2");
+
+    expect(chat.getDraftFor("s1")).toBe("typed in A");
+    chat.setDraftForSession("s1", "typed in A and spoken");
+    expect(chat.getDraftFor("s1")).toBe("typed in A and spoken");
+    expect(chat.getDraftFor("s2")).toBe("");
+    expect(paBotChatView(chat.getState()).draft).toBe("");
+
+    chat.dispose();
+    chat.setDraftForSession("s1", "after dispose");
+    expect(chat.getDraftFor("s1")).toBe("typed in A and spoken");
+  });
+
   it("retries startup and waits for visibility and permission before creating a session", async () => {
     const { api: client } = fakeClient({
       listSessions: vi

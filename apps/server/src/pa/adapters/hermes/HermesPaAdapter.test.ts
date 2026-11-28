@@ -345,6 +345,52 @@ describe("HermesPaAdapter profile routing", () => {
     expect(defaultConn.callsOf("profiles.configure")).toEqual([]);
   });
 
+  it("degrades missing catalog methods or reasoning keys but surfaces other RPC failures", async () => {
+    const defaultConn = new FakeHermesConnection("default");
+    const feedbotConn = new FakeHermesConnection("feedbot");
+    defaultConn.onMethod("profiles.describe", () => ({
+      name: "feedbot",
+      model: { default: "gpt-5.4", provider: "openai" },
+    }));
+    feedbotConn.onMethod("model.options", () => {
+      throw new HermesRpcError("provider_registry_unavailable", 5003);
+    });
+    const { adapter } = makeAdapter({ default: defaultConn, feedbot: feedbotConn });
+
+    // A broken gateway must not read as "no models available".
+    await expect(adapter.models.getCatalog("feedbot")).rejects.toMatchObject({
+      reason: "Upstream",
+    });
+
+    feedbotConn.onMethod("model.options", () => ({
+      providers: [{ slug: "openai", name: "OpenAI", is_current: true, models: ["gpt-5.4"] }],
+    }));
+    feedbotConn.onMethod("config.get", () => {
+      throw new HermesRpcError("unknown_key", -32602);
+    });
+    const legacy = await adapter.models.getCatalog("feedbot");
+    expect(legacy.current).toEqual({ provider: "openai", model: "gpt-5.4" });
+
+    feedbotConn.onMethod("model.options", () => {
+      throw new HermesRpcError("method_not_found", -32601);
+    });
+    expect((await adapter.models.getCatalog("feedbot")).providers).toEqual([]);
+    for (const method of ["config.get", "model.options"]) {
+      for (const error of [
+        new HermesRpcError("invalid_params", -32602),
+        new HermesRpcError("unsupported_transport", 5004),
+      ]) {
+        feedbotConn.onMethod(method, () => {
+          throw error;
+        });
+        await expect(adapter.models.getCatalog("feedbot")).rejects.toMatchObject({
+          message: error.message,
+        });
+      }
+      feedbotConn.onMethod(method, () => ({}));
+    }
+  });
+
   it("patches config sections as Hermes profile fields", async () => {
     const defaultConn = new FakeHermesConnection("default");
     const feedbotConn = new FakeHermesConnection("feedbot");

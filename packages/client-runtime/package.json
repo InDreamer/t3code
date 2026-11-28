@@ -419,6 +419,10 @@
       "types": "./src/pa/composer.ts",
       "default": "./src/pa/composer.ts"
     },
+    "./pa/models": {
+      "types": "./src/pa/models.ts",
+      "default": "./src/pa/models.ts"
+    },
     "./pa/presentation": {
       "types": "./src/pa/presentation.ts",
       "default": "./src/pa/presentation.ts"

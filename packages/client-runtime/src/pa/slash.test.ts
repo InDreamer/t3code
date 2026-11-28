@@ -2,11 +2,9 @@ import type { PaSlashCommand } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
-  countPaSlashTabs,
   isCompletePaSlashCommand,
   parsePaClientSlashAction,
   rankPaSlashCommands,
-  selectPaSlashCommands,
 } from "./slash.ts";
 
 const command = (
@@ -66,30 +64,30 @@ describe("PA slash commands", () => {
     expect(isCompletePaSlashCommand("/", catalog)).toBe(false);
   });
 
-  it("curates featured, all commands and skills on a bare /, and searches across all of them", () => {
-    expect(countPaSlashTabs(catalog)).toEqual({ common: 3, commands: 6, skills: 31 });
-    expect(selectPaSlashCommands(catalog, "", "common").map((c) => c.name)).toEqual([
-      "/new",
-      "/model",
-      "/status",
-    ]);
-    expect(selectPaSlashCommands(catalog, "", "commands").map((c) => c.name)).toEqual([
+  it("lists featured, commands, plugins, then skills on a bare / and searches them all", () => {
+    const names = rankPaSlashCommands(catalog, "").map((c) => c.name);
+    expect(names).toHaveLength(catalog.length);
+    expect(names.slice(0, 7)).toEqual([
       "/new",
       "/model",
       "/status",
       "/clear",
       "/stop",
       "/logs",
-    ]);
-    expect(selectPaSlashCommands(catalog, "", "skills")).toHaveLength(31);
-    expect(selectPaSlashCommands(catalog, "renew", "common").map((c) => c.name)).toEqual([
       "/renew-news",
     ]);
-    // Without featured commands the common tab falls back to the first commands.
     expect(
-      selectPaSlashCommands([command("/a", "a"), command("/b", "b")], "", "common").map(
-        (c) => c.name,
-      ),
-    ).toEqual(["/a", "/b"]);
+      rankPaSlashCommands(
+        [
+          command("/tidy", "Tidy up", { group: "skill" }),
+          command("/logs", "Tail logs", { group: "plugin" }),
+          command("/help", "Help"),
+          command("/digest", "Digest", { group: "skill", featured: true }),
+        ],
+        "/",
+      ).map((c) => c.name),
+    ).toEqual(["/digest", "/help", "/logs", "/tidy"]);
+    expect(rankPaSlashCommands(catalog, "renew").map((c) => c.name)).toEqual(["/renew-news"]);
+    expect(rankPaSlashCommands(catalog, "log").map((c) => c.group)).toEqual(["plugin"]);
   });
 });

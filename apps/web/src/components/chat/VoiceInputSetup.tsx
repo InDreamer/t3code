@@ -46,6 +46,8 @@ export function VoiceInputSetup(props: {
   onDownload(): void;
   onCancelDownload(): void;
   onStartRecording(): void;
+  /** False hides buttons that navigate away to Voice settings, for routes with unsaved drafts. */
+  allowSettingsNavigation?: boolean;
 }) {
   const gt = useGT();
   const locale = useLocale();
@@ -249,9 +251,11 @@ export function VoiceInputSetup(props: {
         {props.step === 0 ? (
           <WizardFooter
             leading={
-              <Button variant="ghost" onClick={() => openSettings("speech-models")}>
-                {model ? gt("Other models") : gt("Choose a model")}
-              </Button>
+              props.allowSettingsNavigation === false ? undefined : (
+                <Button variant="ghost" onClick={() => openSettings("speech-models")}>
+                  {model ? gt("Other models") : gt("Choose a model")}
+                </Button>
+              )
             }
           >
             {props.onRetryCatalog ? (
@@ -282,9 +286,11 @@ export function VoiceInputSetup(props: {
         ) : (
           <WizardFooter
             leading={
-              <Button variant="ghost" onClick={() => openSettings("")}>
-                <T>Voice settings</T>
-              </Button>
+              props.allowSettingsNavigation === false ? undefined : (
+                <Button variant="ghost" onClick={() => openSettings("")}>
+                  <T>Voice settings</T>
+                </Button>
+              )
             }
           >
             <Button onClick={props.onStartRecording}>

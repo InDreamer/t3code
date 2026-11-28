@@ -839,9 +839,17 @@ const layerEnvironmentOwnedDataCleanup = Layer.succeed(
   Persistence.EnvironmentOwnedDataCleanup,
   Persistence.EnvironmentOwnedDataCleanup.of({
     clear: Effect.fn("Persistence.EnvironmentOwnedDataCleanup.clear")(function (environmentId) {
-      return Effect.sync(() => {
-        clearComposerDraftsEnvironment(environmentId);
-      });
+      return Effect.all(
+        [
+          Effect.sync(() => clearComposerDraftsEnvironment(environmentId)),
+          Effect.promise(async () => {
+            // `paApi` depends on this connection runtime.
+            const { paModelCatalogs } = await import("../components/pa/paApi");
+            paModelCatalogs.clearEnvironment(environmentId);
+          }),
+        ],
+        { concurrency: "unbounded", discard: true },
+      );
     }),
   }),
 );

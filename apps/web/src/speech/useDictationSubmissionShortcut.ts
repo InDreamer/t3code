@@ -5,7 +5,7 @@ import { isCommandPaletteOpen } from "../commandPaletteBus";
 /** Keep submission shortcuts reachable when the frozen composer loses focus to the page. */
 export function useDictationSubmissionShortcut(input: {
   enabled: boolean;
-  formRef: RefObject<HTMLFormElement | null>;
+  formRef: RefObject<HTMLElement | null>;
   onKeyDown(event: KeyboardEvent): void;
 }) {
   const latest = useRef(input);

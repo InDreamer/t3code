@@ -826,9 +826,11 @@ export function BotChatPane({
       readonly attachments?: ReadonlyArray<PaAttachment>;
       /** A failed send puts the text back in the composer even though it came from elsewhere. */
       readonly restoreDraft?: boolean;
+      /** The draft as dictation just committed it, before this render's `draft` caught up. */
+      readonly draftText?: string | undefined;
     },
   ) => {
-    const text = (rawOverride ?? draft).trim();
+    const text = (rawOverride ?? options?.draftText ?? draft).trim();
     const sessionId = activeSessionId;
     const attachments = options?.attachments ?? [];
     if ((!text && !attachments.length) || !sessionId || sending || !canOperate) return false;
@@ -1342,7 +1344,9 @@ export function BotChatPane({
             bot={bot}
             capabilities={capabilities}
             sessionId={activeSessionId}
+            sessionModel={activeSession?.model ?? null}
             draft={draft}
+            hasPaneDraft={Object.values(drafts).some((text) => text.trim().length > 0)}
             onDraftChange={(value) => {
               if (!activeSessionId || value === draft) return;
               draftEdits.current.set(
@@ -1354,7 +1358,7 @@ export function BotChatPane({
             running={running}
             sending={sending}
             disabled={!activeSessionId || !canOperate}
-            slashCommands={slashCommands}
+            slashCommands={commands}
             openRequests={openRequests}
             respondingIds={respondingIds}
             canSelectModel={canSelectModel}
@@ -1362,7 +1366,9 @@ export function BotChatPane({
               void handleRespondRequest(req, decision, answers)
             }
             onRespondSecret={handleRespondSecret}
-            onSend={(options) => handleSend(undefined, options)}
+            onSend={({ textOverride, ...options }) =>
+              handleSend(undefined, { ...options, draftText: textOverride })
+            }
             onSteer={() => void handleSteer()}
             onInterrupt={() => void handleInterrupt()}
             statusSlot={
@@ -1397,10 +1403,15 @@ export function BotChatPane({
             }
             modelRefreshVersion={settingsVersion}
             onReasoningChanged={(effort) => {
-              if (!activeSessionId) return;
+              if (!activeSessionId || activeSessionIdRef.current !== activeSessionId) return;
               setSessionReasoning({ sessionId: activeSessionId, effort, settingsVersion });
             }}
-            onModelChanged={onActivity}
+            onModelChanged={(model, targetSessionId) => {
+              if (capabilities?.models.scope === "session" && targetSessionId) {
+                patchSession(targetSessionId, { model });
+              }
+              onActivity();
+            }}
           />
           <div
             aria-hidden

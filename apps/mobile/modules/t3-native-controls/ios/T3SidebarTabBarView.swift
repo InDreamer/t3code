@@ -44,7 +44,7 @@ final class T3SidebarTabBarView: ExpoView, UITabBarDelegate {
     didSet { composeButton.accessibilityLabel = composeAccessibilityLabel }
   }
 
-  var tabs = ["threads", "pullRequests", "issues", "usage", "bots", "settings"] {
+  var tabs = ["threads", "bots", "pullRequests", "usage", "settings"] {
     didSet { if tabs != oldValue { updateItems() } }
   }
   var selectedTab = "threads" { didSet { updateSelection() } }

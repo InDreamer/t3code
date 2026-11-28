@@ -1,24 +1,25 @@
 import { createPaPrimarySessionCreates, makePaRequestKey } from "@t3tools/client-runtime/pa/chat";
 import { createPaEnvironmentCommands } from "@t3tools/client-runtime/pa/environment";
+import { createPaModelCatalogCache } from "@t3tools/client-runtime/pa/models";
 import {
   runAtomCommand,
   squashAtomCommandFailure,
   type AtomCommand,
 } from "@t3tools/client-runtime/state/runtime";
-import type {
+import {
   EnvironmentId,
-  PaAttachment,
-  PaConfigSectionValue,
-  PaCreateBotInput,
-  PaGetMessagesInput,
-  PaListSessionsInput,
-  PaManageQueuedItemInput,
-  PaMutateScheduleInput,
-  PaRespondRequestInput,
-  PaSelectBotModelInput,
-  PaSessionSummary,
-  PaStreamEvent,
-  PaUpdateBotMetaInput,
+  type PaAttachment,
+  type PaConfigSectionValue,
+  type PaCreateBotInput,
+  type PaGetMessagesInput,
+  type PaListSessionsInput,
+  type PaManageQueuedItemInput,
+  type PaMutateScheduleInput,
+  type PaRespondRequestInput,
+  type PaSelectBotModelInput,
+  type PaSessionSummary,
+  type PaStreamEvent,
+  type PaUpdateBotMetaInput,
 } from "@t3tools/contracts";
 import { msg } from "gt-react";
 
@@ -85,9 +86,10 @@ export const paApi = {
   createBot: (input: PaCreateBotInput) => call(pa.createBot, input),
   updateBotMeta: (input: PaUpdateBotMetaInput) => call(pa.updateBotMeta, input),
   markRead: (botId: string) => call(pa.updateBotMeta, { botId, markRead: true }),
-  getBotModels: (botId: string, sessionId?: string) =>
-    call(pa.getBotModels, { botId, ...(sessionId ? { sessionId } : {}) }),
-  selectBotModel: (input: PaSelectBotModelInput) => call(pa.selectBotModel, input),
+  getBotModels: (environmentId: EnvironmentId, botId: string, sessionId?: string | null) =>
+    call(pa.getBotModels, { botId, ...(sessionId ? { sessionId } : {}) }, { environmentId }),
+  selectBotModel: (environmentId: EnvironmentId, input: PaSelectBotModelInput) =>
+    call(pa.selectBotModel, input, { environmentId }),
   getBotConfig: (botId: string) => call(pa.getBotConfig, { botId }),
   patchBotConfig: (botId: string, sectionId: string, value: PaConfigSectionValue) =>
     call(pa.patchBotConfig, { botId, sectionId, value }),
@@ -170,3 +172,8 @@ export const paApi = {
     };
   },
 };
+
+/** The composer's model trigger and its picker read one catalog per Bot and session. */
+export const paModelCatalogs = createPaModelCatalogCache((key) =>
+  paApi.getBotModels(EnvironmentId.make(key.environmentId), key.botId, key.sessionId),
+);

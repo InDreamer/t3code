@@ -1,10 +1,11 @@
 import type { PaModelCatalog } from "@t3tools/contracts";
 import { act, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
-import { expect, it, vi } from "vite-plus/test";
+import { afterEach, expect, it, vi } from "vite-plus/test";
 
 import type { PaClient } from "./paApi";
 import { PaModelSheet } from "./PaModelSheet";
+import { paModelCatalogs } from "./usePaModelCatalog";
 
 const ui = vi.hoisted(() => ({
   sessionId: null as string | null,
@@ -37,11 +38,30 @@ vi.mock("react-native", () => ({
 }));
 vi.mock("../../components/ui/AppActivityIndicator", () => ({ AppActivityIndicator: () => null }));
 vi.mock("../../components/ui/AppSymbol", () => ({ SymbolView: () => null }));
-vi.mock("../../components/ui/AppText", () => ({ AppText: "span", AppTextInput: "input" }));
+vi.mock("../../components/ui/AppText", () => ({
+  AppText: "span",
+  AppTextInput: ({
+    value,
+    onChangeText,
+  }: {
+    value: string;
+    onChangeText: (text: string) => void;
+  }) => <input value={value} onChange={(event) => onChangeText(event.target.value)} />,
+}));
 vi.mock("../../components/ui/Menu", () => ({ Menu: () => null }));
 vi.mock("../../components/ui/Button", () => ({
-  Button: ({ label, onPress }: { label: string; onPress: () => void }) => (
-    <button onClick={onPress}>{label}</button>
+  Button: ({
+    label,
+    onPress,
+    disabled,
+  }: {
+    label: string;
+    onPress: () => void;
+    disabled?: boolean;
+  }) => (
+    <button onClick={onPress} disabled={disabled}>
+      {label}
+    </button>
   ),
 }));
 vi.mock("../../components/ui/SelectionRow", () => ({
@@ -104,19 +124,23 @@ const catalog: PaModelCatalog = {
   reasoningLevels: [{ id: "high", label: "High" }],
 };
 
+afterEach(() => paModelCatalogs.clear());
+
 it.each(["model", "reasoning"])(
   "applies a late %s result to the session that requested it",
   async (kind) => {
     ui.sessionId = null;
+    ui.select.mockClear();
     ui.models.mockResolvedValue(catalog);
     ui.goBack.mockClear();
     vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
     const container = document.createElement("div");
     const root = createRoot(container);
     using _root = { [Symbol.dispose]: () => act(() => root.unmount()) };
+    const botId = "bot";
     const show = () =>
       act(async () =>
-        root.render(<PaModelSheet route={{ params: { environmentId: "env", botId: "bot" } }} />),
+        root.render(<PaModelSheet route={{ params: { environmentId: "env", botId } }} />),
       );
     const button = (name: string) =>
       [...container.querySelectorAll("button")].find((item) => item.textContent === name)!;
@@ -131,14 +155,18 @@ it.each(["model", "reasoning"])(
       ui.select.mockReturnValueOnce(receipt.promise);
       act(() => button("Confirm switch").click());
       expect(ui.select).toHaveBeenLastCalledWith({
-        botId: "bot",
+        botId,
         sessionId: "original",
         reasoningEffort: "high",
         confirm: true,
       });
     } else {
       ui.select.mockReturnValueOnce(receipt.promise);
-      act(() => button("another").click());
+      act(() => {
+        button("another").click();
+        button("another").click();
+      });
+      expect(ui.select).toHaveBeenCalledTimes(1);
     }
     ui.sessionId = "next";
     await show();
@@ -154,3 +182,31 @@ it.each(["model", "reasoning"])(
     expect(ui.goBack).not.toHaveBeenCalled();
   },
 );
+
+it("keeps a custom model unsubmittable until a provider is chosen", async () => {
+  ui.sessionId = "custom";
+  ui.models.mockResolvedValue({
+    ...catalog,
+    allowCustom: true,
+    current: { provider: null, model: "current" },
+  });
+  ui.select.mockClear();
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const container = document.createElement("div");
+  const root = createRoot(container);
+  using _root = { [Symbol.dispose]: () => act(() => root.unmount()) };
+  await act(async () =>
+    root.render(<PaModelSheet route={{ params: { environmentId: "env", botId: "bot-custom" } }} />),
+  );
+  const input = container.querySelector("input")!;
+  await act(async () => {
+    const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
+    setValue.call(input, "my-model");
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  expect(input.value).toBe("my-model");
+  const use = [...container.querySelectorAll("button")].find((item) => item.textContent === "Use")!;
+  expect(use.disabled).toBe(true);
+  await act(async () => use.click());
+  expect(ui.select).not.toHaveBeenCalled();
+});

@@ -67,10 +67,10 @@ describe("workspace root navigation", () => {
   it("keeps the registered defaults while customization is unavailable", () => {
     expect(resolveWorkspaceTabOrder(undefined)).toEqual([
       "threads",
+      "bots",
       "pullRequests",
       "issues",
       "usage",
-      "bots",
     ]);
     expect(resolveWorkspaceTabOrder(["home", "usage", "issues", "threads"])).toEqual(
       resolveWorkspaceTabOrder(undefined),

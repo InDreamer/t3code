@@ -135,7 +135,7 @@ class T3WorkspaceNavigationView(
   private val onTabSelected by EventDispatcher()
   private val onNewThread by EventDispatcher()
   private val onOverlayChange by EventDispatcher()
-  var tabs by mutableStateOf(listOf("threads", "pullRequests", "issues", "usage", "bots", "settings"))
+  var tabs by mutableStateOf(listOf("threads", "bots", "pullRequests", "usage", "settings"))
   var tabTitles by mutableStateOf(emptyMap<String, String>())
   var expandedTabTitles by mutableStateOf(emptyMap<String, String>())
   var newThreadTitle by mutableStateOf("New thread")

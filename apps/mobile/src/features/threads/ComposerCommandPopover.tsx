@@ -93,7 +93,10 @@ interface ComposerCommandPopoverProps {
   readonly onSelect: (item: ComposerCommandItem) => void;
 }
 
-function PopoverSurface(props: { readonly children: React.ReactNode; readonly style?: ViewStyle }) {
+export function PopoverSurface(props: {
+  readonly children: React.ReactNode;
+  readonly style?: ViewStyle;
+}) {
   const baseStyle: ViewStyle = {
     borderRadius: 16,
     overflow: "hidden",

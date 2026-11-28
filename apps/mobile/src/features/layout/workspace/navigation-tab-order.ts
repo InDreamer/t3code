@@ -1,6 +1,6 @@
 import { msg } from "gt-react-native";
 
-export const NAVIGATION_TAB_ORDER = ["threads", "pullRequests", "issues", "usage", "bots"] as const;
+export const NAVIGATION_TAB_ORDER = ["threads", "bots", "pullRequests", "issues", "usage"] as const;
 /** Built, but left out of the tab bar while workflows are a soft launch on web. */
 type UnlistedTab = "workflows";
 export type NavigationTab = (typeof NAVIGATION_TAB_ORDER)[number] | UnlistedTab;

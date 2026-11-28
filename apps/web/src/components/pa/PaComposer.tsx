@@ -7,15 +7,16 @@ import {
   Loader2Icon,
   ShieldAlertIcon,
   SquareIcon,
-  SquareSlashIcon,
   TerminalIcon,
   XIcon,
 } from "lucide-react";
-import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { useId, useLayoutEffect, useRef, useState, type ReactNode, type RefObject } from "react";
 
 import { useSoftwareKeyboardOpen } from "../../hooks/useSoftwareKeyboardOpen";
 import { cn } from "../../lib/utils";
 import { ComposerSurface } from "../chat/ComposerSurface";
+import { DeferredComposerCommandMenuLayer } from "../chat/ComposerCommandMenuLayer";
+import { composerSuggestionOptionId } from "../chat/ComposerCommandMenu";
 import {
   ComposerAttachInput,
   ComposerAttachButton,
@@ -23,6 +24,7 @@ import {
   ComposerAttachmentFileList,
   ComposerFilePreviewDialog,
 } from "../chat/ComposerAttachmentStrip";
+import { ComposerSpeechButton, ComposerSpeechRecordingPill } from "../chat/ComposerSpeechButton";
 import { ExpandedImageDialog } from "../chat/ExpandedImageDialog";
 import type { ExpandedImagePreview } from "../chat/ExpandedImagePreview";
 import { AuthProvidersManageScope } from "@t3tools/contracts";
@@ -34,16 +36,13 @@ import {
 import { useTheme } from "../../hooks/useTheme";
 import { usePaAttachments } from "./usePaAttachments";
 import { MessageCopyButton } from "../chat/MessageCopyButton";
-import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { CheckboxMark } from "../ui/checkbox";
 import { Input } from "../ui/input";
 import {
-  countPaSlashTabs,
   isCompletePaSlashCommand,
   parsePaClientSlashAction,
-  selectPaSlashCommands,
-  type PaSlashTab,
+  rankPaSlashCommands,
 } from "@t3tools/client-runtime/pa/slash";
 import type {
   EnvironmentId,
@@ -57,7 +56,11 @@ import type {
 import { PROVIDER_SEND_TURN_MAX_FILE_BYTES } from "@t3tools/contracts";
 import { resolvePaComposerSendMode } from "@t3tools/client-runtime/pa/composer";
 import { PaModelPicker } from "./PaModelPicker";
+import { PaSlashCommandMenu } from "./PaSlashCommandMenu";
 import { PaSecretRequestForm, type PaSecretAnswer } from "./PaSecretRequestForm";
+import { VoiceInputSetup } from "../chat/VoiceInputSetup";
+import { useDictationSubmissionShortcut } from "../../speech/useDictationSubmissionShortcut";
+import { SpeechTextField, type TextFieldSpeech } from "../../speech/useTextFieldSpeech";
 
 export type PaClarifyAnswers = Readonly<Record<string, PaClarifyAnswer>>;
 
@@ -223,11 +226,104 @@ function PaPendingRequestBanner({
   );
 }
 
-export function PaComposer({
+type PaComposerProps = {
+  readonly environmentId: EnvironmentId | null;
+  readonly bot: PaBotSummary;
+  readonly capabilities: PaCapabilities | null;
+  readonly sessionId: string | null;
+  readonly sessionModel: string | null;
+  readonly draft: string;
+  /** Any session in the pane holds unsent text that navigating away from Bots would discard. */
+  readonly hasPaneDraft?: boolean | undefined;
+  readonly onDraftChange: (value: string) => void;
+  readonly running: boolean;
+  readonly sending: boolean;
+  readonly disabled: boolean;
+  readonly slashCommands: ReadonlyArray<PaSlashCommand>;
+  readonly openRequests: ReadonlyArray<PaPendingRequest>;
+  readonly respondingIds: ReadonlySet<string>;
+  readonly canSelectModel: boolean;
+  readonly onRespondRequest: (
+    req: PaPendingRequest,
+    decision?: string,
+    answers?: PaClarifyAnswers,
+  ) => void;
+  /** Resolves `true` once the engine took the answer; typed values never leave the form until then. */
+  readonly onRespondSecret: (req: PaPendingRequest, answer: PaSecretAnswer) => Promise<boolean>;
+  /** `queued`: the draft waits behind the running turn. */
+  readonly onSend: (options: {
+    readonly queued: boolean;
+    readonly attachments: ReadonlyArray<PaAttachment>;
+    /** The draft as dictation just finished it, newer than the `draft` this render saw. */
+    readonly textOverride?: string | undefined;
+  }) => Promise<boolean | undefined>;
+  /** Hands the draft to the running turn. */
+  readonly onSteer: () => void;
+  readonly onInterrupt: () => void;
+  /** Session status (todos, queue) shown above the composer, in its lane. */
+  readonly statusSlot?: ReactNode;
+  readonly error: string | null;
+  readonly onDismissError: () => void;
+  readonly modelPickerOpen: boolean;
+  readonly onModelPickerOpenChange: (open: boolean) => void;
+  readonly modelQuery: string;
+  readonly onModelQueryChange: (value: string) => void;
+  readonly liveReasoningEffort?: string | null | undefined;
+  readonly modelRefreshVersion?: number | undefined;
+  readonly onReasoningChanged?: ((effort: string) => void) | undefined;
+  readonly onModelChanged: (model: string, sessionId: string | null) => void;
+};
+
+export function PaComposer(props: PaComposerProps) {
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const { environmentId, sessionId } = props;
+  const uploads = usePaAttachments(environmentId, props.capabilities?.attachments);
+  const hasUnsentContent =
+    props.hasPaneDraft === true || props.draft.trim().length > 0 || uploads.items.length > 0;
+  // The pane keys this composer by environment and session, so this branch never flips in place.
+  if (!environmentId || !sessionId) {
+    return (
+      <PaComposerView
+        {...props}
+        textareaRef={textareaRef}
+        uploads={uploads}
+        allowVoiceSettingsNavigation={!hasUnsentContent}
+        speech={null}
+      />
+    );
+  }
+  return (
+    <SpeechTextField
+      environmentId={environmentId}
+      ownerKey={JSON.stringify(["pa", environmentId, props.bot.botId, sessionId])}
+      label={props.bot.name}
+      text={props.draft}
+      textareaRef={textareaRef}
+      onTextChange={props.onDraftChange}
+      disabled={props.disabled || props.sending}
+      modelPickerOpen={props.modelPickerOpen}
+      // Navigating to Voice settings unmounts the Bots route; only offer it when nothing would be lost.
+      offerSetup={!hasUnsentContent}
+    >
+      {(speech) => (
+        <PaComposerView
+          {...props}
+          textareaRef={textareaRef}
+          uploads={uploads}
+          allowVoiceSettingsNavigation={!hasUnsentContent}
+          speech={speech}
+        />
+      )}
+    </SpeechTextField>
+  );
+}
+
+function PaComposerView({
   environmentId,
   bot,
   capabilities,
   sessionId,
+  sessionModel,
   draft,
   onDraftChange,
   running,
@@ -253,54 +349,28 @@ export function PaComposer({
   modelRefreshVersion,
   onReasoningChanged,
   onModelChanged,
-}: {
-  readonly environmentId: EnvironmentId | null;
-  readonly bot: PaBotSummary;
-  readonly capabilities: PaCapabilities | null;
-  readonly sessionId: string | null;
-  readonly draft: string;
-  readonly onDraftChange: (value: string) => void;
-  readonly running: boolean;
-  readonly sending: boolean;
-  readonly disabled: boolean;
-  readonly slashCommands: ReadonlyArray<PaSlashCommand>;
-  readonly openRequests: ReadonlyArray<PaPendingRequest>;
-  readonly respondingIds: ReadonlySet<string>;
-  readonly canSelectModel: boolean;
-  readonly onRespondRequest: (
-    req: PaPendingRequest,
-    decision?: string,
-    answers?: PaClarifyAnswers,
-  ) => void;
-  /** Resolves `true` once the engine took the answer; typed values never leave the form until then. */
-  readonly onRespondSecret: (req: PaPendingRequest, answer: PaSecretAnswer) => Promise<boolean>;
-  /** `queued`: the draft waits behind the running turn. */
-  readonly onSend: (options: {
-    readonly queued: boolean;
-    readonly attachments: ReadonlyArray<PaAttachment>;
-  }) => Promise<boolean | undefined>;
-  /** Hands the draft to the running turn. */
-  readonly onSteer: () => void;
-  readonly onInterrupt: () => void;
-  /** Session status (todos, queue) shown above the composer, in its lane. */
-  readonly statusSlot?: ReactNode;
-  readonly error: string | null;
-  readonly onDismissError: () => void;
-  readonly modelPickerOpen: boolean;
-  readonly onModelPickerOpenChange: (open: boolean) => void;
-  readonly modelQuery: string;
-  readonly onModelQueryChange: (value: string) => void;
-  readonly liveReasoningEffort?: string | null | undefined;
-  readonly modelRefreshVersion?: number | undefined;
-  readonly onReasoningChanged?: ((effort: string) => void) | undefined;
-  readonly onModelChanged: () => void;
+  textareaRef,
+  uploads,
+  allowVoiceSettingsNavigation,
+  speech,
+}: PaComposerProps & {
+  readonly textareaRef: RefObject<HTMLTextAreaElement | null>;
+  readonly uploads: ReturnType<typeof usePaAttachments>;
+  readonly allowVoiceSettingsNavigation: boolean;
+  /** Null until the composer has an environment and a session to dictate into. */
+  readonly speech: TextFieldSpeech | null;
 }) {
   const gt = useGT();
-  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const rootRef = useRef<HTMLDivElement | null>(null);
   const picker = useRef<HTMLInputElement | null>(null);
-  const uploads = usePaAttachments(environmentId, capabilities?.attachments);
   const canManageProviders = useEnvironmentScope(environmentId, AuthProvidersManageScope);
-  const canAttach = uploads.enabled && !disabled && !sending;
+  const voiceInputActive = speech?.blocksSubmission === true;
+  const voicePreparing = speech?.preparing === true;
+  const freezesEditor = speech?.freezesEditor === true;
+  // Phones give the dictation capsule the footer row beside the primary actions.
+  const dictating = speech !== null && speech.state.phase !== "idle";
+  const dictationDisabled = disabled || sending;
+  const canAttach = uploads.enabled && !disabled && !sending && !freezesEditor;
   const hasAttachments = uploads.items.length > 0;
   const [expandedImage, setExpandedImage] = useState<ExpandedImagePreview | null>(null);
   const [previewFileId, setPreviewFileId] = useState<string | null>(null);
@@ -309,7 +379,8 @@ export function PaComposer({
   const maxFileBytes = capabilities?.attachments?.maxFileBytes ?? PROVIDER_SEND_TURN_MAX_FILE_BYTES;
   const [slashIndex, setSlashIndex] = useState(0);
   const [slashDismissed, setSlashDismissed] = useState(false);
-  const [slashTab, setSlashTab] = useState<PaSlashTab>("common");
+  const [menuAnchor, setMenuAnchor] = useState<HTMLDivElement | null>(null);
+  const slashListId = useId();
   const keyboardOpen = useSoftwareKeyboardOpen();
 
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- resizes the textarea DOM height to match multiline draft content
@@ -322,55 +393,114 @@ export function PaComposer({
     }
     el.style.height = "auto";
     el.style.height = `${Math.min(el.scrollHeight, 180)}px`;
-  }, [draft]);
+  }, [draft, textareaRef]);
 
   const slashQuery =
-    !hasAttachments && !slashDismissed && draft.startsWith("/") && !/\s/.test(draft)
+    !hasAttachments &&
+    !freezesEditor &&
+    !slashDismissed &&
+    draft.startsWith("/") &&
+    !/\s/.test(draft)
       ? draft.slice(1)
       : null;
-  const tabCounts = countPaSlashTabs(slashCommands);
-  const effectiveSlashTab: PaSlashTab =
-    slashTab === "skills" && tabCounts.skills === 0 ? "common" : slashTab;
+  const availableCommands = canSelectModel
+    ? slashCommands
+    : slashCommands.filter((command) => command.handling !== "client:model-picker");
   const matchingCommands =
-    slashQuery === null ? [] : selectPaSlashCommands(slashCommands, slashQuery, effectiveSlashTab);
-  const showSlashMenu =
-    slashQuery !== null &&
-    (matchingCommands.length > 0 || (slashQuery === "" && slashCommands.length > 0));
+    slashQuery === null ? [] : rankPaSlashCommands(availableCommands, slashQuery);
+  const showSlashMenu = matchingCommands.length > 0;
   const clampedSlashIndex =
     matchingCommands.length === 0 ? 0 : Math.min(slashIndex, matchingCommands.length - 1);
-  // Client commands (/stop, /new, /model) run at once; plain text queues behind a running turn.
-  const isClientCommand =
-    !hasAttachments && parsePaClientSlashAction(draft, slashCommands) !== null;
-  const sendMode = resolvePaComposerSendMode({
-    running,
-    draft,
-    isClientCommand,
-    hasOpenRequests: openRequests.length > 0,
-    canQueue: capabilities?.execution.queue === true,
-    hasAttachments,
-    attachmentsBlocked: uploads.blocked,
-  });
+  const resolveSend = (text: string) => {
+    // Client commands (/stop, /new, /model) run at once; plain text queues behind a running turn.
+    const isClientCommand =
+      !hasAttachments && parsePaClientSlashAction(text, slashCommands) !== null;
+    const sendMode = resolvePaComposerSendMode({
+      running,
+      draft: text,
+      isClientCommand,
+      hasOpenRequests: openRequests.length > 0,
+      canQueue: capabilities?.execution.queue === true,
+      hasAttachments,
+      attachmentsBlocked: uploads.blocked,
+    });
+    return { isClientCommand, sendMode, canSend: sendMode !== "blocked" && !disabled && !sending };
+  };
+  const { isClientCommand, sendMode, canSend: canSendDraft } = resolveSend(draft);
   const hasDraft = draft.trim().length > 0 || hasAttachments;
-  const canSend = sendMode !== "blocked" && !disabled && !sending && hasDraft;
+  // The transcript is not in the draft yet, so dictation defers the real check to its final text.
+  const canSend = voiceInputActive
+    ? !voicePreparing && !dictationDisabled && !uploads.blocked
+    : canSendDraft;
   const canInterrupt = capabilities?.execution.interrupt !== false;
   const canSteer =
-    !hasAttachments && sendMode === "queue" && capabilities?.execution.steer === true;
+    !hasAttachments &&
+    !voiceInputActive &&
+    sendMode === "queue" &&
+    capabilities?.execution.steer === true;
   // While a turn runs with nothing to send, the primary slot is the stop button.
   const showStopOnly =
-    running && !isClientCommand && canInterrupt && (!hasDraft || sendMode === "blocked");
-  const send = () => {
-    setSlashDismissed(false);
-    if (!canSend) return;
+    running &&
+    !isClientCommand &&
+    canInterrupt &&
+    !voiceInputActive &&
+    (!hasDraft || sendMode === "blocked");
+  const sendText = (text: string, textOverride?: string) => {
+    const resolved = resolveSend(text);
+    if (!resolved.canSend) return;
     const finish = uploads.handoff();
-    void onSend({ queued: sendMode === "queue", attachments: uploads.ready }).then(
+    void onSend({
+      queued: resolved.sendMode === "queue",
+      attachments: uploads.ready,
+      textOverride,
+    }).then(
       (accepted) => finish(Boolean(accepted)),
       () => finish(false),
     );
   };
+  const sendAfterDictationRef = useRef<(text: string) => void>(() => {});
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- publishes the committed send to the asynchronous dictation completion, and drops it on unmount
+  useLayoutEffect(() => {
+    sendAfterDictationRef.current = (text) => sendText(text, text);
+    return () => {
+      sendAfterDictationRef.current = () => {};
+    };
+  });
+  const send = () => {
+    setSlashDismissed(false);
+    if (!canSend) return;
+    if (voiceInputActive) {
+      speech?.submitAfterDictation((finalText) => sendAfterDictationRef.current(finalText));
+      return;
+    }
+    sendText(draft);
+  };
+  useDictationSubmissionShortcut({
+    enabled: voiceInputActive && !voicePreparing,
+    formRef: rootRef,
+    onKeyDown: (event) => {
+      if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
+      if (keyboardOpen && !event.metaKey && !event.ctrlKey) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      send();
+    },
+  });
 
-  const completeCommand = (command: PaSlashCommand) => {
-    onDraftChange(`${command.name} `);
+  const pickCommand = (command: PaSlashCommand) => {
     setSlashIndex(0);
+    // Opening the picker has no side effect, so it runs on pick; every other command only completes.
+    if (
+      command.handling === "client:model-picker" &&
+      canSelectModel &&
+      capabilities?.models.supported
+    ) {
+      onDraftChange("");
+      onModelQueryChange("");
+      onModelPickerOpenChange(true);
+      return;
+    }
+    onDraftChange(`${command.name} `);
     textareaRef.current?.focus();
   };
 
@@ -395,7 +525,7 @@ export function PaComposer({
       const picked = matchingCommands[clampedSlashIndex];
       if (event.key === "Tab" && picked) {
         event.preventDefault();
-        completeCommand(picked);
+        pickCommand(picked);
         return;
       }
       // Enter on a typed full command runs it; on a partial token it completes the highlighted one.
@@ -406,7 +536,7 @@ export function PaComposer({
         !isCompletePaSlashCommand(draft, slashCommands)
       ) {
         event.preventDefault();
-        completeCommand(picked);
+        pickCommand(picked);
         return;
       }
     }
@@ -422,29 +552,11 @@ export function PaComposer({
     }
   };
 
-  const toggleSlashMenu = () => {
-    if (showSlashMenu) {
-      setSlashDismissed(true);
-      if (draft === "/") onDraftChange("");
-      return;
-    }
-    setSlashDismissed(false);
-    setSlashIndex(0);
-    setSlashTab("common");
-    if (!draft.startsWith("/")) onDraftChange(draft ? `/${draft}` : "/");
-    textareaRef.current?.focus();
-  };
-
-  const slashTabs: ReadonlyArray<{ readonly id: PaSlashTab; readonly label: string }> = [
-    { id: "common", label: gt("Favorites") },
-    { id: "commands", label: gt("All commands ({count})", { count: tabCounts.commands }) },
-    ...(tabCounts.skills > 0
-      ? [{ id: "skills" as const, label: gt("Skills ({count})", { count: tabCounts.skills }) }]
-      : []),
-  ];
-
   return (
-    <div className="pointer-events-auto relative mx-auto w-full min-w-0 max-w-(--chat-content-max-width)">
+    <div
+      ref={rootRef}
+      className="pointer-events-auto relative mx-auto w-full min-w-0 max-w-(--chat-content-max-width)"
+    >
       {statusSlot}
       {openRequests.length > 0 ? (
         <div
@@ -511,96 +623,6 @@ export function PaComposer({
         </div>
       ) : null}
 
-      {showSlashMenu ? (
-        <div
-          className={cn(
-            "mb-2 flex min-w-0 flex-col rounded-2xl border border-border/80 bg-popover/95 p-1.5 shadow-lg backdrop-blur-md",
-            keyboardOpen ? "max-h-[min(14rem,28svh)]" : "max-h-[min(18rem,45dvh)]",
-          )}
-        >
-          {slashQuery === "" ? (
-            <div className="mb-1 flex shrink-0 items-center justify-between gap-2 border-b border-border/50 px-1 pb-1.5">
-              <div className="flex min-w-0 items-center gap-1 overflow-x-auto">
-                {slashTabs.map((tab) => {
-                  const active = effectiveSlashTab === tab.id;
-                  return (
-                    <button
-                      key={tab.id}
-                      type="button"
-                      aria-pressed={active}
-                      // Keep textarea focus (and mobile keyboard) while switching tabs.
-                      onPointerDown={(e) => e.preventDefault()}
-                      onClick={() => {
-                        setSlashTab(tab.id);
-                        setSlashIndex(0);
-                      }}
-                      className={cn(
-                        "shrink-0 rounded-md px-2 py-1 text-2xs font-medium transition-colors pointer-coarse:py-1.5",
-                        active
-                          ? "bg-accent text-accent-foreground"
-                          : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
-                      )}
-                    >
-                      {tab.label}
-                    </button>
-                  );
-                })}
-              </div>
-              <span className="hidden shrink-0 pr-1 text-2xs text-muted-foreground sm:inline">
-                <T>Filter by keyword</T>
-              </span>
-            </div>
-          ) : (
-            <div className="flex shrink-0 items-center gap-1.5 px-2.5 py-1 text-2xs font-medium text-muted-foreground">
-              <SquareSlashIcon className="size-3 shrink-0" />
-              <span className="min-w-0 truncate">
-                {gt("{count} matches · Tab to complete, Enter to send", {
-                  count: matchingCommands.length,
-                })}
-              </span>
-            </div>
-          )}
-          <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
-            {matchingCommands.map((cmd, idx) => (
-              <button
-                key={cmd.name}
-                ref={
-                  idx === clampedSlashIndex
-                    ? (el) => el?.scrollIntoView({ block: "nearest" })
-                    : undefined
-                }
-                type="button"
-                // Keep textarea focus (and the mobile keyboard) while picking.
-                onPointerDown={(e) => e.preventDefault()}
-                onClick={() => completeCommand(cmd)}
-                className={cn(
-                  "flex w-full min-w-0 items-center justify-between gap-3 rounded-lg px-2.5 py-1.5 text-left text-xs transition-colors pointer-coarse:py-2.5",
-                  idx === clampedSlashIndex
-                    ? "bg-accent text-accent-foreground"
-                    : "hover:bg-muted/60",
-                )}
-              >
-                <span className="flex min-w-0 shrink-0 items-center gap-1.5">
-                  <span className="font-mono font-medium">{cmd.name}</span>
-                  {cmd.group === "skill" ? (
-                    <Badge variant="secondary" size="sm" className="shrink-0">
-                      <T>Skill</T>
-                    </Badge>
-                  ) : cmd.group === "plugin" ? (
-                    <Badge variant="outline" size="sm" className="shrink-0">
-                      <T>Plugin</T>
-                    </Badge>
-                  ) : null}
-                </span>
-                <span className="min-w-0 truncate text-2xs text-muted-foreground">
-                  {cmd.description}
-                </span>
-              </button>
-            ))}
-          </div>
-        </div>
-      ) : null}
-
       {expandedImage ? (
         <ExpandedImageDialog preview={expandedImage} onClose={() => setExpandedImage(null)} />
       ) : null}
@@ -623,7 +645,19 @@ export function PaComposer({
       >
         <ComposerSurface.Shell>
           <ComposerSurface.Host>
-            <ComposerSurface.Main>
+            <ComposerSurface.Main ref={setMenuAnchor}>
+              <DeferredComposerCommandMenuLayer open={showSlashMenu} anchor={menuAnchor}>
+                <PaSlashCommandMenu
+                  listId={slashListId}
+                  commands={matchingCommands}
+                  activeName={matchingCommands[clampedSlashIndex]?.name ?? null}
+                  onHighlight={(name) => {
+                    const index = matchingCommands.findIndex((command) => command.name === name);
+                    if (index >= 0) setSlashIndex(index);
+                  }}
+                  onSelect={pickCommand}
+                />
+              </DeferredComposerCommandMenuLayer>
               <div className="px-3.5 pt-3 pb-1.5">
                 {environmentId && hasAttachments ? (
                   <div inert={sending}>
@@ -667,8 +701,19 @@ export function PaComposer({
                 <textarea
                   ref={textareaRef}
                   rows={1}
+                  role={showSlashMenu ? "combobox" : undefined}
+                  aria-controls={showSlashMenu ? slashListId : undefined}
+                  aria-expanded={showSlashMenu ? true : undefined}
+                  aria-activedescendant={
+                    showSlashMenu
+                      ? composerSuggestionOptionId(
+                          slashListId,
+                          matchingCommands[clampedSlashIndex]!.name,
+                        )
+                      : undefined
+                  }
                   value={draft}
-                  readOnly={sending && hasAttachments}
+                  readOnly={(sending && hasAttachments) || freezesEditor}
                   onPaste={(event) => {
                     if (!canAttach) return;
                     const files = Array.from(event.clipboardData.files);
@@ -693,14 +738,34 @@ export function PaComposer({
                     setSlashDismissed(false);
                   }}
                   onKeyDown={handleKeyDown}
-                  placeholder={gt("Message {name}, or type / for commands…", { name: bot.name })}
+                  placeholder={
+                    availableCommands.length > 0
+                      ? gt("Message {name}, or type / for commands…", { name: bot.name })
+                      : gt("Message {name}", { name: bot.name })
+                  }
                   // iOS zooms into any field under 16px on focus, and Appearance can shrink 1rem below it.
                   className="block max-h-44 min-h-6 w-full min-w-0 resize-none bg-transparent text-sm leading-6 text-foreground outline-none placeholder:text-muted-foreground/80 pointer-coarse:text-(length:--font-size-prompt-touch)"
                 />
               </div>
 
+              {speech?.preview ? (
+                // column-reverse pins the scroll to the bottom; the single inner div keeps the text in normal order.
+                <div
+                  role="status"
+                  aria-label={gt("Live transcription")}
+                  className="mx-3 mb-3 flex max-h-32 flex-col-reverse overflow-y-auto rounded-lg border border-border/60 bg-muted/30 px-3 py-2 text-sm leading-relaxed break-words whitespace-pre-wrap sm:mx-4"
+                >
+                  <div>
+                    <span>{speech.preview.committed}</span>
+                    <span className="text-muted-foreground">{speech.preview.tentative}</span>
+                  </div>
+                </div>
+              ) : null}
+
               <div className="flex min-w-0 items-center justify-between gap-2 px-2 pb-2">
-                <div className="flex shrink-0 items-center gap-1">
+                <div
+                  className={cn("flex shrink-0 items-center gap-1", dictating && "max-sm:hidden")}
+                >
                   {canAttach ? (
                     <>
                       <ComposerAttachInput
@@ -711,35 +776,71 @@ export function PaComposer({
                       <ComposerAttachButton onOpenPicker={() => picker.current?.click()} />
                     </>
                   ) : null}
-                  {!hasAttachments && slashCommands.length > 0 ? (
-                    <Button
-                      type="button"
-                      size="icon-xs"
-                      variant={showSlashMenu ? "secondary" : "ghost-muted"}
-                      aria-label={gt("Commands and skills")}
-                      aria-expanded={showSlashMenu}
-                      onPointerDown={(e) => e.preventDefault()}
-                      onClick={toggleSlashMenu}
-                    >
-                      <SquareSlashIcon className="size-4" />
-                    </Button>
-                  ) : null}
                 </div>
 
                 <div className="flex min-w-0 flex-1 items-center justify-end gap-1.5 overflow-hidden">
                   {canSelectModel && capabilities?.models.supported ? (
-                    <PaModelPicker
-                      bot={bot}
-                      sessionId={sessionId}
-                      open={modelPickerOpen}
-                      onOpenChange={onModelPickerOpenChange}
-                      query={modelQuery}
-                      onQueryChange={onModelQueryChange}
-                      liveReasoningEffort={liveReasoningEffort}
-                      refreshVersion={modelRefreshVersion}
-                      onReasoningChanged={onReasoningChanged}
-                      onModelChanged={onModelChanged}
-                    />
+                    <div className={cn("contents", dictating && "max-sm:hidden")}>
+                      <PaModelPicker
+                        environmentId={environmentId}
+                        bot={bot}
+                        sessionId={sessionId}
+                        modelScope={capabilities.models.scope}
+                        sessionModel={sessionModel}
+                        open={modelPickerOpen}
+                        onOpenChange={onModelPickerOpenChange}
+                        query={modelQuery}
+                        onQueryChange={onModelQueryChange}
+                        liveReasoningEffort={liveReasoningEffort}
+                        refreshVersion={modelRefreshVersion}
+                        onReasoningChanged={onReasoningChanged}
+                        onModelChanged={onModelChanged}
+                      />
+                    </div>
+                  ) : null}
+
+                  {speech ? (
+                    <>
+                      {speech.available ? (
+                        <>
+                          <ComposerSpeechRecordingPill
+                            state={speech.state}
+                            progress={null}
+                            finishShortcutLabel={speech.shortcutLabel}
+                            cancelShortcutLabel="Esc"
+                            level={speech.level}
+                            recordingStartedAt={speech.recordingStartedAt}
+                            disabled={dictationDisabled}
+                            onStart={() => void speech.start()}
+                            onStop={() => void speech.stop()}
+                            onCancel={speech.cancel}
+                            onSkipPostProcessing={speech.skipPostProcessing}
+                          />
+                          <ComposerSpeechButton
+                            state={speech.state}
+                            shortcutLabel={speech.shortcutLabel}
+                            disabled={dictationDisabled}
+                            onStart={() => void speech.start()}
+                          />
+                        </>
+                      ) : null}
+                      <VoiceInputSetup
+                        environmentId={speech.transcriptionEnvironmentId}
+                        open={speech.setup.open}
+                        step={speech.setup.step}
+                        status={speech.status}
+                        model={speech.setup.model}
+                        language={speech.setup.language}
+                        downloading={speech.setup.downloading}
+                        error={speech.setup.error}
+                        onOpenChange={speech.setup.setOpen}
+                        onRetryCatalog={speech.setup.retryCatalog}
+                        onDownload={() => void speech.setup.download()}
+                        onCancelDownload={() => void speech.setup.cancelDownload()}
+                        onStartRecording={() => void speech.setup.startRecording()}
+                        allowSettingsNavigation={allowVoiceSettingsNavigation}
+                      />
+                    </>
                   ) : null}
 
                   <div className="flex shrink-0 items-center gap-1">
