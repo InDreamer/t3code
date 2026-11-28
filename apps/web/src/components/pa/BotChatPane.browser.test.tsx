@@ -13,6 +13,7 @@ import {
 import { expect, it, vi } from "vite-plus/test";
 import { act, render } from "../../../test/render";
 import { BotChatPane } from "./BotChatPane";
+import { clearPaBotChatsEnvironment } from "./usePaBotChat";
 import { attachmentEnvironment } from "../../state/attachments";
 import { SecretRequestField } from "../chat/SecretRequestField";
 import { paApi, paModelCatalogs, paSelectModelPermissionAtom, paSendPermissionAtom } from "./paApi";
@@ -45,6 +46,16 @@ vi.mock(import("./paApi"), async (original) => {
   const api = await original();
   return {
     ...api,
+    paCache: {
+      loadRoster: async () => null,
+      saveRoster: async () => undefined,
+      removeEnvironment: async () => undefined,
+      loadSession: async () => null,
+      saveSession: async () => undefined,
+      removeSession: async () => undefined,
+      removeBotSessions: async () => undefined,
+      bumpEnvironmentGeneration: () => undefined,
+    },
     paSendPermissionAtom: vi.fn(() => allowed),
     paUpdateMetaPermissionAtom: () => allowed,
     paSelectModelPermissionAtom: vi.fn(api.paSelectModelPermissionAtom),
@@ -105,6 +116,7 @@ vi.mock(import("../../speech/useEnvironmentSpeechInput"), async (original) => {
 vi.mock(import("../../state/session"), async (original) => ({
   ...(await original()),
   useEnvironmentScope: vi.fn(() => true),
+  useEnvironmentScopeDenied: vi.fn(() => false),
 }));
 
 const bot = {
@@ -138,7 +150,10 @@ const capabilities: PaCapabilities = {
   schedules: { supported: false },
 };
 const translations = {};
+
 function setup(spies: DisposableStack) {
+  clearPaBotChatsEnvironment("pa-browser");
+  spies.defer(() => clearPaBotChatsEnvironment("pa-browser"));
   const select = vi.fn();
   const read = spies
     .use(vi.spyOn(paApi, "getMessages"))
@@ -243,7 +258,7 @@ it.each(["complete", "switched", "queued", "voice"] as const)(
     using toast = vi.spyOn(toastManager, "add");
     await using screen = await render(flow.view("deep"));
     expect(flow.select).not.toHaveBeenCalled();
-    expect(flow.read).toHaveBeenCalledWith(bot.botId, "deep");
+    expect(flow.read).toHaveBeenCalledWith(bot.botId, "deep", { limit: 50 });
     await screen.getByRole("textbox").fill("focus on tests");
     await screen.getByRole("button", { name: "Steer the current turn" }).click();
     expect(flow.steer).toHaveBeenCalledWith(bot.botId, "deep", "focus on tests");
@@ -285,7 +300,9 @@ it.each(["complete", "switched", "queued", "voice"] as const)(
       await screen.rerender(flow.view("deep"));
       await expect.element(screen.getByRole("textbox")).toHaveValue("focus on tests");
     }
-    if (scenario === "complete") expect(flow.read).toHaveBeenCalledWith(bot.botId, "deep");
+    if (scenario === "complete") {
+      expect(flow.read).toHaveBeenCalledWith(bot.botId, "deep", { limit: 50 });
+    }
     if (scenario === "voice")
       expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: "Voice chat stopped." }));
     expect(screen.container.querySelector("[data-user-message-bubble]")).toBeNull();
@@ -791,6 +808,136 @@ it.each(["empty", "duplicate", "stale", "prepend"] as const)(
     expect(scroll.mock.calls.length > 0).toBe(scenario !== "prepend");
   },
 );
+
+it("retains the transcript and resumeToken across unmount/remount so switching back paints instantly without getMessages", async () => {
+  using spies = new DisposableStack();
+  clearPaBotChatsEnvironment("pa-browser");
+  spies.defer(() => clearPaBotChatsEnvironment("pa-browser"));
+  const read = spies.use(vi.spyOn(paApi, "getMessages")).mockResolvedValue({
+    messages: [],
+    nextCursor: null,
+  });
+  spies.use(vi.spyOn(paApi, "listSessions")).mockResolvedValue({
+    sessions: [],
+    primarySessionId: "deep",
+    nextCursor: null,
+  });
+  spies.use(vi.spyOn(paApi, "markRead")).mockResolvedValue(undefined);
+  const seenTokens: Array<string | undefined> = [];
+  const follow = spies
+    .use(vi.spyOn(paApi, "followSession"))
+    .mockImplementation((_bot, sessionId, handlers) => {
+      seenTokens.push(handlers.initialResumeToken);
+      if (handlers.initialResumeToken === undefined) {
+        handlers.onEvent({
+          type: "snapshot",
+          sessionId,
+          running: false,
+          openRequests: [],
+          snapshotRequired: false,
+          resumeToken: "ep:10",
+          pageTag: "tag-10",
+          page: {
+            messages: [
+              {
+                id: "row-1",
+                role: "assistant",
+                rowKind: "message",
+                text: "Cached instant reply",
+                timestamp: 100,
+              },
+            ],
+            nextCursor: null,
+          },
+        });
+        handlers.onResumeToken?.("ep:10");
+      } else {
+        handlers.onEvent({
+          type: "snapshot",
+          sessionId,
+          running: false,
+          openRequests: [],
+          snapshotRequired: false,
+          resumeToken: handlers.initialResumeToken,
+          protocolVersion: 3,
+        });
+      }
+      return () => undefined;
+    });
+
+  const pane = () => (
+    <GTProvider locale="en" translations={translations}>
+      <BotChatPane
+        bot={bot}
+        capabilities={capabilities}
+        selectedSessionId="deep"
+        onSelectSession={() => undefined}
+        onActivity={() => undefined}
+        onOpenSettings={() => undefined}
+      />
+    </GTProvider>
+  );
+
+  {
+    await using first = await render(pane());
+    await expect.element(first.getByText("Cached instant reply", { exact: true })).toBeVisible();
+    expect(read).not.toHaveBeenCalled();
+  }
+
+  // Remounting the same Bot (simulating switching A -> B -> A) paints immediately with no spinner
+  // and passes the retained resumeToken for exact replay.
+  await using second = await render(pane());
+  await expect.element(second.getByText("Cached instant reply", { exact: true })).toBeVisible();
+  expect(second.getByText("Loading conversation…").elements()).toHaveLength(0);
+  expect(follow).toHaveBeenCalledTimes(2);
+  expect(seenTokens).toEqual([undefined, "ep:10"]);
+  expect(read).not.toHaveBeenCalled();
+});
+
+it("does not invoke stale onSessionSelected navigation after unmounting a bot while createSession is pending", async () => {
+  using spies = new DisposableStack();
+  const flow = setup(spies);
+  const pendingCreate = Promise.withResolvers<Awaited<ReturnType<typeof paApi.createSession>>>();
+  spies.use(vi.spyOn(paApi, "createSession")).mockReturnValue(pendingCreate.promise);
+  flow.list.mockResolvedValue({
+    sessions: [
+      {
+        sessionId: "deep",
+        title: "Deep",
+        source: "gui",
+        model: null,
+        messageCount: 1,
+        running: false,
+        startedAt: 1,
+        lastActivityAt: 1,
+        isPrimary: true,
+      },
+    ],
+    primarySessionId: "deep",
+    nextCursor: null,
+  });
+
+  {
+    await using screen = await render(flow.view("deep"));
+    await screen.getByRole("button", { name: "Primary conversation" }).click();
+    await page.getByRole("button", { name: "New conversation", exact: true }).click();
+  }
+
+  pendingCreate.resolve({
+    sessionId: "late-created",
+    title: "New conversation",
+    source: "gui",
+    model: null,
+    messageCount: 0,
+    running: false,
+    startedAt: 2,
+    lastActivityAt: 2,
+    isPrimary: true,
+  });
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(flow.select).not.toHaveBeenCalled();
+});
 
 function enableVoice(spies: DisposableStack) {
   voice.available = true;

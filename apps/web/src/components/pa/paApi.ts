@@ -1,5 +1,7 @@
+import { createPaEnvironmentCache } from "@t3tools/client-runtime/pa/cache";
 import { createPaPrimarySessionCreates, makePaRequestKey } from "@t3tools/client-runtime/pa/chat";
 import { createPaEnvironmentCommands } from "@t3tools/client-runtime/pa/environment";
+import type { PaFollowSessionOptions } from "@t3tools/client-runtime/pa/bot-chat";
 import { createPaModelCatalogCache } from "@t3tools/client-runtime/pa/models";
 import {
   runAtomCommand,
@@ -18,7 +20,6 @@ import {
   type PaRespondRequestInput,
   type PaSelectBotModelInput,
   type PaSessionSummary,
-  type PaStreamEvent,
   type PaUpdateBotMetaInput,
 } from "@t3tools/contracts";
 import { msg } from "gt-react";
@@ -30,6 +31,7 @@ import { readPrimaryEnvironmentId } from "../../state/environments";
 import { primaryEnvironmentIdAtom } from "../../state/primaryEnvironment";
 
 const pa = createPaEnvironmentCommands(connectionAtomRuntime);
+export const paCache = createPaEnvironmentCache(appAtomRegistry, connectionAtomRuntime);
 export const paCreateBotPermissionAtom = pa.createBot.permissionAtom;
 export const paSelectModelPermissionAtom = pa.selectBotModel.permissionAtom;
 export const paPatchConfigPermissionAtom = pa.patchBotConfig.permissionAtom;
@@ -148,14 +150,7 @@ export const paApi = {
   respondRequest: (input: PaRespondRequestInput) =>
     call(pa.respondRequest, input, { reportDefect: false }),
   /** Streams a session over the environment connection; resumes on its own after drops. */
-  followSession(
-    botId: string,
-    sessionId: string,
-    handlers: {
-      readonly onEvent: (event: PaStreamEvent) => void;
-      readonly onFailure: (error: unknown, status: { readonly retrying: boolean }) => void;
-    },
-  ): () => void {
+  followSession(botId: string, sessionId: string, handlers: PaFollowSessionOptions): () => void {
     let stop: (() => void) | null = null;
     let stopped = false;
     primaryEnvironmentId().then(

@@ -1,3 +1,4 @@
+import { PaCacheStore } from "@t3tools/client-runtime/pa/cache";
 import { Persistence } from "@t3tools/client-runtime/platform";
 import { EnvironmentQueryStore } from "@t3tools/client-runtime/state/query-persistence";
 import { EnvironmentId } from "@t3tools/contracts";
@@ -68,5 +69,33 @@ describe("IndexedDB query cache", () => {
       yield* store.save(environmentId, "diff", "x".repeat(4 * 1024 * 1024 + 1));
       expect(yield* store.load(environmentId, "diff")).toEqual(Option.none());
     }).pipe(Effect.provide(ConnectionStorage.layer)),
+  );
+
+  it.effect(
+    "round trips PA cache entries, removes by prefix, and clears with the environment",
+    () =>
+      Effect.gen(function* () {
+        const pa = (yield* PaCacheStore)!;
+        const query = (yield* EnvironmentQueryStore)!;
+        const environmentId = EnvironmentId.make("pa-storage");
+        yield* query.save(environmentId, "pr", "keep-query");
+        yield* pa.save(environmentId, "roster", "roster-json");
+        yield* pa.save(environmentId, "session:bot-a:s-1", "s1-json");
+        yield* pa.save(environmentId, "session:bot-a:s-2", "s2-json");
+        yield* pa.save(environmentId, "session:bot-b:s-1", "b1-json");
+
+        expect(yield* pa.load(environmentId, "roster")).toEqual(Option.some("roster-json"));
+        expect(yield* pa.load(environmentId, "session:bot-a:s-1")).toEqual(Option.some("s1-json"));
+
+        yield* pa.removePrefix(environmentId, "session:bot-a:");
+        expect(yield* pa.load(environmentId, "session:bot-a:s-1")).toEqual(Option.none());
+        expect(yield* pa.load(environmentId, "session:bot-a:s-2")).toEqual(Option.none());
+        expect(yield* pa.load(environmentId, "session:bot-b:s-1")).toEqual(Option.some("b1-json"));
+        expect(yield* query.load(environmentId, "pr")).toEqual(Option.some("keep-query"));
+
+        yield* (yield* Persistence.EnvironmentCacheStore).clear(environmentId);
+        expect(yield* pa.load(environmentId, "roster")).toEqual(Option.none());
+        expect(yield* pa.load(environmentId, "session:bot-b:s-1")).toEqual(Option.none());
+      }).pipe(Effect.provide(ConnectionStorage.layer)),
   );
 });

@@ -844,8 +844,18 @@ const layerEnvironmentOwnedDataCleanup = Layer.succeed(
           Effect.sync(() => clearComposerDraftsEnvironment(environmentId)),
           Effect.promise(async () => {
             // `paApi` depends on this connection runtime.
-            const { paModelCatalogs } = await import("../components/pa/paApi");
+            const [
+              { paModelCatalogs },
+              { clearPaBotsEnvironment },
+              { clearPaBotChatsEnvironment },
+            ] = await Promise.all([
+              import("../components/pa/paApi"),
+              import("../components/pa/paBotsStore"),
+              import("../components/pa/usePaBotChat"),
+            ]);
             paModelCatalogs.clearEnvironment(environmentId);
+            clearPaBotChatsEnvironment(environmentId);
+            clearPaBotsEnvironment(environmentId);
           }),
         ],
         { concurrency: "unbounded", discard: true },

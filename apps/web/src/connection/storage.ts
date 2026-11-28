@@ -31,6 +31,7 @@ import {
   pullRequestRoutingPermissionFor,
 } from "@t3tools/client-runtime/connection";
 import { EnvironmentQueryStore } from "@t3tools/client-runtime/state/query-persistence";
+import { PaCacheStore } from "@t3tools/client-runtime/pa/cache";
 import { EnvironmentId, ServerConfig, ThreadId, VcsListRefsResult } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
@@ -1136,6 +1137,26 @@ export const layer = Layer.effectContext(
         ),
     };
 
+    const paCacheStore: NonNullable<typeof PaCacheStore.Service> = {
+      load: (environmentId, key) => queryStore.load(environmentId, `pa:${key}`),
+      save: (environmentId, key, payload) => queryStore.save(environmentId, `pa:${key}`, payload),
+      remove: (environmentId, key) =>
+        removeDatabaseValue(
+          database,
+          QUERY_STORE_NAME,
+          queryCacheKey(environmentId, `pa:${key}`),
+        ).pipe(Effect.ignore),
+      removePrefix: (environmentId, prefix) =>
+        removeDatabaseValuesInRange(
+          database,
+          QUERY_STORE_NAME,
+          IDBKeyRange.bound(
+            queryCacheKey(environmentId, `pa:${prefix}`),
+            `${queryCacheKey(environmentId, `pa:${prefix}`)}\uffff`,
+          ),
+        ).pipe(Effect.ignore),
+    };
+
     return Context.make(Persistence.ConnectionTargetStore, targetStore).pipe(
       Context.add(PullRequestRoutingPermissions, pullRequestRoutingPermissions),
       Context.add(Persistence.ConnectionRegistrationStore, registrationStore),
@@ -1144,6 +1165,7 @@ export const layer = Layer.effectContext(
       Context.add(TokenStore.RemoteDpopAccessTokenStore, remoteTokenStore),
       Context.add(Persistence.EnvironmentCacheStore, cacheStore),
       Context.add(EnvironmentQueryStore, queryStore),
+      Context.add(PaCacheStore, paCacheStore),
     );
   }),
 );
