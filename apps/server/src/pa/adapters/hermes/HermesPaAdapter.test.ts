@@ -208,6 +208,34 @@ describe("HermesPaAdapter profile routing", () => {
     expect(conn.callsOf("session.active_list")).toHaveLength(5);
   });
 
+  it("dates each agent by its newest listed session, not only the profile's last session", async () => {
+    const conn = new FakeHermesConnection("default");
+    const fresh = new FakeHermesConnection("fresh");
+    const { adapter } = makeAdapter({ default: conn, fresh });
+    conn.onMethod("profiles.list", () => ({
+      profiles: [
+        { name: "default", model: "m", last_session: { id: "a", last_active: 100 } },
+        { name: "fresh", model: "m" },
+      ],
+    }));
+    conn.onMethod("session.list", ({ scope }) =>
+      scope === "stored"
+        ? {
+            sessions: [
+              { session_id: "b", updated_at: 300 },
+              { session_id: "c", started_at: 200 },
+            ],
+          }
+        : { sessions: [] },
+    );
+    fresh.onMethod("session.list", () => ({ sessions: [] }));
+    const agents = await adapter.listAgents();
+    expect(agents.map((agent) => [agent.agentRef, agent.lastActivityAt])).toEqual([
+      ["default", 300_000],
+      ["fresh", null],
+    ]);
+  });
+
   it.effect(
     "restores an unread reply across interleaved sessions and restart and deduplicates an alias replay",
     () =>

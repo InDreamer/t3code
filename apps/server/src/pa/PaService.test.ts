@@ -537,6 +537,35 @@ describe("PaService", () => {
   );
 
   it.effect(
+    "dates a Bot without engine activity by its last finished turn, creation or first open",
+    () =>
+      Effect.gen(function* () {
+        const { engine } = makeEngine({
+          listAgents: async () => [
+            row("active", { lastActivityAt: 10, lastReplyAt: 30 }),
+            row("finished"),
+            row("created"),
+            row("opened"),
+            row("unknown"),
+          ],
+        });
+        const { service, store } = makeService([engine]);
+        store.updateBotMeta("fake:finished", { lastCompletedAt: 20 });
+        store.updateBotMeta("fake:created", { createdAt: 15, lastReadAt: 25 });
+        store.updateBotMeta("fake:opened", { lastReadAt: 5 });
+
+        const { bots } = yield* service.listBots();
+        expect(bots.map((bot) => [bot.agentRef, bot.lastActivityAt])).toEqual([
+          ["active", 30],
+          ["finished", 20],
+          ["created", 15],
+          ["opened", 5],
+          ["unknown", null],
+        ]);
+      }),
+  );
+
+  it.effect(
     "coalesces roster reads, keeps offline bots and disposes their feeds only on a confirmed removal",
     () =>
       Effect.gen(function* () {
@@ -1073,6 +1102,7 @@ describe("PaService", () => {
         expect(latest).toEqual({
           messages: [expect.objectContaining({ id: "row-1", rowId: 1 })],
           nextCursor: null,
+          pageTag: expect.any(String),
         });
         const older = yield* service.getMessages({
           botId: "fake:main",
@@ -1235,4 +1265,325 @@ describe("PaService", () => {
       expect(calls).toEqual(["cancel:q1", "steer:nudge", "steer:q2"]);
     }),
   );
+
+  it.effect(
+    "bundles the latest page on subscribeSession, answers pageUnchanged on matching tags, and skips reads on warm replay",
+    () =>
+      Effect.gen(function* () {
+        let messageText = "Hello v1";
+        let pageStarted: ReturnType<typeof Promise.withResolvers<void>> | null = null;
+        let pageGate: ReturnType<typeof Promise.withResolvers<void>> | null = null;
+        const getMessages = vi.fn(
+          async (_ref: string, _sessionId: string, opts: { limit: number }) => {
+            pageStarted?.resolve();
+            if (pageGate) await pageGate.promise;
+            return {
+              messages: [
+                {
+                  id: "row-1",
+                  rowId: 1,
+                  role: "assistant" as const,
+                  text: messageText,
+                  timestamp: 1_000,
+                  rowKind: "message" as const,
+                },
+              ],
+              nextCursor: opts.limit < 100 ? "older-1" : null,
+              reset: false,
+            };
+          },
+        );
+        const { engine, feeds } = makeEngine({ getMessages });
+        const { service } = makeService([engine]);
+
+        // 1. Cold open with latestPage bundles page + pageTag and buffers live events arriving mid-read.
+        pageStarted = Promise.withResolvers<void>();
+        pageGate = Promise.withResolvers<void>();
+        const coldFiber = yield* service
+          .subscribeSession({
+            botId: "fake:main",
+            sessionId: "s-1",
+            protocolVersion: 3,
+            latestPage: { limit: 40 },
+          })
+          .pipe(Stream.take(2), Stream.runCollect, Effect.forkChild({ startImmediately: true }));
+        yield* Effect.promise(() => pageStarted!.promise);
+        feeds[0]!.onEvent({ type: "turn.started", sessionId: "s-1" });
+        pageGate.resolve();
+        pageStarted = null;
+        pageGate = null;
+        const coldEvents = Array.from(yield* Fiber.join(coldFiber));
+        expect(coldEvents[0]).toMatchObject({
+          type: "snapshot",
+          pageTag: expect.any(String),
+          page: {
+            messages: [expect.objectContaining({ id: "row-1", text: "Hello v1" })],
+            nextCursor: "older-1",
+          },
+        });
+        expect(coldEvents[1]).toMatchObject({ type: "turn.started" });
+        expect(getMessages).toHaveBeenCalledTimes(1);
+        const tagV1 = (coldEvents[0] as Extract<(typeof coldEvents)[number], { type: "snapshot" }>)
+          .pageTag!;
+
+        // 2. Warm resume with valid token and no terminal replay skips getMessages completely.
+        const warmEvents = Array.from(
+          yield* service
+            .subscribeSession({
+              botId: "fake:main",
+              sessionId: "s-1",
+              protocolVersion: 3,
+              resumeToken: coldEvents[1]!.resumeToken,
+              latestPage: { limit: 40, knownPageTag: tagV1 },
+            })
+            .pipe(Stream.take(1), Stream.runCollect),
+        );
+        expect(warmEvents[0]).toMatchObject({ type: "snapshot", snapshotRequired: false });
+        expect(getMessages).toHaveBeenCalledTimes(1);
+
+        // 3. Cold reopen with matching knownPageTag answers pageUnchanged with no page body.
+        const unchangedEvents = Array.from(
+          yield* service
+            .subscribeSession({
+              botId: "fake:main",
+              sessionId: "s-1",
+              protocolVersion: 3,
+              latestPage: { limit: 40, knownPageTag: tagV1 },
+            })
+            .pipe(Stream.take(1), Stream.runCollect),
+        );
+        expect(unchangedEvents[0]).toMatchObject({
+          type: "snapshot",
+          pageTag: tagV1,
+          pageUnchanged: true,
+        });
+        expect(
+          (unchangedEvents[0] as Extract<(typeof unchangedEvents)[number], { type: "snapshot" }>)
+            .page,
+        ).toBeUndefined();
+        expect(getMessages).toHaveBeenCalledTimes(2);
+
+        // 4. Rewriting text under the same rowId changes pageTag and delivers the updated page.
+        messageText = "Hello v2 edited";
+        const editedEvents = Array.from(
+          yield* service
+            .subscribeSession({
+              botId: "fake:main",
+              sessionId: "s-1",
+              protocolVersion: 3,
+              latestPage: { limit: 40, knownPageTag: tagV1 },
+            })
+            .pipe(Stream.take(1), Stream.runCollect),
+        );
+        const editedSnap = editedEvents[0] as Extract<
+          (typeof editedEvents)[number],
+          { type: "snapshot" }
+        >;
+        expect(editedSnap.pageUnchanged).toBeUndefined();
+        expect(editedSnap.pageTag).not.toBe(tagV1);
+        expect(editedSnap.page?.messages[0]?.text).toBe("Hello v2 edited");
+
+        // 5. Warm resume after a turn completed while detached bundles the refreshed page in 1 RTT.
+        feeds[0]!.onEvent({
+          type: "turn.completed",
+          sessionId: "s-1",
+          status: "complete",
+          replyId: "row-1",
+        });
+        const afterComplete = Array.from(
+          yield* service
+            .subscribeSession({
+              botId: "fake:main",
+              sessionId: "s-1",
+              protocolVersion: 3,
+              resumeToken: coldEvents[1]!.resumeToken,
+              latestPage: { limit: 40, knownPageTag: tagV1 },
+            })
+            .pipe(Stream.take(1), Stream.runCollect),
+        );
+        expect(afterComplete[0]).toMatchObject({
+          type: "snapshot",
+          page: { messages: [expect.objectContaining({ text: "Hello v2 edited" })] },
+        });
+        service.dispose();
+      }),
+  );
+
+  it.effect(
+    "memoizes rapid listBots calls within rosterCacheTtlMs while preserving live metadata",
+    () =>
+      Effect.gen(function* () {
+        const listAgents = vi.fn(async () => [
+          row("main", { isDefault: true, lastActivityAt: 10 }),
+        ]);
+        const { engine } = makeEngine({
+          listAgents,
+          capabilities: { ...CORE_ONLY, lifecycle: { create: true, delete: false } },
+          lifecycle: { create: async ({ agentRef }) => ({ agentRef }) },
+        });
+        const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-pa-memo-"));
+        tempDirs.push(dir);
+        const store = new PaStore(dir);
+        const service = makePaService({ store, instances: [engine], rosterCacheTtlMs: 60_000 });
+
+        yield* service.listBots();
+        yield* service.updateBotMeta({ botId: "fake:main", name: "Live Name" });
+        const second = yield* service.listBots();
+        expect(listAgents).toHaveBeenCalledTimes(1);
+        expect(second.bots[0]?.name).toBe("Live Name");
+
+        listAgents.mockResolvedValueOnce([
+          row("main", { isDefault: true }),
+          row("fresh", { name: "Fresh" }),
+        ]);
+        yield* service.createBot({ instanceId: "fake", agentRef: "fresh" });
+        expect(listAgents).toHaveBeenCalledTimes(2);
+        service.dispose();
+      }),
+  );
+
+  it.effect(
+    "preserves persistent notices and session updates across terminal replay, invalidates roster memo on completion, and falls back when page read fails",
+    () =>
+      Effect.gen(function* () {
+        let failReads = false;
+        const listAgents = vi.fn(async () => [
+          row("main", { isDefault: true, running: true, lastActivityAt: 10 }),
+        ]);
+        const getMessages = vi.fn(async () => {
+          if (failReads) throw new Error("storage offline");
+          return {
+            messages: [
+              {
+                id: "row-1",
+                rowId: 1,
+                role: "assistant" as const,
+                text: "Done",
+                timestamp: 100,
+                rowKind: "message" as const,
+              },
+            ],
+            nextCursor: null,
+            reset: false,
+          };
+        });
+        const { engine, feeds } = makeEngine({ listAgents, getMessages });
+        const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-pa-review-"));
+        tempDirs.push(dir);
+        const store = new PaStore(dir);
+        const service = makePaService({ store, instances: [engine], rosterCacheTtlMs: 60_000 });
+
+        yield* service.listBots();
+        expect(listAgents).toHaveBeenCalledTimes(1);
+
+        const initial = Array.from(
+          yield* service
+            .subscribeSession({
+              botId: "fake:main",
+              sessionId: "s-1",
+              protocolVersion: 3,
+              latestPage: { limit: 50 },
+            })
+            .pipe(Stream.take(1), Stream.runCollect),
+        );
+        const token0 = initial[0]!.resumeToken;
+        expect(initial[0]).toMatchObject({ type: "snapshot", protocolVersion: 3 });
+
+        // Detached events: notice + session.updated + deltas + turn.completed.
+        feeds[0]!.onEvent({
+          type: "notice",
+          sessionId: "s-1",
+          message: "Ran /compact",
+          persistent: true,
+        });
+        feeds[0]!.onEvent({
+          type: "session.updated",
+          sessionId: "s-1",
+          title: "Renamed",
+        });
+        feeds[0]!.onEvent({
+          type: "text.delta",
+          sessionId: "s-1",
+          role: "answer",
+          text: "partial",
+        });
+        feeds[0]!.onEvent({
+          type: "turn.completed",
+          sessionId: "s-1",
+          status: "complete",
+          replyId: "row-1",
+        });
+
+        // Completion must invalidate the 2s roster memo so listBots sees the fresh non-running state.
+        listAgents.mockResolvedValueOnce([
+          row("main", { isDefault: true, running: false, lastActivityAt: 20 }),
+        ]);
+        const refreshedRoster = yield* service.listBots();
+        expect(listAgents).toHaveBeenCalledTimes(2);
+        expect(refreshedRoster.bots[0]?.running).toBe(false);
+
+        // Reconnect replays notice + session.updated before the bundled v3 snapshot, dropping stale delta.
+        const resumed = Array.from(
+          yield* service
+            .subscribeSession({
+              botId: "fake:main",
+              sessionId: "s-1",
+              protocolVersion: 3,
+              resumeToken: token0,
+              latestPage: { limit: 50 },
+            })
+            .pipe(Stream.take(3), Stream.runCollect),
+        );
+        expect(resumed.map((e) => e.type)).toEqual(["notice", "session.updated", "snapshot"]);
+        expect(resumed[2]).toMatchObject({
+          type: "snapshot",
+          protocolVersion: 3,
+          page: { messages: [expect.objectContaining({ text: "Done" })] },
+        });
+
+        // If the bundled page read fails, the v3 snapshot still delivers so the client can fall back.
+        failReads = true;
+        const degraded = Array.from(
+          yield* service
+            .subscribeSession({
+              botId: "fake:main",
+              sessionId: "s-1",
+              protocolVersion: 3,
+              latestPage: { limit: 50 },
+            })
+            .pipe(Stream.take(1), Stream.runCollect),
+        );
+        expect(degraded[0]).toMatchObject({ type: "snapshot", protocolVersion: 3 });
+        expect(
+          (degraded[0] as Extract<(typeof degraded)[number], { type: "snapshot" }>).page,
+        ).toBeUndefined();
+        service.dispose();
+      }),
+  );
+
+  it("forgets cached attachment owner knowledge on forget and clears stale alias on self-bind", async () => {
+    const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "pa-owner-cache-"));
+    tempDirs.push(dir);
+    const store = new PaAttachmentStore(dir, dir);
+    const id = createPendingAttachmentId(".txt");
+    NodeFS.writeFileSync(NodePath.join(dir, id + ".txt"), "hi");
+    const item: PaAttachment = {
+      type: "file",
+      id,
+      name: "note.txt",
+      mimeType: "text/plain",
+      sizeBytes: 2,
+    };
+    await store.claim("bot", "canon", "in-1", "hi", [item], { files: true, images: true });
+    store.markOwnerKnown("bot", "s-self", "s-self");
+    expect(store.needsOwnerLookup("bot", "s-self")).toBe(false);
+    store.forget("bot", "s-self");
+    expect(store.needsOwnerLookup("bot", "s-self")).toBe(true);
+
+    store.bindSession("bot", "alias", "canon");
+    expect(store.find("bot", "alias", "in-1")).toBeDefined();
+    store.markOwnerKnown("bot", "alias", "alias");
+    expect(store.find("bot", "alias", "in-1")).toBeUndefined();
+    expect(store.find("bot", "canon", "in-1")).toBeDefined();
+  });
 });

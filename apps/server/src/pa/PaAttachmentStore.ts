@@ -85,9 +85,14 @@ export class PaAttachmentStore {
   private readonly stateDir: string;
   private readonly attachmentsDir: string;
   private readonly recent = new Map<string, AttachmentRecord[]>();
+  private readonly ownerKnown = new Set<string>();
   constructor(stateDir: string, attachmentsDir: string) {
     this.stateDir = stateDir;
     this.attachmentsDir = attachmentsDir;
+  }
+
+  private ownerCacheKey(botId: string, sessionId: string) {
+    return `${botId}\u0000${sessionId}`;
   }
 
   private file(botId: string, sessionId: string) {
@@ -114,33 +119,75 @@ export class PaAttachmentStore {
     return file;
   }
 
+  private rememberOwnerKnown(botId: string, sessionId: string) {
+    const key = this.ownerCacheKey(botId, sessionId);
+    this.ownerKnown.delete(key);
+    if (this.ownerKnown.size >= 2_048) {
+      const oldest = this.ownerKnown.values().next().value;
+      if (oldest !== undefined) this.ownerKnown.delete(oldest);
+    }
+    this.ownerKnown.add(key);
+  }
+
+  private clearOwnerKnown(botId: string) {
+    const prefix = `${botId}\u0000`;
+    for (const key of Array.from(this.ownerKnown)) {
+      if (key.startsWith(prefix)) this.ownerKnown.delete(key);
+    }
+  }
+
   needsOwnerLookup(botId: string, sessionId: string) {
+    if (this.ownerKnown.has(this.ownerCacheKey(botId, sessionId))) return false;
     const base = NodePath.join(this.stateDir, "pa-attachments");
     if (!NodeFS.existsSync(base)) return false;
     const dir = NodePath.join(base, digest(botId));
     if (!NodeFS.existsSync(dir))
       return NodeFS.readdirSync(base).some((name) => name.endsWith(".json"));
-    return !NodeFS.existsSync(NodePath.join(dir, digest(sessionId) + ".alias"));
+    const hasAlias = NodeFS.existsSync(NodePath.join(dir, digest(sessionId) + ".alias"));
+    if (hasAlias) this.rememberOwnerKnown(botId, sessionId);
+    return !hasAlias;
+  }
+
+  markOwnerKnown(botId: string, sessionId: string, canonicalId: string) {
+    if (sessionId !== canonicalId) {
+      this.bindSession(botId, sessionId, canonicalId);
+      return;
+    }
+    const aliasPath = NodePath.join(
+      this.stateDir,
+      "pa-attachments",
+      digest(botId),
+      digest(sessionId) + ".alias",
+    );
+    NodeFS.rmSync(aliasPath, { force: true });
+    this.rememberOwnerKnown(botId, sessionId);
   }
 
   bindSession(botId: string, sessionId: string, canonicalId: string) {
-    if (sessionId === canonicalId) return;
-    const from = this.file(botId, sessionId);
+    if (sessionId === canonicalId) {
+      this.markOwnerKnown(botId, sessionId, canonicalId);
+      return;
+    }
+    const dir = NodePath.join(this.stateDir, "pa-attachments", digest(botId));
+    const directFrom = NodePath.join(dir, digest(sessionId) + ".json");
     const to = this.file(botId, canonicalId);
-    if (from === to) return;
-    const previous = this.read(from);
-    if (previous.length) {
-      const current = this.read(to);
-      const ids = new Set(current.map((entry) => entry.inputId));
-      this.write(to, [...current, ...previous.filter((entry) => !ids.has(entry.inputId))]);
-      NodeFS.rmSync(from, { force: true });
-      this.recent.delete(from);
+    if (directFrom !== to && NodeFS.existsSync(directFrom)) {
+      const previous = this.read(directFrom);
+      if (previous.length) {
+        const current = this.read(to);
+        const ids = new Set(current.map((entry) => entry.inputId));
+        this.write(to, [...current, ...previous.filter((entry) => !ids.has(entry.inputId))]);
+        NodeFS.rmSync(directFrom, { force: true });
+        this.recent.delete(directFrom);
+      }
     }
     NodeFS.mkdirSync(NodePath.dirname(to), { recursive: true });
     NodeFS.writeFileSync(
       NodePath.join(NodePath.dirname(to), digest(sessionId) + ".alias"),
       NodePath.basename(to, ".json"),
     );
+    this.rememberOwnerKnown(botId, sessionId);
+    this.rememberOwnerKnown(botId, canonicalId);
   }
 
   private cache(file: string, records: AttachmentRecord[]) {
@@ -322,6 +369,7 @@ export class PaAttachmentStore {
   }
 
   forget(botId: string, sessionId?: string) {
+    this.clearOwnerKnown(botId);
     const dir = NodePath.join(this.stateDir, "pa-attachments", digest(botId));
     const files =
       sessionId === undefined

@@ -99,6 +99,8 @@ export interface PaBotLocalMeta {
   readonly primarySessionId?: string | undefined;
   readonly lastCompletedAt?: number | undefined;
   readonly lastReadAt?: number | undefined;
+  /** When T3 created the Bot; dates it in the roster until it has activity of its own. */
+  readonly createdAt?: number | undefined;
 }
 
 interface PaStoreData {
@@ -168,6 +170,7 @@ function sanitizeBotMeta(raw: unknown): { meta: PaBotLocalMeta; clean: boolean }
   keep("primarySessionId", isString);
   keep("lastCompletedAt", (value) => typeof value === "number" && Number.isFinite(value));
   keep("lastReadAt", (value) => typeof value === "number" && Number.isFinite(value));
+  keep("createdAt", (value) => typeof value === "number" && Number.isFinite(value));
   return { meta: meta as PaBotLocalMeta, clean };
 }
 

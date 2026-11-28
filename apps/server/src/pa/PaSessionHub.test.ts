@@ -150,6 +150,35 @@ describe("PaSessionHub", () => {
     expect(foreign.events[0]!.resumeToken).toBe(resumed.events.at(-1)!.resumeToken);
   });
 
+  it("delivers replay events before the authoritative snapshot when replayBeforeSnapshot is enabled", async () => {
+    const { hub, emit, delta } = makeHub({ capacity: 8 });
+    const first = listen();
+    const detach = await hub.attach(first.listener);
+    emit({ type: "turn.started", sessionId: "s-1" });
+    const cursor = first.events.at(-1)!.resumeToken;
+    detach();
+
+    // While detached, turn 1 finished and turn 2 started streaming.
+    emit({ type: "turn.completed", sessionId: "s-1", status: "complete", replyId: "r1" });
+    emit({ type: "turn.started", sessionId: "s-1" });
+    emit(delta("turn 2"));
+
+    const resumed = listen();
+    await hub.attach(resumed.listener, cursor, { replayBeforeSnapshot: true });
+    expect(resumed.events.map((e) => e.type)).toEqual([
+      "turn.completed",
+      "turn.started",
+      "text.delta",
+      "snapshot",
+    ]);
+    expect(resumed.events.at(-1)).toMatchObject({
+      type: "snapshot",
+      running: true,
+      snapshotRequired: false,
+      resumeToken: resumed.events[2]!.resumeToken,
+    });
+  });
+
   it("keeps unknown admissions actionable during the idle linger", async () => {
     const { hub, emit, clock, isDisposed } = makeHub();
     const detach = await hub.attach(listen().listener);

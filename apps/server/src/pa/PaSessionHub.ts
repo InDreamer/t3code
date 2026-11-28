@@ -15,6 +15,8 @@ import type { PaAdapterEvent, PaSessionSubscriber } from "./types.ts";
 
 export interface PaHubListener {
   readonly onEvent: (event: PaStreamEvent) => void;
+  /** Optional hook receiving the synthetic attach snapshot so callers can distinguish it from replayed upstream snapshots. */
+  readonly onAttachSnapshot?: (event: Extract<PaStreamEvent, { type: "snapshot" }>) => void;
   readonly onFail: (error: PaError) => void;
 }
 
@@ -320,7 +322,11 @@ export class PaSessionHub {
     return this.buffer.filter((entry) => entry.seq > seq).map((entry) => entry.event);
   }
 
-  async attach(listener: PaHubListener, resumeToken?: string): Promise<() => void> {
+  async attach(
+    listener: PaHubListener,
+    resumeToken?: string,
+    options?: { readonly replayBeforeSnapshot?: boolean },
+  ): Promise<() => void> {
     await this.ready;
     if (this.disposed) {
       throw new PaError({ reason: "Unavailable", message: "The session feed closed" });
@@ -330,19 +336,29 @@ export class PaSessionHub {
       this.lingerTimer = null;
     }
     const replay = this.replayAfter(resumeToken);
-    listener.onEvent({
+    const replayFirst =
+      options?.replayBeforeSnapshot === true && replay !== null && replay.length > 0;
+    if (replayFirst) {
+      for (const event of replay) listener.onEvent(event);
+    }
+    const attachSnapshot: Extract<PaStreamEvent, { type: "snapshot" }> = {
       type: "snapshot",
       sessionId: this.sessionId,
       resumeToken:
-        replay !== null && resumeToken !== undefined ? resumeToken : this.token(this.seq),
+        !replayFirst && replay !== null && resumeToken !== undefined
+          ? resumeToken
+          : this.token(this.seq),
       running: this.running,
       openRequests: this.openRequests,
       snapshotRequired: resumeToken !== undefined && replay === null,
       queuedItems: this.queuedItems,
       usage: this.usage,
       todos: this.todos,
-    });
-    for (const event of replay ?? []) listener.onEvent(event);
+    };
+    (listener.onAttachSnapshot ?? listener.onEvent)(attachSnapshot);
+    if (!replayFirst) {
+      for (const event of replay ?? []) listener.onEvent(event);
+    }
     this.listeners.add(listener);
     let detached = false;
     return () => {

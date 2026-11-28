@@ -551,6 +551,8 @@ export const PaGetMessagesResult = Schema.Struct({
   nextCursor: Schema.optionalKey(Schema.NullOr(Schema.String)),
   /** The rows the cursor covered changed: this is the newest page again and replaces what is shown. */
   reset: Schema.optionalKey(Schema.Boolean),
+  /** Content digest of this normalized, hydrated latest page (omitted on cursor reads). */
+  pageTag: Schema.optionalKey(Schema.String),
 });
 export type PaGetMessagesResult = typeof PaGetMessagesResult.Type;
 
@@ -733,6 +735,14 @@ export const PaSubscribeSessionInput = Schema.Struct({
   sessionId: PaSessionId,
   /** The last `resumeToken` this client applied; the server replays what followed it if it can. */
   resumeToken: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(200))),
+  /** Requests the newest transcript page bundled with the initial snapshot (1-RTT open). */
+  latestPage: Schema.optionalKey(
+    Schema.Struct({
+      limit: Schema.optionalKey(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 500 }))),
+      /** Digest of the client's cached latest page; matching server pages answer `pageUnchanged`. */
+      knownPageTag: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(128))),
+    }),
+  ),
 });
 export type PaSubscribeSessionInput = typeof PaSubscribeSessionInput.Type;
 
@@ -753,6 +763,14 @@ export const PaStreamEvent = Schema.Union([
     queuedItems: Schema.optionalKey(Schema.Array(PaQueuedItem)),
     usage: Schema.optionalKey(Schema.NullOr(PaContextUsage)),
     todos: Schema.optionalKey(Schema.NullOr(PaTodoState)),
+    /** Latest transcript page bundled on initial open / revalidation when requested. */
+    page: Schema.optionalKey(PaGetMessagesResult),
+    /** Content digest of the normalized, hydrated latest page. */
+    pageTag: Schema.optionalKey(Schema.String),
+    /** True when the server verified the latest page matches `latestPage.knownPageTag`. */
+    pageUnchanged: Schema.optionalKey(Schema.Boolean),
+    /** Negotiated protocol version spoken by the server for this attach snapshot (e.g. 3). */
+    protocolVersion: Schema.optionalKey(Schema.Int),
   }),
   Schema.Struct({
     type: Schema.Literal("queue.updated"),

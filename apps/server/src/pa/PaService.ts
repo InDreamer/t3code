@@ -37,6 +37,7 @@ import {
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
@@ -58,7 +59,16 @@ function nowMs(): number {
 }
 
 const DEFAULT_MESSAGE_LIMIT = 120;
+const INITIAL_SUBSCRIBE_MESSAGE_LIMIT = 50;
 const DEFAULT_SESSION_LIMIT = 30;
+const PRODUCTION_ROSTER_CACHE_TTL_MS = 2_000;
+
+function computePaPageTag(page: PaGetMessagesResult): string {
+  return NodeCrypto.createHash("sha256")
+    .update(JSON.stringify([page.nextCursor ?? null, page.messages]))
+    .digest("base64url")
+    .slice(0, 32);
+}
 
 const isPaError = Schema.is(PaError);
 
@@ -160,6 +170,8 @@ export function makePaService(options: {
   readonly attachmentStore?: PaAttachmentStore;
   readonly instances: ReadonlyArray<PaEngineInstance>;
   readonly hub?: PaHubOptions;
+  /** Short TTL for reusing recent roster rows across rapid polls/surfaces; 0 disables. */
+  readonly rosterCacheTtlMs?: number;
 }): PaServiceInternals {
   const { store } = options;
   const instances = new Map(options.instances.map((instance) => [instance.instanceId, instance]));
@@ -167,6 +179,8 @@ export function makePaService(options: {
   const botHubs = new Map<string, Set<PaSessionHub>>();
   const instanceReads = new Map<string, Promise<ReadonlyArray<PaAgentRow>>>();
   const lastRosters = new Map<string, ReadonlyArray<PaAgentRow>>();
+  const lastRosterAt = new Map<string, number>();
+  const rosterCacheTtlMs = Math.max(0, options.rosterCacheTtlMs ?? 0);
   const hubOwners = new Map<string, string>();
   const hubOptions = options.hub ?? DEFAULT_PA_HUB_OPTIONS;
   // Events a slow client may lag behind before its stream is cut and it resumes. It must hold a
@@ -231,7 +245,9 @@ export function makePaService(options: {
           meta.replies?.some((reply) => !reply.read) === true ||
           meta.progress?.some((entry) => entry.unread !== undefined) === true),
       lastMessagePreview: row.lastMessagePreview,
-      lastActivityAt: row.lastActivityAt,
+      // A Bot with no activity yet is dated by when it was made, or else first opened here.
+      lastActivityAt:
+        Math.max(row.lastActivityAt ?? 0, completedAt) || meta.createdAt || meta.lastReadAt || null,
       primarySessionId: meta.primarySessionId ?? null,
     };
   };
@@ -338,7 +354,10 @@ export function makePaService(options: {
           if (parsePaBotId(botId)?.instanceId === id && !present.has(botId))
             for (const hub of sessions) hub.removeBot();
         }
-        if (instanceReads.get(id) === read) lastRosters.set(id, confirmed);
+        if (instanceReads.get(id) === read) {
+          lastRosters.set(id, confirmed);
+          lastRosterAt.set(id, nowMs());
+        }
         return confirmed;
       })
       .finally(() => {
@@ -354,22 +373,39 @@ export function makePaService(options: {
     });
 
   const listBots = Effect.fn("PaService.listBots")(function* () {
+    const now = nowMs();
     const results = yield* Effect.forEach(
       Array.from(instances.values()),
-      (instance) =>
-        fromPromise(() => readRoster(instance)).pipe(
+      (instance) => {
+        const cached = lastRosters.get(instance.instanceId);
+        const cachedAt = lastRosterAt.get(instance.instanceId);
+        if (
+          rosterCacheTtlMs > 0 &&
+          cached !== undefined &&
+          cachedAt !== undefined &&
+          now - cachedAt < rosterCacheTtlMs &&
+          !instanceReads.has(instance.instanceId)
+        ) {
+          return Effect.succeed({
+            status: status(instance, { botCount: cached.length, error: null }),
+            bots: cached.map((row) => summarize(instance, row)),
+          });
+        }
+        return fromPromise(() => readRoster(instance)).pipe(
           Effect.map((rows) => ({
             status: status(instance, { botCount: rows.length, error: null }),
             bots: rows.map((row) => summarize(instance, row)),
           })),
           Effect.catch((error) => {
+            lastRosterAt.delete(instance.instanceId);
             const rows = lastRosters.get(instance.instanceId) ?? [];
             return Effect.succeed({
               status: status(instance, { botCount: rows.length, error: error.message }),
               bots: rows.map((row) => ({ ...summarize(instance, row), online: false })),
             });
           }),
-        ),
+        );
+      },
       { concurrency: 3 },
     );
     return {
@@ -398,16 +434,19 @@ export function makePaService(options: {
       }),
     );
     const botId = makePaBotId(instance.instanceId, agentRef);
+    const createdAt = nowMs();
     yield* fromSync(() =>
       store.updateBotMeta(botId, {
         displayName: input.name?.trim() || agentRef,
         avatarColor: input.avatarColor,
         avatarShape: input.avatarShape,
         pinned: input.pinned ?? false,
-        lastReadAt: nowMs(),
+        lastReadAt: createdAt,
+        createdAt,
       }),
     );
     yield* finishPriorRosterRead(instance);
+    lastRosterAt.delete(instance.instanceId);
     const rows = yield* fromPromise(() => readRoster(instance));
     const row = rows.find((entry) => entry.agentRef === agentRef);
     if (!row) {
@@ -624,42 +663,57 @@ export function makePaService(options: {
   ) => {
     const ownerId =
       (await instance.attachmentSessionId?.(agentRef, sessionId, readOnly)) ?? sessionId;
-    if (ownerId !== sessionId) options.attachmentStore?.bindSession(botId, sessionId, ownerId);
+    options.attachmentStore?.markOwnerKnown(botId, sessionId, ownerId);
     return ownerId;
   };
 
-  const getMessages = Effect.fn("PaService.getMessages")(function* (input: PaGetMessagesInput) {
-    const { instance, agentRef } = yield* resolveBot(input.botId);
-    const page = yield* fromPromise(() =>
-      instance.getMessages(agentRef, input.sessionId, {
-        limit: input.limit ?? DEFAULT_MESSAGE_LIMIT,
-        cursor: input.cursor,
-      }),
-    );
-    const reply =
-      !input.cursor && latestTranscriptReply(ownerFor(input.botId, input.sessionId), page.messages);
-    if (reply) yield* fromSync(() => store.rememberReplies(input.botId, [reply], "history"));
-    return {
-      messages: yield* fromPromise(async () => {
-        const storage = options.attachmentStore;
-        if (!storage) return page.messages;
-        if (!page.messages.some((row) => row.role === "user")) return page.messages;
-        const ownerId = storage.needsOwnerLookup(input.botId, input.sessionId)
-          ? await attachmentSession(instance, agentRef, input.botId, input.sessionId, true).catch(
-              () => input.sessionId,
-            )
-          : input.sessionId;
-        return storage.hydrate(input.botId, ownerId, page.messages);
-      }).pipe(
-        Effect.catch(() =>
-          Effect.logWarning("PA attachment history could not be hydrated").pipe(
-            Effect.as(page.messages),
-          ),
+  const readMessagesPage = Effect.fn("PaService.readMessagesPage")(function* (
+    instance: PaEngineInstance,
+    agentRef: string,
+    botId: string,
+    sessionId: string,
+    pageOptions: { readonly limit: number; readonly cursor?: string | undefined },
+  ) {
+    const page = yield* fromPromise(() => instance.getMessages(agentRef, sessionId, pageOptions));
+    const knownOwner = ownerFor(botId, sessionId);
+    const reply = !pageOptions.cursor && latestTranscriptReply(knownOwner, page.messages);
+    if (reply) yield* fromSync(() => store.rememberReplies(botId, [reply], "history"));
+    const messages = yield* fromPromise(async () => {
+      const storage = options.attachmentStore;
+      if (!storage) return page.messages;
+      if (!page.messages.some((row) => row.role === "user")) return page.messages;
+      const ownerId =
+        knownOwner !== sessionId
+          ? knownOwner
+          : storage.needsOwnerLookup(botId, sessionId)
+            ? await attachmentSession(instance, agentRef, botId, sessionId, true).catch(
+                () => sessionId,
+              )
+            : sessionId;
+      return storage.hydrate(botId, ownerId, page.messages);
+    }).pipe(
+      Effect.catch(() =>
+        Effect.logWarning("PA attachment history could not be hydrated").pipe(
+          Effect.as(page.messages),
         ),
       ),
+    );
+    const result: PaGetMessagesResult = {
+      messages,
       nextCursor: page.nextCursor,
       ...(page.reset ? { reset: true } : {}),
     };
+    return pageOptions.cursor === undefined
+      ? { ...result, pageTag: computePaPageTag(result) }
+      : result;
+  });
+
+  const getMessages = Effect.fn("PaService.getMessages")(function* (input: PaGetMessagesInput) {
+    const { instance, agentRef } = yield* resolveBot(input.botId);
+    return yield* readMessagesPage(instance, agentRef, input.botId, input.sessionId, {
+      limit: input.limit ?? DEFAULT_MESSAGE_LIMIT,
+      cursor: input.cursor,
+    });
   });
 
   const requiredScopeForMessage = Effect.fn("PaService.requiredScopeForMessage")(function* (
@@ -932,7 +986,7 @@ export function makePaService(options: {
               ownerId = id;
               try {
                 store.bindReplySession(botId, sessionId, id);
-                options.attachmentStore?.bindSession(botId, sessionId, id);
+                options.attachmentStore?.markOwnerKnown(botId, sessionId, id);
               } catch {
                 process.emitWarning("PA attachment session alias could not be recorded");
               }
@@ -990,6 +1044,14 @@ export function makePaService(options: {
               )
                 void checkHistory();
               subscriber.onEvent(enriched);
+              if (
+                event.type === "turn.completed" ||
+                event.type === "error" ||
+                event.type === "request.opened" ||
+                event.type === "request.resolved"
+              ) {
+                lastRosterAt.delete(instance.instanceId);
+              }
               if (event.type === "request.resolved")
                 settleRequests(botId, ownerId, event.requestId, hubs.get(key));
             },
@@ -1017,37 +1079,171 @@ export function makePaService(options: {
         Effect.map(({ instance, agentRef, botId }) =>
           Stream.callback<PaStreamEvent, PaError>(
             (queue) =>
-              Effect.acquireRelease(
-                fromPromise(() =>
-                  hubFor(instance, agentRef, botId, input.sessionId).attach(
-                    {
-                      onEvent: (event) => {
-                        const compatible =
-                          (input.protocolVersion ?? 1) >= 2 ? event : legacyEvent(event);
-                        if (!compatible) return;
-                        if (!Queue.offerUnsafe(queue, compatible)) {
-                          // A slow reader must not silently lose events: cut it off so it
-                          // resumes from the last token it applied.
-                          Queue.failCauseUnsafe(
-                            queue,
-                            Cause.fail(
-                              new PaError({
-                                reason: "Unavailable",
-                                message: "The session stream fell behind; reconnecting.",
-                              }),
-                            ),
-                          );
-                        }
+              Effect.gen(function* () {
+                const runFork = Effect.runForkWith(yield* Effect.context<never>());
+                const protocolVersion = input.protocolVersion ?? 1;
+                const latestPage = input.latestPage;
+                let detached = false;
+                let bootstrapping = latestPage !== undefined;
+                let attachSnapshotSeen = false;
+                let maxHeldAfter = subscriberBuffer;
+                let pageFiber: Fiber.Fiber<void, never> | null = null;
+                const heldBeforeSnapshot: PaStreamEvent[] = [];
+                const heldAfterSnapshot: PaStreamEvent[] = [];
+
+                const failLagging = () => {
+                  detached = true;
+                  if (pageFiber) {
+                    const active = pageFiber;
+                    pageFiber = null;
+                    runFork(Fiber.interrupt(active));
+                  }
+                  // A slow reader must not silently lose events: cut it off so it
+                  // resumes from the last token it applied.
+                  Queue.failCauseUnsafe(
+                    queue,
+                    Cause.fail(
+                      new PaError({
+                        reason: "Unavailable",
+                        message: "The session stream fell behind; reconnecting.",
+                      }),
+                    ),
+                  );
+                };
+
+                const emit = (event: PaStreamEvent): boolean => {
+                  if (detached) return false;
+                  const compatible = protocolVersion >= 2 ? event : legacyEvent(event);
+                  if (!compatible) return true;
+                  if (!Queue.offerUnsafe(queue, compatible)) {
+                    failLagging();
+                    return false;
+                  }
+                  return true;
+                };
+
+                const tagSnapshot = (
+                  snapshot: Extract<PaStreamEvent, { type: "snapshot" }>,
+                ): Extract<PaStreamEvent, { type: "snapshot" }> =>
+                  protocolVersion >= 3 ? { ...snapshot, protocolVersion: 3 } : snapshot;
+
+                const flushBootstrap = (
+                  pre: ReadonlyArray<PaStreamEvent>,
+                  snapshot: Extract<PaStreamEvent, { type: "snapshot" }>,
+                  post: ReadonlyArray<PaStreamEvent>,
+                ) => {
+                  bootstrapping = false;
+                  for (const event of pre) if (!emit(event)) return;
+                  if (!emit(snapshot)) return;
+                  for (const event of post) if (!emit(event)) return;
+                };
+
+                const handleAttachSnapshot = (
+                  event: Extract<PaStreamEvent, { type: "snapshot" }>,
+                ) => {
+                  if (detached) return;
+                  const stamped = tagSnapshot(event);
+                  if (!bootstrapping) {
+                    emit(stamped);
+                    return;
+                  }
+                  attachSnapshotSeen = true;
+                  const lastTerminalIndex = heldBeforeSnapshot.findLastIndex(
+                    (entry) => entry.type === "turn.completed" || entry.type === "error",
+                  );
+                  const sawReplayTerminal = lastTerminalIndex >= 0;
+                  const needsPage =
+                    input.resumeToken === undefined ||
+                    stamped.snapshotRequired ||
+                    sawReplayTerminal;
+                  if (!needsPage) {
+                    flushBootstrap(heldBeforeSnapshot, stamped, []);
+                    return;
+                  }
+                  const limit = latestPage?.limit ?? INITIAL_SUBSCRIBE_MESSAGE_LIMIT;
+                  const knownPageTag = latestPage?.knownPageTag;
+                  // Keep non-turn-scoped events (command notices, title/model updates) even when
+                  // earlier turns are superseded by the bundled latest page.
+                  const pre = sawReplayTerminal
+                    ? heldBeforeSnapshot.filter(
+                        (entry, idx) =>
+                          idx > lastTerminalIndex ||
+                          entry.type === "notice" ||
+                          entry.type === "session.updated",
+                      )
+                    : heldBeforeSnapshot;
+                  maxHeldAfter = Math.max(0, subscriberBuffer - heldBeforeSnapshot.length - 1);
+                  pageFiber = runFork(
+                    readMessagesPage(instance, agentRef, botId, input.sessionId, { limit }).pipe(
+                      Effect.match({
+                        onSuccess: (page) => {
+                          pageFiber = null;
+                          if (detached) return;
+                          const pageTag = page.pageTag ?? computePaPageTag(page);
+                          const enrichedSnapshot: Extract<PaStreamEvent, { type: "snapshot" }> =
+                            knownPageTag !== undefined && knownPageTag === pageTag
+                              ? { ...stamped, pageTag, pageUnchanged: true }
+                              : { ...stamped, page, pageTag };
+                          flushBootstrap(pre, enrichedSnapshot, heldAfterSnapshot);
+                        },
+                        onFailure: () => {
+                          pageFiber = null;
+                          if (detached) return;
+                          // On a history read failure, still deliver the live snapshot so the client falls back.
+                          flushBootstrap(heldBeforeSnapshot, stamped, heldAfterSnapshot);
+                        },
+                      }),
+                    ),
+                  );
+                };
+
+                yield* Effect.acquireRelease(
+                  fromPromise(() =>
+                    hubFor(instance, agentRef, botId, input.sessionId).attach(
+                      {
+                        onEvent: (event) => {
+                          if (detached) return;
+                          if (!bootstrapping) {
+                            emit(event);
+                            return;
+                          }
+                          if (!attachSnapshotSeen) {
+                            heldBeforeSnapshot.push(event);
+                            return;
+                          }
+                          if (heldAfterSnapshot.length >= maxHeldAfter) {
+                            failLagging();
+                            return;
+                          }
+                          heldAfterSnapshot.push(event);
+                        },
+                        onAttachSnapshot: handleAttachSnapshot,
+                        onFail: (error) => {
+                          detached = true;
+                          if (pageFiber) {
+                            const active = pageFiber;
+                            pageFiber = null;
+                            runFork(Fiber.interrupt(active));
+                          }
+                          Queue.failCauseUnsafe(queue, Cause.fail(error));
+                        },
                       },
-                      onFail: (error) => {
-                        Queue.failCauseUnsafe(queue, Cause.fail(error));
-                      },
-                    },
-                    input.resumeToken,
+                      input.resumeToken,
+                      { replayBeforeSnapshot: protocolVersion >= 3 },
+                    ),
                   ),
-                ),
-                (detach) => Effect.sync(detach),
-              ),
+                  (detach) =>
+                    Effect.sync(() => {
+                      detached = true;
+                      detach();
+                      if (pageFiber) {
+                        const active = pageFiber;
+                        pageFiber = null;
+                        runFork(Fiber.interrupt(active));
+                      }
+                    }),
+                );
+              }),
             { bufferSize: subscriberBuffer, strategy: "dropping" },
           ),
         ),
@@ -1081,6 +1277,7 @@ export function makePaService(options: {
       for (const hub of Array.from(hubs.values())) hub.dispose();
       instanceReads.clear();
       lastRosters.clear();
+      lastRosterAt.clear();
       hubOwners.clear();
       for (const instance of instances.values()) instance.dispose?.();
     },
@@ -1096,6 +1293,7 @@ export const layer = Layer.effect(
       store,
       attachmentStore: new PaAttachmentStore(config.stateDir, config.attachmentsDir),
       instances: [new HermesPaAdapter({ store })],
+      rosterCacheTtlMs: PRODUCTION_ROSTER_CACHE_TTL_MS,
     });
     yield* Effect.addFinalizer(() => Effect.sync(service.dispose));
     return service;

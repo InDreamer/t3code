@@ -565,6 +565,13 @@ export class HermesPaAdapter implements PaEngineInstance {
       normalizeHermesTimestamp(
         session.last_active_at ?? session.updated_at ?? session.last_active,
       ) ?? 0;
+    const latest = Math.max(
+      agent.lastActivityAt ?? 0,
+      ...Array.from(
+        sessions.values(),
+        (session) => activity(session) || (normalizeHermesTimestamp(session.started_at) ?? 0),
+      ),
+    );
     const candidates = [...sessions]
       .filter(([, session]) => {
         const updated = normalizeHermesTimestamp(session.last_active_at ?? session.updated_at);
@@ -587,6 +594,7 @@ export class HermesPaAdapter implements PaEngineInstance {
     }
     return {
       ...agent,
+      lastActivityAt: latest || null,
       activeSessions: active?.states ?? null,
       completeActivity: active?.complete ?? false,
       running:
