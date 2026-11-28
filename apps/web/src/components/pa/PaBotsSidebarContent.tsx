@@ -37,19 +37,12 @@ export function PaBotsSidebarContent() {
   const rawSearch = useSearch({ strict: false }) as { readonly bot?: unknown };
   const routeBotId = typeof rawSearch.bot === "string" && rawSearch.bot ? rawSearch.bot : null;
   const { isMobile, openMobile, open, setOpenMobile } = useSidebar();
-  const { instances, bots, loading, refreshing, error, nowMs, lastBotId } = usePaBotsStore(
+  const { instances, bots, loading, refreshing, error, lastBotId } = usePaBotsStore(
     isMobile ? openMobile : open,
   );
   const [query, setQuery] = useState("");
 
   const m = useMessages();
-  const formatRelativeTime = (ts: number | null): string =>
-    formatPaRosterTime(
-      ts,
-      nowMs,
-      (date) => date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-      m,
-    );
 
   const filteredBots = filterPaBots(bots, query);
   const { pinned: pinnedBots, others: unpinnedBots } = groupPaBots(filteredBots);
@@ -278,7 +271,7 @@ export function PaBotsSidebarContent() {
                             {bot.name}
                           </span>
                           <span className="shrink-0 text-3xs text-sidebar-muted-foreground tabular-nums">
-                            {formatRelativeTime(bot.lastActivityAt)}
+                            {formatPaRosterTime(bot.lastActivityAt)}
                           </span>
                         </div>
                         <p className="mt-0.5 truncate text-2xs text-sidebar-muted-foreground">

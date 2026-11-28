@@ -22,7 +22,7 @@ const FIRST_FRAME = () => 0;
 
 const THEMED_TONES: Partial<Record<PaAvatarTone, { className: string; opacity: number }>> = {
   warn: { className: "accent-warning-foreground", opacity: 1 },
-  info: { className: "accent-primary", opacity: 1 },
+  success: { className: "accent-adaptive-emerald-600-400", opacity: 1 },
   muted: { className: "accent-foreground-muted", opacity: 0.6 },
 };
 const OBSIDIAN_OPACITY = {

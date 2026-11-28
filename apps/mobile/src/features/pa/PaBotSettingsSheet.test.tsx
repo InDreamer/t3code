@@ -34,6 +34,7 @@ vi.mock("./usePaBotChat", () => ({ bumpPaBotSettingsIfActive: vi.fn() }));
 vi.mock("../../lib/openExternalUrl", () => ({ tryOpenExternalUrl: vi.fn() }));
 vi.mock("./paApi", () => ({
   paClient: () => ({ listBots: ui.list, listSchedules: ui.schedules, updateBotMeta: ui.save }),
+  paCache: undefined,
   paErrorMessage: (err: Error) => err.message,
   paUpdateMetaPermissionAtom: vi.fn(),
   paSelectModelPermissionAtom: vi.fn(),

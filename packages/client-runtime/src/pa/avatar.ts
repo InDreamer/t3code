@@ -210,7 +210,7 @@ const MASKS: Readonly<Record<PaAvatarShape, ReadonlyArray<string>>> = {
   ],
 };
 
-export type PaAvatarTone = "body" | "glow" | "glint" | "warn" | "info" | "muted";
+export type PaAvatarTone = "body" | "glow" | "glint" | "warn" | "success" | "muted";
 
 /** What the avatar shows; each client maps its Bot fields onto this. */
 export interface PaAvatarStatus {
@@ -231,6 +231,12 @@ function resolveMode(status: PaAvatarStatus): Mode {
   if (status.awaiting) return "awaiting";
   if (status.working) return "working";
   return "online";
+}
+
+/** The corner dot: amber while a turn runs or waits on the user, green once a finished turn is unread. */
+function statusDotTone(status: PaAvatarStatus): PaAvatarTone | null {
+  if (status.online !== false && (status.working || status.awaiting)) return "warn";
+  return status.unread ? "success" : null;
 }
 
 /** Whether this status moves; only working avatars do, and only while not awaiting or offline. */
@@ -531,9 +537,8 @@ export function paAvatarCells(
   }
 
   if (mode === "awaiting") for (const [x, y] of AWAITING_MARK) cells.set(key(x, y), "warn");
-  if (status.unread && !(status.working && !status.awaiting)) {
-    for (let y = 17; y <= 19; y++) for (let x = 17; x <= 19; x++) cells.set(key(x, y), "info");
-  }
+  const dot = statusDotTone(status);
+  if (dot) for (let y = 17; y <= 19; y++) for (let x = 17; x <= 19; x++) cells.set(key(x, y), dot);
   if (status.isDefault) {
     // Three prongs around the grid's middle columns, the center one taller, like the effort glyph.
     const base = Math.max(1, mask.top - 1);
@@ -594,7 +599,14 @@ export interface PaAvatarLayer {
   readonly d: string;
 }
 
-const TONE_ORDER: ReadonlyArray<PaAvatarTone> = ["body", "muted", "glow", "glint", "warn", "info"];
+const TONE_ORDER: ReadonlyArray<PaAvatarTone> = [
+  "body",
+  "muted",
+  "glow",
+  "glint",
+  "warn",
+  "success",
+];
 const layerCache = new Map<string, ReadonlyArray<PaAvatarLayer>>();
 
 /** The frame as one path per tone, cached since every Bot list draws the same few frames. */
@@ -605,8 +617,8 @@ export function paAvatarLayers(
 ): ReadonlyArray<PaAvatarLayer> {
   const mode = resolveMode(status);
   const frame = workingFrame(mode, tick);
-  const unread = status.unread && !(status.working && !status.awaiting);
-  const cacheKey = `${shape}|${mode}|${frame}|${unread ? 1 : 0}|${status.isDefault ? 1 : 0}`;
+  const dot = statusDotTone(status) ?? "";
+  const cacheKey = `${shape}|${mode}|${frame}|${dot}|${status.isDefault ? 1 : 0}`;
   const cached = layerCache.get(cacheKey);
   if (cached) return cached;
   const cells = paAvatarCells(shape, status, frame);

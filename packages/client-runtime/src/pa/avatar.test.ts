@@ -98,7 +98,7 @@ describe("PA avatar cells", () => {
   it("marks awaiting, unread and the default Bot in separate corners", () => {
     const cells = paAvatarCells("pumpkin", { awaiting: true, unread: true, isDefault: true });
     expect(cells.get(at(18, 0))).toBe("warn");
-    expect(cells.get(at(19, 19))).toBe("info");
+    expect(cells.get(at(19, 19))).toBe("warn");
     expect(cells.get(at(9, 0))).toBe("warn");
     expect(paAvatarCells("pumpkin", {}).get(at(18, 0))).toBeUndefined();
   });
@@ -106,7 +106,7 @@ describe("PA avatar cells", () => {
   it("fades an offline Bot and keeps its unread badge", () => {
     const cells = paAvatarCells("circle", { online: false, unread: true });
     const tones = new Set(cells.values());
-    expect(tones).toEqual(new Set(["muted", "info"]));
+    expect(tones).toEqual(new Set(["muted", "success"]));
     expect(cells.size).toBeLessThan(paAvatarCells("circle", { unread: true }).size);
   });
 });
@@ -146,19 +146,23 @@ describe("PA avatar layers", () => {
     expect(crown(false)).toBe(path);
   });
 
-  it("hides stale unread while working and preserves it when awaiting or finished", () => {
-    const tones = (status: Parameters<typeof paAvatarLayers>[1]) =>
-      paAvatarLayers("circle", status).map((layer) => layer.tone);
-    expect(tones({ working: true, unread: true })).not.toContain("info");
-    expect(tones({ working: true, awaiting: true, unread: true })).toEqual(
-      expect.arrayContaining(["warn", "info"]),
+  it("dots running and waiting Bots amber, unread finished Bots green, and idle Bots not at all", () => {
+    const dot = (status: Parameters<typeof paAvatarCells>[1]) =>
+      paAvatarCells("circle", status).get(at(18, 18));
+    expect(dot({ working: true })).toBe("warn");
+    expect(dot({ working: true, unread: true })).toBe("warn");
+    expect(dot({ working: true, awaiting: true, unread: true })).toBe("warn");
+    expect(dot({ unread: true })).toBe("success");
+    expect(dot({})).toBeUndefined();
+    expect(dot({ online: false, working: true })).toBeUndefined();
+    expect(paAvatarLayers("circle", { unread: true }).map((layer) => layer.tone)).toContain(
+      "success",
     );
-    expect(tones({ unread: true })).toContain("info");
-    expect(tones({ online: false, unread: true, isDefault: true })).toEqual([
-      "muted",
-      "warn",
-      "info",
-    ]);
+    expect(
+      paAvatarLayers("circle", { online: false, unread: true, isDefault: true }).map(
+        (layer) => layer.tone,
+      ),
+    ).toEqual(["muted", "warn", "success"]);
   });
 
   it("rounds only outside corners", () => {

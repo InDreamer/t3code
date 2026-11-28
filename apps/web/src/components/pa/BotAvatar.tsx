@@ -20,7 +20,7 @@ const FIRST_FRAME = () => 0;
 
 const THEMED_TONES: Partial<Record<PaAvatarTone, string>> = {
   warn: "fill-warning-foreground",
-  info: "fill-info",
+  success: "fill-success",
   muted: "fill-muted-foreground/60",
 };
 const OBSIDIAN_TONES: Partial<Record<PaAvatarTone, string>> = {

@@ -1,4 +1,4 @@
-// @effect-diagnostics globalDate:off - Local calendar-day labels for roster rows, computed outside an Effect runtime.
+// @effect-diagnostics globalDate:off - Local calendar dates for roster rows, computed outside an Effect runtime.
 import type { PaBotSummary, PaInstanceStatus, PaListBotsResult } from "@t3tools/contracts";
 import { mFallback, msg } from "gt-i18n";
 import type { MFunctionType } from "gt-i18n/types";
@@ -123,41 +123,11 @@ export function derivePaAgentSlug(agentRef: string, name: string): string {
     .slice(0, 64);
 }
 
-const DAY_MS = 24 * 60 * 60 * 1000;
+const pad2 = (value: number) => String(value % 100).padStart(2, "0");
 
-/**
- * How a roster row dates its last activity: the time today, "Yesterday", a weekday within the
- * week, else month/day. Times are formatted by the caller in the host's locale.
- */
-export function formatPaRosterTime(
-  timestamp: number | null,
-  nowMs: number,
-  formatTime: (date: Date) => string,
-  resolve: MFunctionType = mFallback,
-): string {
+/** How a roster row dates its last activity: a fixed-width local `YY/MM/DD`, empty when unknown. */
+export function formatPaRosterTime(timestamp: number | null): string {
   if (!timestamp) return "";
-  const now = new Date(nowMs);
-  const target = new Date(timestamp);
-  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
-  const startOfTarget = new Date(
-    target.getFullYear(),
-    target.getMonth(),
-    target.getDate(),
-  ).getTime();
-  const dayDiff = Math.round((startOfToday - startOfTarget) / DAY_MS);
-  if (dayDiff === 0) return formatTime(target);
-  if (dayDiff === 1) return resolve(msg("Yesterday"));
-  if (dayDiff > 1 && dayDiff < 7) {
-    const weekdays = [
-      msg("Sun"),
-      msg("Mon"),
-      msg("Tue"),
-      msg("Wed"),
-      msg("Thu"),
-      msg("Fri"),
-      msg("Sat"),
-    ];
-    return resolve(weekdays[target.getDay()]!);
-  }
-  return resolve(msg("{month}/{day}", { month: target.getMonth() + 1, day: target.getDate() }));
+  const date = new Date(timestamp);
+  return `${pad2(date.getFullYear())}/${pad2(date.getMonth() + 1)}/${pad2(date.getDate())}`;
 }

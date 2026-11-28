@@ -7,8 +7,8 @@ import {
   paOfflineInstances,
 } from "@t3tools/client-runtime/pa/roster";
 import { useIsFocused, useNavigation } from "@react-navigation/native";
-import { useGT, useMessages } from "gt-react-native";
-import { use, useRef, useState, type ReactNode } from "react";
+import { useGT } from "gt-react-native";
+import { use, useEffect, useRef, useState, type ReactNode } from "react";
 import { Keyboard, Platform, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
@@ -32,12 +32,12 @@ import { useWorkspaceEnvironments } from "../../state/workspace";
 import { useSearchScrollRestoration } from "../layout/workspace/useSearchScrollRestoration";
 import { useSelectWorkspaceDetail } from "../layout/workspace/useSelectWorkspaceDetail";
 import { useWorkspaceTabs } from "../layout/workspace/WorkspaceTabsContext";
-import { useMessageTimeFormatter } from "../threads/useMessageTimeFormatter";
 import { paClient, paErrorMessage } from "./paApi";
 import { paBotKey } from "./paBotParams";
 import { PaRowVisibility } from "./paRowVisibility";
 import { PaBotRow, type PaBotRowAction, type PaRosterBot } from "./PaBotRow";
 import {
+  hydratePaRoster,
   patchPaBot,
   refreshPaRoster,
   refreshPaRosters,
@@ -67,8 +67,6 @@ export function PaBotsScreen(
   } = {},
 ) {
   const gt = useGT();
-  const messages = useMessages();
-  const formatMessageTime = useMessageTimeFormatter();
   const canCreate = usePaCreatableEngines().length > 0;
   const navigation = useNavigation();
   const primaryColumn = use(NativePrimaryColumnContext);
@@ -91,8 +89,18 @@ export function PaBotsScreen(
   });
   const query = tab.searchMode === "resting" ? "" : tab.query;
 
-  const connected = environments.filter(
-    (environment) => environment.isEnabled && environment.connectionState === "connected",
+  const enabledEnvironments = environments.filter((environment) => environment.isEnabled);
+  const enabledKey = enabledEnvironments
+    .map((environment) => String(environment.environmentId))
+    .sort()
+    .join("\u0000");
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- hydrates cached PA rosters for enabled environments so Bots paint immediately on cold launch or while reconnecting
+  useEffect(() => {
+    if (!enabledKey) return;
+    for (const id of enabledKey.split("\u0000")) hydratePaRoster(id);
+  }, [enabledKey]);
+  const connected = enabledEnvironments.filter(
+    (environment) => environment.connectionState === "connected",
   );
   const environmentIds = connected.map((environment) => String(environment.environmentId)).sort();
   const paneRole = usePaneRole();
@@ -110,7 +118,12 @@ export function PaBotsScreen(
     (sidebar ? (primaryColumn?.presented ?? panes.primarySidebarVisible) : focused);
   usePaRosterRefresh(visible ? environmentIds : []);
   const rosters = usePaRosterEntries();
-  const loaded = connected.flatMap((environment) => {
+  const visibleEnvironments = enabledEnvironments.filter(
+    (environment) =>
+      environment.connectionState === "connected" ||
+      rosters.get(String(environment.environmentId))?.loadedAt !== null,
+  );
+  const loaded = visibleEnvironments.flatMap((environment) => {
     const entry = rosters.get(String(environment.environmentId));
     return entry ? [{ environment, entry }] : [];
   });
@@ -119,6 +132,7 @@ export function PaBotsScreen(
   const allBots: ReadonlyArray<PaRosterBot> = withEngines.flatMap(({ environment, entry }) =>
     entry.bots.map((bot) => ({
       ...bot,
+      online: environment.connectionState === "connected" && bot.online,
       environmentId: String(environment.environmentId),
       environmentLabel: showEnvironment ? environment.environmentLabel : null,
       key: paBotKey(String(environment.environmentId), bot.botId),
@@ -126,7 +140,9 @@ export function PaBotsScreen(
   );
   const filtered = filterPaBots(allBots, query);
   const { pinned, others } = groupPaBots(filtered);
-  const loading = loaded.length < connected.length || loaded.some(({ entry }) => entry.loading);
+  const loading =
+    allBots.length === 0 &&
+    (loaded.length < connected.length || loaded.some(({ entry }) => entry.loading));
   const refreshing = loaded.some(({ entry }) => entry.refreshing);
   const failures = loaded.filter(({ entry }) => entry.error !== null && entry.loadedAt === null);
   const everyFailed = loaded.length > 0 && failures.length === loaded.length;
@@ -206,14 +222,6 @@ export function PaBotsScreen(
     }
     void refreshPaRoster(bot.environmentId);
   };
-  const formatTime = (timestamp: number | null, nowMs: number) =>
-    formatPaRosterTime(
-      timestamp,
-      nowMs,
-      (date) => formatMessageTime(date.toISOString(), date.getTime()),
-      messages,
-    );
-  const nowMsFor = (environmentId: string) => rosters.get(environmentId)?.loadedAt ?? 0;
 
   const content = (
     <View className={sidebar ? "flex-1 bg-drawer" : "flex-1 bg-screen"}>
@@ -297,7 +305,7 @@ export function PaBotsScreen(
                 <PaBotRow
                   bot={item.bot}
                   preview={paBotPreview(item.bot)}
-                  time={formatTime(item.bot.lastActivityAt, nowMsFor(item.bot.environmentId))}
+                  time={formatPaRosterTime(item.bot.lastActivityAt)}
                   selected={selectedKey === item.bot.key}
                   sidebar={sidebar}
                   visible={visible}

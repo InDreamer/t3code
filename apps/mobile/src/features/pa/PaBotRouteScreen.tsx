@@ -6,7 +6,7 @@ import {
   summarizePaLiveActivity,
   formatPaSessionSource,
 } from "@t3tools/client-runtime/pa/presentation";
-import { EnvironmentId } from "@t3tools/contracts";
+import { AuthOrchestrationReadScope, EnvironmentId } from "@t3tools/contracts";
 import { T, useGT, useMessages } from "gt-react-native";
 import { use, useEffect, useRef, useState } from "react";
 import { Platform, Pressable, View, type ScrollViewInstance } from "react-native";
@@ -21,6 +21,7 @@ import { Button } from "../../components/ui/Button";
 import { EmptyState } from "../../components/ui/EmptyState";
 import { Notice } from "../../components/ui/Notice";
 import { ScreenContent } from "../../components/ui/ScreenContent";
+import { useBarOverlap } from "../../components/ui/useBarInset";
 import { chatContentMaxWidth } from "../../lib/layout";
 import { deriveBottomControlInsets, type NativeLayoutMetrics } from "../../lib/reserved-regions";
 import { NativeLayoutObserver } from "../../native/NativeLayoutObserver";
@@ -31,11 +32,16 @@ import { useAdaptiveWorkspaceLayout } from "../layout/adaptive-workspace-context
 import { useAppActive } from "../../lib/appState";
 import { NativeWorkspaceTabActivityContext } from "../../native/v5-workspace-context";
 import { connectedEnvironmentIdsAtom } from "../../state/presentation";
+import { useEnvironmentScopeDenied } from "../../state/session";
 import { useAndroidWorkspaceBack } from "../layout/workspace/useAndroidWorkspaceNavigation";
 import { ComposerPopoverHost } from "../threads/ComposerPopoverHost";
 import { useMessageTimeFormatter } from "../threads/useMessageTimeFormatter";
 import { BotAvatar } from "./BotAvatar";
-import { paSelectModelPermissionAtom, paOperatePermissionAtom } from "./paApi";
+import {
+  paOperatePermissionAtom,
+  paSelectModelPermissionAtom,
+  paUpdateMetaPermissionAtom,
+} from "./paApi";
 import { paBotChatView } from "./paBotChat";
 import type { PaBotParams } from "./paBotParams";
 import { PaComposer } from "./PaComposer";
@@ -82,6 +88,8 @@ function PaBotRoute({
   const environmentId = EnvironmentId.make(params.environmentId);
   const { bot, capabilities, entry } = usePaBot(params.environmentId, params.botId);
   const canOperate = useAtomValue(paOperatePermissionAtom(environmentId));
+  const readDenied = useEnvironmentScopeDenied(environmentId, AuthOrchestrationReadScope);
+  const canMarkRead = useAtomValue(paUpdateMetaPermissionAtom(environmentId));
   const canSelectModel = useAtomValue(paSelectModelPermissionAtom(environmentId));
   const connected = useAtomValue(connectedEnvironmentIdsAtom, (ids) => ids.includes(environmentId));
   const focused = useIsFocused();
@@ -91,6 +99,7 @@ function PaBotRoute({
     focused && foreground && (tabActivity?.active ?? true) && !tabActivity?.headerOnly;
   const view = paBotChatView(state);
   const composerBottomInset = useComposerBottomInset();
+  const barOverlap = useBarOverlap();
   const deviceType = useDeviceType();
   const usesNativeWorkspaceColumns = useNativeWorkspaceColumnsSupported();
   const [screenMetrics, setScreenMetrics] = useState<NativeLayoutMetrics | null>(null);
@@ -106,26 +115,47 @@ function PaBotRoute({
   const [nearBottom, setNearBottom] = useState(true);
   const following = useRef(true);
   const beforePrepend = useRef<string | undefined>(undefined);
+  // Anchoring is only for rows read in above; left on, a header row changing size moves the chat.
+  const [prepending, setPrepending] = useState(false);
   const keyboardHeight = useKeyboardState((keyboard) => keyboard.height);
   const followEnd = (animated: boolean) => {
     following.current = true;
     beforePrepend.current = undefined;
+    setPrepending(false);
     setNearBottom(true);
     scrollRef.current?.scrollToEnd({ animated });
   };
   const loadOlder = () => {
     if (!view.transcript.olderCursor || view.older?.loading) return;
     beforePrepend.current = view.transcript.messages[0]?.id;
+    setPrepending(true);
     void chat.loadOlderMessages();
   };
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- only a foreground detail may create the primary session or clear the bot's unread badge
   useEffect(() => (visible ? chat.holdVisible() : undefined), [chat, visible]);
   const unread = bot?.unread ?? false;
 
-  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- hands the shared chat the Bot's latest capabilities and permission, which start it
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- hands the shared chat the Bot's latest capabilities, primary session hint, and permissions
   useEffect(() => {
-    chat.setContext({ capabilities, canOperate, unread, connected });
-  }, [chat, capabilities, canOperate, unread, connected]);
+    chat.setContext({
+      capabilities,
+      canOperate,
+      canMarkRead,
+      readDenied,
+      unread,
+      connected,
+      primarySessionId: bot?.primarySessionId ?? null,
+    });
+  }, [
+    chat,
+    capabilities,
+    canOperate,
+    canMarkRead,
+    readDenied,
+    unread,
+    connected,
+    bot?.primarySessionId,
+  ]);
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- the chat's /model command opens this page's model sheet
   useEffect(() => {
     if (!canSelectModel || !visible) return;
@@ -152,7 +182,7 @@ function PaBotRoute({
       ? gt("Waiting for input")
       : view.running
         ? view.liveTurn.statusText || gt("Working…")
-        : !bot.online
+        : !bot.online || !connected
           ? gt("{engine} · Offline", { engine: bot.engineLabel })
           : (sessionLabel ?? bot.engineLabel);
   const showsModel = canSelectModel && capabilities?.models.supported === true;
@@ -211,9 +241,12 @@ function PaBotRoute({
         ),
   );
   const contentMaxWidth = chatContentMaxWidth(Platform.OS, layout.usesSplitView);
-  const showComposer = bot !== null;
-  const loadingChat = state.loadingSessions || view.loadingMessages;
-  const empty = !loadingChat && view.timelineItems.length === 0 && !view.hasLiveTurn;
+  const showComposer = bot !== null && !view.readDenied;
+  const loadingChat =
+    !view.readDenied &&
+    ((view.sessionId === null && state.loadingSessions) || view.loadingMessages);
+  const empty =
+    !view.readDenied && !loadingChat && view.timelineItems.length === 0 && !view.hasLiveTurn;
 
   const scrollToEnd = (animated: boolean) => scrollRef.current?.scrollToEnd({ animated });
 
@@ -246,11 +279,14 @@ function PaBotRoute({
           <NativeScrollView
             ref={scrollRef}
             className="flex-1"
-            contentInsetAdjustmentBehavior="automatic"
+            // The top padding clears the bar instead of an automatic inset: `scrollToEnd` clamps to
+            // offset 0, which under an automatic inset puts a short chat behind the bar.
+            contentInsetAdjustmentBehavior="never"
+            scrollIndicatorInsets={Platform.OS === "ios" ? { top: barOverlap } : undefined}
             keyboardShouldPersistTaps="handled"
             keyboardDismissMode="interactive"
             // Older rows go in above: the reader stays on what they were reading.
-            maintainVisibleContentPosition={{ minIndexForVisible: 1 }}
+            maintainVisibleContentPosition={prepending ? { minIndexForVisible: 1 } : undefined}
             onScroll={(event) => {
               const { contentOffset, contentSize, layoutMeasurement } = event.nativeEvent;
               following.current =
@@ -264,11 +300,11 @@ function PaBotRoute({
             }}
             onContentSizeChange={() => {
               if (beforePrepend.current !== undefined) {
-                if (beforePrepend.current !== view.transcript.messages[0]?.id) {
-                  beforePrepend.current = undefined;
-                  return;
-                }
                 if (view.older?.loading) return;
+                const prepended = beforePrepend.current !== view.transcript.messages[0]?.id;
+                beforePrepend.current = undefined;
+                setPrepending(false);
+                if (prepended) return;
               }
               if (following.current) scrollToEnd(false);
             }}
@@ -277,7 +313,7 @@ function PaBotRoute({
               maxWidth: contentMaxWidth,
               alignSelf: "center",
               paddingHorizontal: 16,
-              paddingTop: 8,
+              paddingTop: barOverlap + 8,
               paddingBottom: showComposer
                 ? composerHeight +
                   Math.max(0, keyboardHeight - composerBottomInset) +
@@ -303,7 +339,7 @@ function PaBotRoute({
                     }
                   />
                 )
-              ) : !bot.online ? (
+              ) : !bot.online || !connected ? (
                 <View className="pb-3">
                   <Notice
                     icon="wifi.slash"
@@ -312,6 +348,13 @@ function PaBotRoute({
                     })}
                   />
                 </View>
+              ) : null}
+              {bot && view.readDenied ? (
+                <EmptyState
+                  title={gt("Could not load messages")}
+                  detail={gt("Could not connect to the bot session")}
+                  variant="plain"
+                />
               ) : null}
               {bot && view.transcript.olderCursor !== null && !view.loadingMessages ? (
                 <View className="items-center gap-1 pb-3">
@@ -355,7 +398,7 @@ function PaBotRoute({
                     color={bot.avatarColor}
                     shape={bot.avatarShape}
                     size="lg"
-                    online={bot.online}
+                    online={bot.online && connected}
                     running={view.running}
                     visible={visible}
                     awaiting={view.liveTurn.openRequests.length > 0}
@@ -473,6 +516,8 @@ function PaBotRoute({
                   onSend={() => followEnd(false)}
                   canOperate={canOperate}
                   modelLabel={modelSelection.displayLabel}
+                  modelProvider={modelSelection.provider}
+                  modelId={modelSelection.model}
                   reasoningLabel={modelSelection.reasoningLabel}
                   bottomInset={composerBottomInset}
                   contentMaxWidth={contentMaxWidth}

@@ -60,15 +60,11 @@ describe("PA roster", () => {
     expect(derivePaAgentSlug("", "!!!")).toBe("");
   });
 
-  it("dates activity by calendar day", () => {
-    const now = new Date(2026, 10, 27, 9, 0).getTime();
-    const at = (day: number, hour = 12) => new Date(2026, 10, day, hour).getTime();
-    const time = () => "TIME";
-    expect(formatPaRosterTime(at(27, 1), now, time)).toBe("TIME");
-    expect(formatPaRosterTime(at(26, 23), now, time)).toBe("Yesterday");
-    expect(formatPaRosterTime(at(24), now, time)).toBe("Tue");
-    expect(formatPaRosterTime(at(2), now, time)).toBe("11/2");
-    expect(formatPaRosterTime(null, now, time)).toBe("");
+  it("dates activity with one short local year/month/day format", () => {
+    expect(formatPaRosterTime(new Date(2026, 10, 27, 1).getTime())).toBe("26/11/27");
+    expect(formatPaRosterTime(new Date(2026, 0, 3, 23, 59).getTime())).toBe("26/01/03");
+    expect(formatPaRosterTime(new Date(2009, 8, 9).getTime())).toBe("09/09/09");
+    expect(formatPaRosterTime(null)).toBe("");
   });
 });
 

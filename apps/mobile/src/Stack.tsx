@@ -670,7 +670,7 @@ const RootStackConfig = createWorkspaceStackNavigator({
     }),
     PaModel: createNativeStackScreen({
       screen: PaModelSheet,
-      options: SEARCH_SHEET_ROUTE,
+      options: THREAD_SETTINGS_ROUTE,
     }),
     PaBotSettings: createNativeStackScreen({
       screen: PaBotSettingsSheet,

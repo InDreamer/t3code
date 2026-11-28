@@ -1,5 +1,6 @@
 import { useAtomValue } from "@effect/atom-react";
 import { resolvePaComposerSendMode } from "@t3tools/client-runtime/pa/composer";
+import { paProviderIconKey } from "@t3tools/client-runtime/pa/models";
 import { voiceInputBlocksSubmission } from "@t3tools/client-runtime/voice-input";
 import {
   isCompletePaSlashCommand,
@@ -16,6 +17,7 @@ import {
 import { useGT } from "gt-react-native";
 import { useLayoutEffect, useRef, useState } from "react";
 import { Platform, Pressable, ScrollView, View } from "react-native";
+import { KeyboardController } from "react-native-keyboard-controller";
 import Animated from "react-native-reanimated";
 
 import { ComposerAttachmentStrip } from "../../components/ComposerAttachmentStrip";
@@ -37,6 +39,7 @@ import {
   ComposerInlineControl,
   ComposerToolbarRow,
 } from "../../components/ComposerToolbar";
+import { ProviderIcon } from "../../components/ProviderIcon";
 import { SymbolView } from "../../components/ui/AppSymbol";
 import { AppText as Text } from "../../components/ui/AppText";
 import { FilePreviewModal, type FilePreviewSource } from "../../components/ui/FilePreviewModal";
@@ -87,6 +90,8 @@ export function PaComposer(props: {
   readonly onSend: () => void;
   readonly canOperate: boolean;
   readonly modelLabel: string | null;
+  readonly modelProvider: string | null;
+  readonly modelId: string | null;
   readonly reasoningLabel: string | null;
   readonly bottomInset: number;
   readonly contentMaxWidth?: number;
@@ -247,6 +252,12 @@ export function PaComposer(props: {
       inFlight.current = false;
     });
   };
+  // Like Code's settings sheet: the keyboard leaves first, so the sheet does not open over it.
+  const openModel = () => {
+    void KeyboardController.dismiss({ animated: true });
+    editorRef.current?.blur();
+    props.onOpenModel();
+  };
   const pickCommand = (command: PaSlashCommand) => {
     // Opening the picker has no side effect, so it runs on pick; every other command only completes.
     if (
@@ -255,7 +266,7 @@ export function PaComposer(props: {
       capabilities?.models.supported
     ) {
       chat.setDraft("");
-      props.onOpenModel();
+      openModel();
       return;
     }
     const completion = `${command.name} `;
@@ -480,27 +491,24 @@ export function PaComposer(props: {
                   }
                 >
                   {props.canSelectModel && capabilities?.models.supported ? (
-                    <ComposerInlineControl
-                      accessibilityLabel={[
-                        gt("Model and reasoning"),
-                        props.modelLabel,
-                        props.reasoningLabel,
-                      ]
-                        .filter(Boolean)
-                        .join(", ")}
-                      icon="brain"
-                      label={props.modelLabel ?? gt("Choose model")}
-                      iconOnly={!compactEditor.isExpanded}
-                      suffix={
-                        props.reasoningLabel ? (
-                          <Text className="text-xs text-foreground-muted" numberOfLines={1}>
-                            {`· ${props.reasoningLabel}`}
-                          </Text>
-                        ) : undefined
-                      }
-                      maxWidth={200}
-                      onPress={props.onOpenModel}
-                    />
+                    <Animated.View
+                      key={compactEditor.isExpanded ? "expanded" : "compact"}
+                      className="min-w-0 shrink flex-row items-center"
+                      entering={compactEditor.toolbarControlsEntering}
+                    >
+                      {/* Only the expanded label can truncate; shrinking the icon-only control clips the icon. */}
+                      <View className={compactEditor.isExpanded ? "min-w-0 shrink" : "shrink-0"}>
+                        <PaComposerModelControl
+                          size={chrome.controlSize}
+                          label={props.modelLabel}
+                          provider={props.modelProvider}
+                          model={props.modelId}
+                          reasoningLabel={props.reasoningLabel}
+                          iconOnly={!compactEditor.isExpanded}
+                          onPress={openModel}
+                        />
+                      </View>
+                    </Animated.View>
                   ) : null}
                   <ComposerDictationStartAction
                     size={chrome.controlSize}
@@ -581,5 +589,49 @@ export function PaComposer(props: {
         </View>
       </View>
     </Animated.View>
+  );
+}
+
+/** The Code composer's model trigger, fed by a PA engine's provider and model ids. */
+function PaComposerModelControl(props: {
+  readonly size: "regular" | "large";
+  readonly label: string | null;
+  readonly provider: string | null;
+  readonly model: string | null;
+  readonly reasoningLabel: string | null;
+  readonly iconOnly: boolean;
+  readonly onPress: () => void;
+}) {
+  const gt = useGT();
+  const iconKey = paProviderIconKey(props.provider, props.model);
+  const label = props.label ?? gt("Choose model");
+  return (
+    <ComposerInlineControl
+      accessibilityLabel={[gt("Model and reasoning settings"), label, props.reasoningLabel]
+        .filter(Boolean)
+        .join(", ")}
+      size={props.size}
+      emphasized
+      icon={iconKey ? undefined : "brain"}
+      renderIcon={iconKey ? (size) => <ProviderIcon provider={iconKey} size={size} /> : undefined}
+      label={label}
+      iconOnly={props.iconOnly}
+      suffix={
+        props.reasoningLabel ? (
+          <Text
+            className={
+              props.size === "large"
+                ? "text-sm text-foreground-muted"
+                : "text-xs text-foreground-muted"
+            }
+            numberOfLines={1}
+          >
+            {props.reasoningLabel}
+          </Text>
+        ) : undefined
+      }
+      maxWidth="100%"
+      onPress={props.onPress}
+    />
   );
 }

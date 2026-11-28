@@ -124,7 +124,11 @@ export const PaBotRow = memo(function PaBotRow(props: {
               >
                 {bot.name}
               </Text>
-              <Text className={cn("text-2xs tabular-nums", muted)}>{props.time}</Text>
+              {props.time ? (
+                <Text className={cn("shrink-0 text-2xs tabular-nums", muted)} numberOfLines={1}>
+                  {props.time}
+                </Text>
+              ) : null}
             </View>
             <Text className={cn("text-sm", muted)} numberOfLines={1}>
               {props.preview}

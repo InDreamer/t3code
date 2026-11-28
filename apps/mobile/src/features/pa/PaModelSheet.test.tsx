@@ -1,5 +1,5 @@
 import type { PaModelCatalog } from "@t3tools/contracts";
-import { act, type ReactNode } from "react";
+import { act, type ComponentType, type ReactElement, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, expect, it, vi } from "vite-plus/test";
 
@@ -16,6 +16,8 @@ const ui = vi.hoisted(() => ({
   bump: vi.fn(),
   goBack: vi.fn(),
   dispatch: vi.fn(),
+  navigate: vi.fn(),
+  nestedBack: vi.fn(),
 }));
 vi.mock("@effect/atom-react", () => ({ useAtomValue: () => true }));
 vi.mock("@react-navigation/native", () => ({
@@ -40,6 +42,97 @@ vi.mock("react-native", () => ({
       {children}
     </button>
   ),
+}));
+// Both picker pages render at once; the pages get the nested stack's navigation as props.
+vi.mock("../../native/createV5StackNavigator", async () => {
+  const { Children } = await vi.importActual<typeof import("react")>("react");
+  type ScreenElement = ReactElement<{
+    name: string;
+    component: ComponentType<{ navigation: object }>;
+  }>;
+  return {
+    createV5StackNavigator: () => ({
+      Navigator: ({ children }: { children: ReactNode }) =>
+        (Children.toArray(children) as ScreenElement[]).map((screen) => {
+          const Screen = screen.props.component;
+          return (
+            <Screen
+              key={screen.props.name}
+              navigation={{ navigate: ui.navigate, goBack: ui.nestedBack }}
+            />
+          );
+        }),
+      Screen: () => null,
+    }),
+  };
+});
+vi.mock("../layout/nested-stacks", () => ({ useSheetStackOptions: () => ({}) }));
+vi.mock("react-native-safe-area-context", () => ({
+  useSafeAreaInsets: () => ({ top: 0, bottom: 0, left: 0, right: 0 }),
+}));
+vi.mock("../../components/ui/AppBar", () => ({
+  AppBar: ({
+    title,
+    onClose,
+    confirm,
+  }: {
+    title: string;
+    onClose?: () => void;
+    confirm?: { label: string; onPress: () => void };
+  }) => (
+    <header>
+      {onClose ? <button onClick={onClose}>{`Close ${title}`}</button> : null}
+      {confirm ? <button onClick={confirm.onPress}>{confirm.label}</button> : null}
+    </header>
+  ),
+}));
+vi.mock("../../components/ui/ScreenContent", () => ({
+  ScreenContent: ({ children }: { children: ReactNode }) => children,
+}));
+vi.mock("../../components/ui/useBarInset", () => ({ useSearchToolbarInset: () => 0 }));
+vi.mock("../threads/ThreadSettingsRows", () => ({
+  ChoiceRow: ({
+    label,
+    onPress,
+    disabled,
+  }: {
+    label: string;
+    onPress: () => void;
+    disabled?: boolean;
+  }) => (
+    <button onClick={onPress} disabled={disabled}>
+      {label}
+    </button>
+  ),
+}));
+vi.mock("../threads/ThreadSettingsSections", () => ({
+  ProviderHeader: ({
+    label,
+    collapsible,
+    collapsed,
+    modelCount,
+    onToggle,
+  }: {
+    label: string;
+    collapsible: boolean;
+    collapsed: boolean;
+    modelCount: number;
+    onToggle: () => void;
+  }) =>
+    collapsible ? (
+      <button onClick={onToggle}>{`${label} ${collapsed ? modelCount : "open"}`}</button>
+    ) : (
+      <span>{label}</span>
+    ),
+  DisclosureRow: ({
+    label,
+    value,
+    onPress,
+  }: {
+    label: string;
+    value?: string;
+    onPress: () => void;
+  }) => <button onClick={onPress}>{`${label}: ${value ?? ""}`}</button>,
 }));
 vi.mock("../../components/ui/AppActivityIndicator", () => ({ AppActivityIndicator: () => null }));
 vi.mock("../../components/ui/AppSymbol", () => ({ SymbolView: () => null }));
@@ -69,30 +162,8 @@ vi.mock("../../components/ui/Button", () => ({
     </button>
   ),
 }));
-vi.mock("../../components/ui/SelectionRow", () => ({
-  SelectionRow: ({
-    title,
-    onPress,
-    disabled,
-  }: {
-    title: string;
-    onPress: () => void;
-    disabled: boolean;
-  }) => (
-    <button onClick={onPress} disabled={disabled}>
-      {title}
-    </button>
-  ),
-}));
 vi.mock("../../native/NativeScrollViewMarker", () => ({
   NativeScrollView: ({ children }: { children: ReactNode }) => children,
-}));
-vi.mock("../pull-requests/PullRequestSearchSheet", () => ({
-  PullRequestSearchSheet: ({
-    children,
-  }: {
-    children: (insets: { paddingBottom: number }) => ReactNode;
-  }) => children({ paddingBottom: 0 }),
 }));
 vi.mock("./paApi", () => ({
   paClient: () => ({ getBotModels: ui.models, selectBotModel: ui.select }),
@@ -206,7 +277,11 @@ it.each(["model", "reasoning"])(
     const receipt = Promise.withResolvers<Awaited<ReturnType<PaClient["selectBotModel"]>>>();
     if (kind === "reasoning") {
       ui.select.mockResolvedValueOnce({ status: "confirmRequired", message: "Confirm effort" });
+      ui.nestedBack.mockClear();
       await act(async () => button("High").click());
+      // The effort page returns to the list, where the confirmation shows.
+      expect(ui.nestedBack).toHaveBeenCalledTimes(1);
+      expect(container.textContent).toContain("Confirm effort");
       ui.select.mockReturnValueOnce(receipt.promise);
       act(() => button("Confirm switch").click());
       expect(ui.select).toHaveBeenLastCalledWith({
@@ -264,4 +339,78 @@ it("keeps a custom model unsubmittable until a provider is chosen", async () => 
   expect(use.disabled).toBe(true);
   await act(async () => use.click());
   expect(ui.select).not.toHaveBeenCalled();
+});
+
+const button = (container: HTMLElement, name: string) =>
+  [...container.querySelectorAll("button")].find((item) => item.textContent === name);
+
+async function renderSheet(botId: string, query?: string) {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const container = document.createElement("div");
+  const root = createRoot(container);
+  await act(async () =>
+    root.render(
+      <PaModelSheet
+        route={{ params: { environmentId: "env", botId, ...(query ? { query } : {}) } }}
+      />,
+    ),
+  );
+  return { container, [Symbol.dispose]: () => act(() => root.unmount()) };
+}
+
+it("folds detected providers behind their header, opens them on tap or search, and closes from the bar", async () => {
+  ui.sessionId = "detected";
+  ui.goBack.mockClear();
+  ui.navigate.mockClear();
+  ui.models.mockResolvedValue({
+    ...catalog,
+    current: { provider: "p", model: "another", reasoningEffort: "high" },
+    providers: [
+      ...catalog.providers,
+      {
+        id: "found",
+        label: "Found",
+        tier: "detected",
+        isCurrent: false,
+        models: [{ id: "local-a" }, { id: "local-b" }],
+      },
+    ],
+  });
+  using sheet = await renderSheet("bot-detected");
+  const { container } = sheet;
+  expect(button(container, "local-a")).toBeUndefined();
+  await act(async () => button(container, "Found 2")!.click());
+  expect(button(container, "local-a")).toBeDefined();
+  await act(async () => button(container, "Found open")!.click());
+  expect(button(container, "local-a")).toBeUndefined();
+
+  const effort = [...container.querySelectorAll("button")].find((item) =>
+    item.textContent?.endsWith(": High"),
+  )!;
+  await act(async () => effort.click());
+  expect(ui.navigate).toHaveBeenCalledWith("PaModelEffort");
+
+  await act(async () => button(container, "Done")!.click());
+  await act(async () => button(container, "Close Model")!.click());
+  expect(ui.goBack).toHaveBeenCalledTimes(2);
+});
+
+it("opens with the /model query searching every provider, detected ones included", async () => {
+  ui.sessionId = "query";
+  ui.models.mockResolvedValue({
+    ...catalog,
+    providers: [
+      ...catalog.providers,
+      {
+        id: "found",
+        label: "Found",
+        tier: "detected",
+        isCurrent: false,
+        models: [{ id: "local-a" }],
+      },
+    ],
+  });
+  using sheet = await renderSheet("bot-query", "local");
+  expect(button(sheet.container, "local-a")).toBeDefined();
+  expect(button(sheet.container, "another")).toBeUndefined();
 });
