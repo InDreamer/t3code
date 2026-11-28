@@ -328,6 +328,7 @@ vi.mock("../../pa/PaBotRow", () => ({
     createElement("div", { "data-avatar-visible": String(visible) }, bot.name),
 }));
 vi.mock("../../pa/paRosterStore", () => ({
+  hydratePaRoster: () => undefined,
   usePaCreatableEngines: () => (mocks.canCreate ? ["engine"] : []),
   usePaRosterRefresh: () => undefined,
   usePaRosterEntries: () =>

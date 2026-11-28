@@ -179,7 +179,7 @@ describe("createPaBotChat", () => {
 
     feeds.get("primary")!.onEvent(snapshot("primary"));
     await until(chat, () => !paBotChatView(chat.getState()).loadingMessages);
-    expect(client.getMessages).toHaveBeenCalledWith("bot", "primary");
+    expect(client.getMessages).toHaveBeenCalledWith("bot", "primary", { limit: 50 });
     expect(paBotChatView(chat.getState()).loadingMessages).toBe(false);
   });
 

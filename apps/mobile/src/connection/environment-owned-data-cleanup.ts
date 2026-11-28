@@ -40,8 +40,10 @@ export const layer = Layer.succeed(
           Effect.promise(async () => {
             // The roster client depends on this connection runtime.
             const { clearPaRosterEnvironment } = await import("../features/pa/paRosterStore");
+            const { clearPaBotChatsEnvironment } = await import("../features/pa/usePaBotChat");
             const { paModelCatalogs } = await import("../features/pa/usePaModelCatalog");
             paModelCatalogs.clearEnvironment(environmentId);
+            clearPaBotChatsEnvironment(environmentId);
             clearPaRosterEnvironment(environmentId);
           }),
           settle("outbox", clearThreadOutboxEnvironment),

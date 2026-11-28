@@ -10,11 +10,13 @@ const harness = vi.hoisted(() => ({
   clearOutbox: vi.fn<(environmentId: string) => Promise<void>>(),
   clearDrafts: vi.fn<(environmentId: string) => Promise<void>>(),
   clearRoster: vi.fn(),
+  clearChats: vi.fn(),
   clearModels: vi.fn(),
   clearComposerErrors: vi.fn(),
 }));
 
 vi.mock("../features/pa/paRosterStore", () => ({ clearPaRosterEnvironment: harness.clearRoster }));
+vi.mock("../features/pa/usePaBotChat", () => ({ clearPaBotChatsEnvironment: harness.clearChats }));
 vi.mock("../features/pa/usePaModelCatalog", () => ({
   paModelCatalogs: { clearEnvironment: harness.clearModels },
 }));
@@ -56,6 +58,7 @@ describe("EnvironmentOwnedDataCleanup", () => {
       yield* cleanup.clear(ENVIRONMENT_ID);
 
       expect(harness.clearRoster).toHaveBeenCalledWith(ENVIRONMENT_ID);
+      expect(harness.clearChats).toHaveBeenCalledWith(ENVIRONMENT_ID);
       expect(harness.clearModels).toHaveBeenCalledWith(ENVIRONMENT_ID);
       expect(draftsCleared).toBe(true);
       expect(warnings).toEqual([

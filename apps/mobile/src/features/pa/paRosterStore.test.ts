@@ -12,7 +12,7 @@ import {
 } from "./paRosterStore";
 
 const { listBots } = vi.hoisted(() => ({ listBots: vi.fn<PaClient["listBots"]>() }));
-vi.mock("./paApi", () => ({ paClient: () => ({ listBots }) }));
+vi.mock("./paApi", () => ({ paClient: () => ({ listBots }), paCache: undefined }));
 vi.mock("react-native", () => ({ AppState: {} }));
 vi.mock("../../state/workspace", () => ({ workspaceConnections: {} }));
 vi.mock("../../i18n/messages", () => ({ m: String }));

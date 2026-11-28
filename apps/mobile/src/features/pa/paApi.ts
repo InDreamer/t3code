@@ -1,5 +1,7 @@
+import { createPaEnvironmentCache } from "@t3tools/client-runtime/pa/cache";
 import { createPaPrimarySessionCreates, makePaRequestKey } from "@t3tools/client-runtime/pa/chat";
 import { createPaEnvironmentCommands } from "@t3tools/client-runtime/pa/environment";
+import type { PaFollowSessionOptions } from "@t3tools/client-runtime/pa/bot-chat";
 import {
   runAtomCommand,
   squashAtomCommandFailure,
@@ -17,7 +19,6 @@ import {
   type PaRespondRequestInput,
   type PaSelectBotModelInput,
   type PaSessionSummary,
-  type PaStreamEvent,
   type PaUpdateBotMetaInput,
 } from "@t3tools/contracts";
 
@@ -25,6 +26,7 @@ import { connectionAtomRuntime } from "../../connection/runtime";
 import { appAtomRegistry } from "../../state/atom-registry";
 
 const pa = createPaEnvironmentCommands(connectionAtomRuntime);
+export const paCache = createPaEnvironmentCache(appAtomRegistry, connectionAtomRuntime);
 
 /** Whether this connection may talk to an environment's Bots; the server stays authoritative. */
 export const paCreateBotPermissionAtom = pa.createBot.permissionAtom;
@@ -142,14 +144,8 @@ export function paClient(environmentIdValue: string) {
     /** Secret values pass straight through; nothing here keeps or reports them. */
     respondRequest: (input: PaRespondRequestInput) =>
       call(pa.respondRequest, environmentId, input, false),
-    followSession: (
-      botId: string,
-      sessionId: string,
-      handlers: {
-        readonly onEvent: (event: PaStreamEvent) => void;
-        readonly onFailure: (error: unknown, status: { readonly retrying: boolean }) => void;
-      },
-    ) => pa.followSession(appAtomRegistry, { environmentId, botId, sessionId, ...handlers }),
+    followSession: (botId: string, sessionId: string, handlers: PaFollowSessionOptions) =>
+      pa.followSession(appAtomRegistry, { environmentId, botId, sessionId, ...handlers }),
   };
 }
 

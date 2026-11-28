@@ -270,6 +270,16 @@ function makeDatabase() {
         removed.push(id);
         values.delete(id);
       }),
+    removeCachePrefix: (environmentId, kind, keyPrefix) =>
+      Effect.sync(() => {
+        const prefix = `${environmentId}:${kind}:${keyPrefix}`;
+        for (const key of values.keys()) {
+          if (key.startsWith(prefix)) {
+            removed.push(key);
+            values.delete(key);
+          }
+        }
+      }),
     clearCacheKind: (environmentId, kind) =>
       Effect.sync(() => {
         for (const key of values.keys()) {
